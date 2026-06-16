@@ -7,6 +7,16 @@ plugins {
 val bundledSourceFilesDir = rootProject.layout.projectDirectory.dir("source-files")
 val generatedBundledSourcesDir = layout.buildDirectory.dir("generated/reamicroBundledSources")
 val generatedBundledSourcesRoot = layout.buildDirectory.file("generated/reamicroBundledSources").get().asFile
+val releaseKeystoreFile = System.getenv("RELEASE_KEYSTORE_FILE").orEmpty()
+val releaseKeystorePassword = System.getenv("RELEASE_KEYSTORE_PASSWORD").orEmpty()
+val releaseKeyAlias = System.getenv("RELEASE_KEY_ALIAS").orEmpty()
+val releaseKeyPassword = System.getenv("RELEASE_KEY_PASSWORD").orEmpty()
+val hasReleaseSigning = listOf(
+    releaseKeystoreFile,
+    releaseKeystorePassword,
+    releaseKeyAlias,
+    releaseKeyPassword,
+).all { it.isNotBlank() }
 val syncBundledSources by tasks.registering(Sync::class) {
     from(bundledSourceFilesDir) {
         include("*.rmsource")
@@ -29,6 +39,25 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = file(releaseKeystoreFile)
+                storePassword = releaseKeystorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
+        }
     }
 
     sourceSets["main"].assets.srcDir(generatedBundledSourcesRoot)
