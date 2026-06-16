@@ -22,4 +22,6 @@ dex_tmp/
 # Optional closed/local side-loaded ReaMicro sources. If these directories
 # exist locally, Gradle can bundle their .rmsource files into the APK.
 external-sources/
-source-files/
+source-files/*
+!source-files/
+!source-files/fanqie.rmsource
