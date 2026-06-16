@@ -1,25 +1,87 @@
-# ReaMicro LSP
+# ReaMicro Extend
 
-用于补充阅微图书关联能力的 Android LSPosed 模块。
+ReaMicro Extend is an LSPosed module for adding small behavior extensions to ReaMicro.
 
-## 当前目标
+This repository contains only the open-source module framework and general hooks. Search providers and optional closed features are not included in the public source tree.
 
-- 定位阅微图书关联链路。
-- 为关联候选补充外部搜索来源。
-- 先接入次元姬，并增强/兜底刺猬猫图书搜索 provider。
+## Features
 
-## 当前结论
+- Reader-related behavior tweaks.
+- Settings UI for module switches.
+- External source loading through side-loaded `.rmsource` files.
+- Optional bundling of local `.rmsource` files at build time.
 
-当前目标 APK 为 `RM2.0.A4.APK`。新版本已切到 Ktorfit 风格 REST API，并通过远端下发 JS 文件执行第三方搜索，不再沿用旧版 `N4.u` / `Bibliosurf` / gRPC 主链路。
+## Side-Loaded Sources
 
-本模块现在 Hook `BookPublishViewModel.searchByThird()` 和 `BookPublishViewModel.onIntent(...)`，插入“手动关联”候选并复用阅微原生 `postCloudBook -> relateCloudBook` 提交流程。
+Association search providers are loaded from external source files instead of being hardcoded in this repository.
 
-最新接口扫描见 `docs/reamicro-rm2-a4-interface-scan.md`，手动关联选项见 `docs/manual-association-option.md`。旧版 `RM1.3.0+` 记录仅作历史参考。
+At runtime, the module scans the app private source directory:
 
-## 构建
+```text
+/data/data/app.zhendong.reamicro/files/reamicro_sources
+```
 
-需要 Android SDK。首次构建前确认 `local.properties` 指向本机 SDK，例如：`sdk.dir=C:/Users/<name>/AppData/Local/Android/Sdk`。
+Supported file types:
+
+```text
+.rmsource
+.apk
+.jar
+.dex
+```
+
+Only loaded sources appear in the settings page. If no source file exists, no external source switch is shown.
+
+Source results must map to one of the known platform names maintained by the module. Unknown platforms are ignored instead of being added dynamically.
+
+## Bundled Local Sources
+
+For private or local builds, `.rmsource` files can be placed in:
+
+```text
+source-files/
+```
+
+If this directory exists locally, Gradle packages `source-files/*.rmsource` into the APK assets. On app startup, the module copies bundled source files into the app private source directory, then loads them the same way as manually side-loaded files.
+
+`source-files/` is ignored by Git and is not part of the open-source project.
+
+## Open-Source Boundary
+
+The public repository does not include:
+
+- Concrete association search provider implementations.
+- Private source files or generated `.rmsource` packages.
+- Closed optional features.
+- Private server addresses or credentials.
+
+The source-loading framework is public; individual sources can be distributed separately.
+
+## Build
+
+Requirements:
+
+- Android SDK
+- JDK 17
+
+Build debug APK:
 
 ```bash
 ./gradlew :app:assembleDebug
 ```
+
+Run unit tests:
+
+```bash
+./gradlew :app:testDebugUnitTest
+```
+
+If `local.properties` is needed, point it to your Android SDK, for example:
+
+```properties
+sdk.dir=C:/Users/<name>/AppData/Local/Android/Sdk
+```
+
+## License
+
+No license has been declared yet. Do not assume redistribution rights until a license is added.
