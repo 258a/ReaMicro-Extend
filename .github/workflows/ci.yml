@@ -38,7 +38,7 @@ jobs:
       - name: Install Android SDK packages
         run: |
           yes | sdkmanager --sdk_root="$ANDROID_HOME" --licenses
-          sdkmanager --sdk_root="$ANDROID_HOME" "platform-tools" "platforms;android-37" "build-tools;37.0.0"
+          sdkmanager --sdk_root="$ANDROID_HOME" "platform-tools" "platforms;android-36" "build-tools;36.0.0"
 
       - name: Make Gradle executable
         run: chmod +x ./gradlew

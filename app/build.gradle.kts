@@ -16,7 +16,7 @@ val syncBundledSources by tasks.registering(Sync::class) {
 
 android {
     namespace = "com.reamicro.fix"
-    compileSdk = 37
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.reamicro.fix"
