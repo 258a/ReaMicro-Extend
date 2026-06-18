@@ -25,4 +25,5 @@ dex_tmp/
 external-sources/
 source-files/*
 !source-files/
+!source-files/ciweimao.rmsource
 !source-files/fanqie.rmsource
