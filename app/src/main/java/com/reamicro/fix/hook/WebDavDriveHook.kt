@@ -135,6 +135,7 @@ class WebDavDriveHook(
     private val webDavDownloadCancelPrompts = ConcurrentHashMap<String, Long>()
     private val webDavHomeSearchSeq = AtomicLong(0L)
     private val localLibraryHomeSearchSeq = AtomicLong(0L)
+    private val cloudStorageScreenRefreshAt = ConcurrentHashMap<String, Long>()
     private val localLibraryListCache = ConcurrentHashMap<String, LocalLibraryListCache>()
     private val localLibrarySearchIndexLock = Any()
     @Volatile private var localLibrarySearchIndex: LocalLibrarySearchIndex? = null
@@ -2210,11 +2211,13 @@ class WebDavDriveHook(
     }
 
     private fun copyBookWithBackup(book: Any, backupType: Int, backupId: String, backupCode: String): Any {
-        val copyMethod = book.javaClass.methods.first {
+        val copyMethod = book.javaClass.methods.firstOrNull {
+            it.name == "copy" && it.parameterTypes.size == 24
+        } ?: book.javaClass.methods.first {
             it.name == "copy" && it.parameterTypes.size == 23
-        }.apply { isAccessible = true }
-        return copyMethod.invoke(
-            book,
+        }
+        copyMethod.isAccessible = true
+        val args = mutableListOf<Any?>(
             book.callLong("getId"),
             book.callString("getUuid"),
             book.callLong("getUid"),
@@ -2227,18 +2230,26 @@ class WebDavDriveHook(
             book.callString("getGroup"),
             book.callLong("getCreated"),
             book.callInt("getCfiVersion"),
-            book.callString("getEpubcfi"),
-            book.callString("getChapter"),
-            book.callFloat("getProgress"),
-            book.callLong("getTotal"),
-            book.callLong("getFinished"),
-            book.callLong("getUpdated"),
-            book.callLong("getCloudId"),
-            backupType,
-            backupId,
-            backupCode,
-            book.callString("getPublisher"),
         )
+        if (copyMethod.parameterTypes.size == 24) {
+            args.add(book.callInt("getEmbeddedFonts"))
+        }
+        args.addAll(
+            listOf(
+                book.callString("getEpubcfi"),
+                book.callString("getChapter"),
+                book.callFloat("getProgress"),
+                book.callLong("getTotal"),
+                book.callLong("getFinished"),
+                book.callLong("getUpdated"),
+                book.callLong("getCloudId"),
+                backupType,
+                backupId,
+                backupCode,
+                book.callString("getPublisher"),
+            ),
+        )
+        return copyMethod.invoke(book, *args.toTypedArray())
     }
 
     private fun copyCloudBookWithType(book: Any, type: Int): Any {
@@ -2380,6 +2391,13 @@ class WebDavDriveHook(
                             }
                         }
                     }
+
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val key = param.args?.getOrNull(0)?.callString("getKey").orEmpty()
+                        if ((webDavRunningSyncAuthCardDepth.get() ?: 0) > 0 && key == STRING_KEY_UPLOAD_TO_115) {
+                            param.result = "上传到 $WEBDAV_TITLE"
+                        }
+                    }
                 })
             }
             XposedBridge.log("$LOG_PREFIX WebDAV cloud storage string hook installed")
@@ -2442,10 +2460,12 @@ class WebDavDriveHook(
                         BACKUP_TYPE_WEBDAV -> {
                             val next = (webDavCloudScreenDepth.get() ?: 0) - 1
                             if (next <= 0) webDavCloudScreenDepth.remove() else webDavCloudScreenDepth.set(next)
+                            refreshCloudStorageScreen(type)
                         }
                         BACKUP_TYPE_LOCAL_LIBRARY -> {
                             val next = (localLibraryCloudScreenDepth.get() ?: 0) - 1
                             if (next <= 0) localLibraryCloudScreenDepth.remove() else localLibraryCloudScreenDepth.set(next)
+                            refreshCloudStorageScreen(type)
                         }
                     }
                 }
@@ -2506,9 +2526,11 @@ class WebDavDriveHook(
                     }
                     if (type == BACKUP_TYPE_LOCAL_LIBRARY) {
                         updateLocalLibraryStorageTree(viewModel, currentLocalLibraryBrowseDir())
+                        refreshLocalLibraryAsync(currentLocalLibraryBrowseDir(), force = true)
                         logWebDav("local library cloud storage viewModel registered")
                     } else {
                         updateWebDavStorageTree(viewModel, currentWebDavBrowseDir())
+                        refreshWebDavLibraryAsync(currentWebDavBrowseDir())
                         logWebDav("WebDAV cloud storage viewModel registered")
                     }
                 }
@@ -3503,10 +3525,11 @@ class WebDavDriveHook(
         }.start()
     }
 
-    private fun refreshLocalLibrary(path: String = currentLocalLibraryBrowseDir()) {
+    private fun refreshLocalLibrary(path: String = currentLocalLibraryBrowseDir(), force: Boolean = false) {
         val flow = synchronized(localLibraryLock) { localLibraryFlow } ?: return
         runCatching {
             val normalizedPath = localLibraryPathArg(path)
+            if (force) clearLocalLibraryListCache()
             val items = listLocalLibrary(normalizedPath)
                 .filter { it.isDirectory || isSupportedBookFile(it.name) }
                 .map {
@@ -3526,10 +3549,34 @@ class WebDavDriveHook(
         }
     }
 
-    private fun refreshLocalLibraryAsync(path: String = currentLocalLibraryBrowseDir()) {
+    private fun refreshLocalLibraryAsync(path: String = currentLocalLibraryBrowseDir(), force: Boolean = false) {
         Thread {
-            refreshLocalLibrary(path)
+            refreshLocalLibrary(path, force)
         }.start()
+    }
+
+    private fun refreshCloudStorageScreen(type: Int) {
+        val path = when (type) {
+            BACKUP_TYPE_WEBDAV -> currentWebDavBrowseDir()
+            BACKUP_TYPE_LOCAL_LIBRARY -> currentLocalLibraryBrowseDir()
+            else -> return
+        }
+        val key = "$type:$path"
+        val now = System.currentTimeMillis()
+        val last = cloudStorageScreenRefreshAt[key] ?: 0L
+        if (now - last < CLOUD_STORAGE_SCREEN_REFRESH_DEBOUNCE_MS) return
+        cloudStorageScreenRefreshAt[key] = now
+        when (type) {
+            BACKUP_TYPE_WEBDAV -> {
+                updateWebDavStorageTrees(path)
+                refreshWebDavLibraryAsync(path)
+            }
+            BACKUP_TYPE_LOCAL_LIBRARY -> {
+                updateLocalLibraryStorageTrees(path)
+                refreshLocalLibraryAsync(path, force = true)
+            }
+        }
+        logWebDav("cloud storage screen refresh scheduled type=$type path=$path")
     }
 
     private fun searchWebDavBooks(query: String): List<Any> {
@@ -6782,6 +6829,8 @@ class WebDavDriveHook(
         const val LOCAL_LIBRARY_SEARCH_BACKGROUND_BUDGET_MS = 8_000L
         const val LOCAL_LIBRARY_SEARCH_REFRESH_DELAY_MS = 1_600L
         const val LOCAL_LIBRARY_SEARCH_LATE_REFRESH_DELAY_MS = 4_500L
+        const val CLOUD_STORAGE_SCREEN_REFRESH_DEBOUNCE_MS = 1_000L
+        const val STRING_KEY_UPLOAD_TO_115 = "upload_to_115"
         const val HOME_SEARCH_DEBOUNCE_MS = 250L
         const val DOWNLOAD_CANCEL_CONFIRM_WINDOW_MS = 2_500L
         const val STARTUP_CACHE_CLEANUP_DELAY_MS = 1_500L
