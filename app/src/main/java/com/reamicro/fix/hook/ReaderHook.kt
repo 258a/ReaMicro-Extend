@@ -1226,7 +1226,8 @@ class ReaderHook(
         if (!result.cfi.isNullOrBlank()) {
             XposedBridge.log(
                 "$LOG_PREFIX full-text search jump result index=$resultIndex chapter=${result.chapterTitle} " +
-                    "file=${result.file.name} cfi=${result.cfi} snippet=${result.snippet.take(80)}",
+                    "file=${result.file.name} jumpCfi=${result.cfi} startCfi=${result.startCfi.orEmpty()} " +
+                    "endCfi=${result.endCfi.orEmpty()} snippet=${result.snippet.take(80)}",
             )
             if (!isValidEpubCfi(result.cfi)) {
                 XposedBridge.log("$LOG_PREFIX full-text search invalid cfi: ${result.cfi}")
@@ -1246,7 +1247,6 @@ class ReaderHook(
                     receiver = receiver,
                     viewModel = viewModel,
                     cfi = result.cfi,
-                    mark = highlightMark,
                     chapterIndex = result.chapterIndex.coerceAtLeast(0),
                     title = result.chapterTitle,
                     summary = result.snippet,
@@ -1422,7 +1422,6 @@ class ReaderHook(
                 receiver = receiver,
                 viewModel = viewModel,
                 cfi = cfi,
-                mark = highlightMark,
                 chapterIndex = result.chapterIndex.coerceAtLeast(0),
                 title = result.chapterTitle,
                 summary = result.snippet,
@@ -1559,7 +1558,7 @@ class ReaderHook(
     }
 
     private fun createSearchResultHighlightMark(result: FullTextSearchResult, resultIndex: Int): Any? {
-        val startCfi = result.cfi?.takeIf { it.isNotBlank() } ?: return null
+        val startCfi = result.startCfi?.takeIf { it.isNotBlank() } ?: result.cfi?.takeIf { it.isNotBlank() } ?: return null
         val endCfi = result.endCfi?.takeIf { it.isNotBlank() && it != startCfi } ?: return null
         return createReaderMark(
             id = SEARCH_HIGHLIGHT_MARK_ID_BASE + resultIndex.coerceAtLeast(0),
@@ -2121,7 +2120,8 @@ class ReaderHook(
             val index = document.lowerText.indexOf(needle, from)
             if (index < 0) break
             val snippet = snippetFor(document.text, index, index + keyword.length)
-            val cfi = document.indexedText.cfiAt(index)
+            val startCfi = document.indexedText.cfiAt(index)
+            val cfi = document.indexedText.cfiAtSearchJump(index, keyword.length) ?: startCfi
             val endCfi = document.indexedText.cfiAtBoundary(index + keyword.length)
             results.add(
                 FullTextSearchResult(
@@ -2129,6 +2129,7 @@ class ReaderHook(
                     chapter = document.chapter,
                     chapterTitle = document.chapterTitle,
                     intentReceiver = context.intentReceiver,
+                    startCfi = startCfi,
                     cfi = cfi,
                     endCfi = endCfi,
                     file = document.file,
@@ -2140,7 +2141,8 @@ class ReaderHook(
             )
             XposedBridge.log(
                 "$LOG_PREFIX full-text search hit chapter=${document.chapterTitle} " +
-                    "file=${document.file.name} index=$index cfi=${cfi.orEmpty()} snippet=${snippet.text.take(60)}",
+                    "file=${document.file.name} index=$index startCfi=${startCfi.orEmpty()} " +
+                    "jumpCfi=${cfi.orEmpty()} endCfi=${endCfi.orEmpty()} snippet=${snippet.text.take(60)}",
             )
             countInFile++
             from = index + needle.length.coerceAtLeast(1)
@@ -2930,6 +2932,20 @@ class ReaderHook(
             return span.cfiAt(bounded - span.start)
         }
 
+        fun cfiAtSearchJump(startIndex: Int, length: Int): String? {
+            if (text.isEmpty()) return null
+            val safeStart = startIndex.coerceIn(0, text.lastIndex)
+            val safeLength = length.coerceAtLeast(1)
+            val lastMatchIndex = (safeStart + safeLength - 1).coerceIn(safeStart, text.lastIndex)
+            val candidates = listOf(
+                (safeStart + safeLength / 2).coerceIn(safeStart, lastMatchIndex),
+                lastMatchIndex,
+                safeStart,
+            ).distinct()
+            return candidates.firstNotNullOfOrNull { cfiAt(it) }
+                ?: cfiAtBoundary(safeStart + safeLength)
+        }
+
         private fun TextSpan.cfiAt(relativeIndex: Int): String {
             val elementPath = elementSteps.joinToString(separator = "") { "/$it" }
             val offset = (textOffset + relativeIndex).coerceAtLeast(0)
@@ -2942,6 +2958,7 @@ class ReaderHook(
         val chapter: Any?,
         val chapterTitle: String,
         val intentReceiver: Any?,
+        val startCfi: String?,
         val cfi: String?,
         val endCfi: String?,
         val file: File,
