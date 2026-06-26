@@ -1737,20 +1737,27 @@ class ReaderHook(
 
     private fun scheduleSearchJumpVisibilityCorrection(receiver: Any?, viewModel: Any?, mark: Any) {
         val id = searchResultHighlightMarkId(mark) ?: return
+        var corrected = false
         val block = {
             if (activeSearchHighlightId == id && activeSearchHighlightVisibleId != id) {
-                XposedBridge.log("$LOG_PREFIX full-text search highlight not visible after jump; correcting to next page id=$id")
-                dispatchTapDirection(receiver, viewModel, next = true)
+                if (!corrected) {
+                    corrected = true
+                    XposedBridge.log("$LOG_PREFIX full-text search highlight not visible after jump; correcting to next page id=$id")
+                    dispatchTapDirection(receiver, viewModel, next = true)
+                }
                 scheduleSearchResultHighlightRefresh(viewModel ?: currentViewModelRef?.get(), mark, id, 250L)
             }
         }
         val view = activityProvider()?.window?.decorView
         if (view != null) {
-            view.postDelayed(block, SEARCH_JUMP_VISIBILITY_CHECK_DELAY_MS)
+            view.postDelayed(block, SEARCH_JUMP_FAST_VISIBILITY_CHECK_DELAY_MS)
+            view.postDelayed(block, SEARCH_JUMP_RETRY_VISIBILITY_CHECK_DELAY_MS)
         } else {
             Thread {
                 runCatching {
-                    Thread.sleep(SEARCH_JUMP_VISIBILITY_CHECK_DELAY_MS)
+                    Thread.sleep(SEARCH_JUMP_FAST_VISIBILITY_CHECK_DELAY_MS)
+                    block()
+                    Thread.sleep(SEARCH_JUMP_RETRY_VISIBILITY_CHECK_DELAY_MS - SEARCH_JUMP_FAST_VISIBILITY_CHECK_DELAY_MS)
                     block()
                 }
             }.apply {
@@ -2863,7 +2870,8 @@ class ReaderHook(
         const val SEARCH_MENU_BUTTON_BOTTOM_MARGIN_DP = 166
         const val SEARCH_NAVIGATION_READER_BOTTOM_MARGIN_DP = 8
         const val SEARCH_NAVIGATION_MENU_BOTTOM_MARGIN_DP = 190
-        const val SEARCH_JUMP_VISIBILITY_CHECK_DELAY_MS = 900L
+        const val SEARCH_JUMP_FAST_VISIBILITY_CHECK_DELAY_MS = 220L
+        const val SEARCH_JUMP_RETRY_VISIBILITY_CHECK_DELAY_MS = 520L
         const val MARK_KIND_HIGHLIGHT = 0
         const val MARK_STYLE_FILL = 0
         const val MARK_STYLE_LINE = 1
@@ -2987,9 +2995,12 @@ class ReaderHook(
             if (text.isEmpty()) return null
             val safeStart = startIndex.coerceIn(0, text.lastIndex)
             val safeLength = length.coerceAtLeast(1)
+            val safeEnd = safeStart + safeLength
             val lastMatchIndex = (safeStart + safeLength - 1).coerceIn(safeStart, text.lastIndex)
             val candidates = listOf(
-                safeStart + safeLength,
+                safeEnd + 16,
+                safeEnd + 4,
+                safeEnd,
                 lastMatchIndex,
                 (safeStart + safeLength / 2).coerceIn(safeStart, lastMatchIndex),
                 safeStart,
