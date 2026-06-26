@@ -77,6 +77,7 @@ class ReaderHook(
     @Volatile private var activeSearchHighlightVisibleId: Long? = null
     @Volatile private var activeSearchHighlightRenderLogId: Long? = null
     @Volatile private var activeSearchHighlightRenderLogCount: Int = 0
+    @Volatile private var pendingSearchOriginRestore: Boolean = false
 
     fun install() {
         installNativeSelectionHooks()
@@ -104,6 +105,7 @@ class ReaderHook(
                 override fun afterHookedMethod(param: MethodHookParam) {
                     currentViewModelRef = WeakReference(param.thisObject)
                     XposedBridge.log("$LOG_PREFIX ReaderViewModel created")
+                    scheduleRestorePersistedSearchOrigin("viewModel created")
                 }
             })
             XposedBridge.hookAllMethods(cls, "onCleared", object : XC_MethodHook() {
@@ -164,6 +166,7 @@ class ReaderHook(
                         }
                         lastCatalogContext = context
                         ensureSearchIndexAsync(context)
+                        scheduleRestorePersistedSearchOrigin("catalog context")
                     }
                 })
             }
@@ -176,7 +179,10 @@ class ReaderHook(
     private fun clearSearchOverlays(clearNavigationState: Boolean) {
         closeSearchPage()
         removeSearchMenuButton()
-        if (clearNavigationState) activeSearchNavigation = null
+        if (clearNavigationState) {
+            activeSearchNavigation = null
+            clearPersistedSearchOrigin()
+        }
         removeSearchNavigationBar()
     }
 
@@ -933,6 +939,7 @@ class ReaderHook(
                     XposedBridge.hookMethod(method, object : XC_MethodHook() {
                         override fun beforeHookedMethod(param: MethodHookParam) {
                             currentPageRef = WeakReference(param.args?.getOrNull(1))
+                            scheduleRestorePersistedSearchOrigin("page rendered")
                             val args = param.args ?: return
                             val marksIndex = 4
                             val originalMarks = args.getOrNull(marksIndex) as? List<*> ?: return
@@ -1306,11 +1313,13 @@ class ReaderHook(
             return
         }
         if (jumped && activity != null && returnTarget != null) {
-            activeSearchNavigation = SearchNavigationState(
+            val navigation = SearchNavigationState(
                 bookKey = lastSearchState?.bookKey ?: lastCatalogContext?.let(::bookKey).orEmpty(),
                 returnTarget = returnTarget,
                 currentIndex = resultIndex,
             )
+            activeSearchNavigation = navigation
+            persistSearchOrigin(navigation)
             activity.runOnUiThread { ensureSearchNavigationBar(activity) }
         }
     }
@@ -1424,6 +1433,7 @@ class ReaderHook(
             XposedBridge.log("$LOG_PREFIX full-text search return failed: ${it.stackTraceToString()}")
         }.getOrDefault(false)
         if (clearNavigation) activeSearchNavigation = null
+        if (jumped || clearNavigation) clearPersistedSearchOrigin()
         clearSearchResultHighlight()
         activityProvider()?.let { activity ->
             activity.runOnUiThread {
@@ -1528,6 +1538,7 @@ class ReaderHook(
                     setOnClickListener { returnToSearchOrigin() }
                     setOnLongClickListener {
                         activeSearchNavigation = null
+                        clearPersistedSearchOrigin()
                         clearSearchResultHighlight()
                         removeSearchNavigationBar()
                         true
@@ -1601,8 +1612,116 @@ class ReaderHook(
 
     private fun clearStaleSearchNavigation() {
         activeSearchNavigation = null
+        clearPersistedSearchOrigin()
         clearSearchResultHighlight()
         activityProvider()?.runOnUiThread { removeSearchNavigationBar() }
+    }
+
+    private fun scheduleRestorePersistedSearchOrigin(reason: String) {
+        if (activeSearchNavigation != null || pendingSearchOriginRestore) return
+        val activity = activityProvider() ?: return
+        val persisted = readPersistedSearchOrigin() ?: return
+        if (!isPersistedSearchOriginForCurrentBook(persisted)) return
+        pendingSearchOriginRestore = true
+        activity.window?.decorView?.postDelayed({
+            restorePersistedSearchOrigin(reason)
+        }, SEARCH_ORIGIN_RESTORE_DELAY_MS)
+    }
+
+    private fun restorePersistedSearchOrigin(reason: String) {
+        val persisted = readPersistedSearchOrigin()
+        if (persisted == null) {
+            pendingSearchOriginRestore = false
+            return
+        }
+        if (!isPersistedSearchOriginForCurrentBook(persisted)) {
+            pendingSearchOriginRestore = false
+            return
+        }
+        val viewModel = currentViewModelRef?.get()
+        if (viewModel == null && lastCatalogContext?.intentReceiver == null) {
+            pendingSearchOriginRestore = false
+            return
+        }
+        val jumped = runCatching {
+            jumpToCfi(
+                receiver = lastCatalogContext?.intentReceiver,
+                viewModel = viewModel,
+                cfi = persisted.returnTarget.cfi,
+                chapterIndex = persisted.returnTarget.chapterIndex,
+                title = persisted.returnTarget.title,
+                summary = persisted.returnTarget.summary,
+            )
+        }.onFailure {
+            XposedBridge.log("$LOG_PREFIX persisted search origin restore failed: ${it.stackTraceToString()}")
+        }.getOrDefault(false)
+        if (jumped) {
+            XposedBridge.log("$LOG_PREFIX persisted search origin restored reason=$reason cfi=${persisted.returnTarget.cfi}")
+            clearPersistedSearchOrigin()
+            activeSearchNavigation = null
+            clearSearchResultHighlight()
+            activityProvider()?.runOnUiThread { removeSearchNavigationBar() }
+        }
+        pendingSearchOriginRestore = false
+    }
+
+    private fun isPersistedSearchOriginForCurrentBook(persisted: PersistedSearchOrigin): Boolean {
+        if (System.currentTimeMillis() - persisted.timestamp > SEARCH_ORIGIN_MAX_AGE_MS) {
+            clearPersistedSearchOrigin()
+            return false
+        }
+        lastCatalogContext?.let { context ->
+            val currentKey = bookKey(context)
+            if (currentKey.isNotBlank() && persisted.bookKey.isNotBlank()) {
+                return currentKey == persisted.bookKey
+            }
+        }
+        val currentRoot = currentEpubRoot()?.absolutePath.orEmpty()
+        return currentRoot.isNotBlank() &&
+            persisted.epubRoot.isNotBlank() &&
+            currentRoot == persisted.epubRoot
+    }
+
+    private fun persistSearchOrigin(navigation: SearchNavigationState) {
+        val activity = activityProvider() ?: return
+        val target = navigation.returnTarget
+        activity.applicationContext
+            .getSharedPreferences(SEARCH_ORIGIN_PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putLong(SEARCH_ORIGIN_KEY_TIMESTAMP, System.currentTimeMillis())
+            .putString(SEARCH_ORIGIN_KEY_BOOK, navigation.bookKey)
+            .putString(SEARCH_ORIGIN_KEY_EPUB_ROOT, currentEpubRoot()?.absolutePath.orEmpty())
+            .putString(SEARCH_ORIGIN_KEY_CFI, target.cfi)
+            .putInt(SEARCH_ORIGIN_KEY_CHAPTER_INDEX, target.chapterIndex)
+            .putString(SEARCH_ORIGIN_KEY_TITLE, target.title)
+            .putString(SEARCH_ORIGIN_KEY_SUMMARY, target.summary)
+            .apply()
+    }
+
+    private fun readPersistedSearchOrigin(): PersistedSearchOrigin? {
+        val activity = activityProvider() ?: return null
+        val prefs = activity.applicationContext.getSharedPreferences(SEARCH_ORIGIN_PREFS, Context.MODE_PRIVATE)
+        val cfi = prefs.getString(SEARCH_ORIGIN_KEY_CFI, null)?.takeIf { it.isNotBlank() } ?: return null
+        return PersistedSearchOrigin(
+            timestamp = prefs.getLong(SEARCH_ORIGIN_KEY_TIMESTAMP, 0L),
+            bookKey = prefs.getString(SEARCH_ORIGIN_KEY_BOOK, null).orEmpty(),
+            epubRoot = prefs.getString(SEARCH_ORIGIN_KEY_EPUB_ROOT, null).orEmpty(),
+            returnTarget = ReadingTarget(
+                cfi = cfi,
+                chapterIndex = prefs.getInt(SEARCH_ORIGIN_KEY_CHAPTER_INDEX, 0),
+                title = prefs.getString(SEARCH_ORIGIN_KEY_TITLE, null).orEmpty().ifBlank { "\u539f\u6765\u8fdb\u5ea6" },
+                summary = prefs.getString(SEARCH_ORIGIN_KEY_SUMMARY, null).orEmpty(),
+            ),
+        )
+    }
+
+    private fun clearPersistedSearchOrigin() {
+        val activity = activityProvider() ?: return
+        activity.applicationContext
+            .getSharedPreferences(SEARCH_ORIGIN_PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .clear()
+            .apply()
     }
 
     private fun createSearchResultHighlightMark(result: FullTextSearchResult, resultIndex: Int): Any? {
@@ -1795,6 +1914,7 @@ class ReaderHook(
             view.postDelayed(block, SEARCH_JUMP_FAST_VISIBILITY_CHECK_DELAY_MS)
             view.postDelayed(block, SEARCH_JUMP_RETRY_VISIBILITY_CHECK_DELAY_MS)
             view.postDelayed(block, SEARCH_JUMP_FINAL_VISIBILITY_CHECK_DELAY_MS)
+            view.postDelayed(block, SEARCH_JUMP_LAST_VISIBILITY_CHECK_DELAY_MS)
         } else {
             Thread {
                 runCatching {
@@ -1803,6 +1923,8 @@ class ReaderHook(
                     Thread.sleep(SEARCH_JUMP_RETRY_VISIBILITY_CHECK_DELAY_MS - SEARCH_JUMP_FAST_VISIBILITY_CHECK_DELAY_MS)
                     block()
                     Thread.sleep(SEARCH_JUMP_FINAL_VISIBILITY_CHECK_DELAY_MS - SEARCH_JUMP_RETRY_VISIBILITY_CHECK_DELAY_MS)
+                    block()
+                    Thread.sleep(SEARCH_JUMP_LAST_VISIBILITY_CHECK_DELAY_MS - SEARCH_JUMP_FINAL_VISIBILITY_CHECK_DELAY_MS)
                     block()
                 }
             }.apply {
@@ -2925,10 +3047,21 @@ class ReaderHook(
         const val SEARCH_NAVIGATION_READER_BOTTOM_MARGIN_DP = 8
         const val SEARCH_NAVIGATION_MENU_BOTTOM_MARGIN_DP = 190
         const val SEARCH_JUMP_FAST_VISIBILITY_CHECK_DELAY_MS = 220L
-        const val SEARCH_JUMP_RETRY_VISIBILITY_CHECK_DELAY_MS = 520L
-        const val SEARCH_JUMP_FINAL_VISIBILITY_CHECK_DELAY_MS = 900L
-        const val SEARCH_JUMP_MAX_CORRECTION_ATTEMPTS = 3
+        const val SEARCH_JUMP_RETRY_VISIBILITY_CHECK_DELAY_MS = 620L
+        const val SEARCH_JUMP_FINAL_VISIBILITY_CHECK_DELAY_MS = 1200L
+        const val SEARCH_JUMP_LAST_VISIBILITY_CHECK_DELAY_MS = 1800L
+        const val SEARCH_JUMP_MAX_CORRECTION_ATTEMPTS = 4
         const val SEARCH_HIGHLIGHT_OFFSET_TOLERANCE = 8
+        const val SEARCH_ORIGIN_PREFS = "reamicro_search_origin"
+        const val SEARCH_ORIGIN_KEY_TIMESTAMP = "timestamp"
+        const val SEARCH_ORIGIN_KEY_BOOK = "book"
+        const val SEARCH_ORIGIN_KEY_EPUB_ROOT = "epub_root"
+        const val SEARCH_ORIGIN_KEY_CFI = "cfi"
+        const val SEARCH_ORIGIN_KEY_CHAPTER_INDEX = "chapter_index"
+        const val SEARCH_ORIGIN_KEY_TITLE = "title"
+        const val SEARCH_ORIGIN_KEY_SUMMARY = "summary"
+        const val SEARCH_ORIGIN_RESTORE_DELAY_MS = 360L
+        const val SEARCH_ORIGIN_MAX_AGE_MS = 24L * 60L * 60L * 1000L
         const val MARK_KIND_HIGHLIGHT = 0
         const val MARK_STYLE_FILL = 0
         const val MARK_STYLE_LINE = 1
@@ -2985,6 +3118,13 @@ class ReaderHook(
         val bookKey: String,
         val returnTarget: ReadingTarget,
         val currentIndex: Int,
+    )
+
+    private data class PersistedSearchOrigin(
+        val timestamp: Long,
+        val bookKey: String,
+        val epubRoot: String,
+        val returnTarget: ReadingTarget,
     )
 
     private data class IndexedChapter(
