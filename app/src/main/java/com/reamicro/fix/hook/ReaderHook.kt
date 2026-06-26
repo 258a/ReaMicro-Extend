@@ -64,9 +64,12 @@ class ReaderHook(
     private var searchOverlayThemeCallbacksActivityRef: WeakReference<Activity>? = null
     private var bottomSearchReceiverRef: WeakReference<Any>? = null
     private var bottomSearchBookRef: WeakReference<Any>? = null
+    private val renderingEpubPage = ThreadLocal<Any?>()
     @Volatile private var lastCatalogContext: CatalogContext? = null
     @Volatile private var lastSearchState: SearchState? = null
     @Volatile private var activeSearchNavigation: SearchNavigationState? = null
+    @Volatile private var currentVisiblePageSignature: String? = null
+    @Volatile private var currentVisiblePageNumber: Int? = null
     @Volatile private var searchIndexState: SearchIndexState? = null
     @Volatile private var searchIndexBuildingKey: String? = null
     @Volatile private var searchStateGeneration: Long = 0L
@@ -75,6 +78,8 @@ class ReaderHook(
     @Volatile private var activeSearchHighlightId: Long? = null
     @Volatile private var activeSearchHighlightMark: Any? = null
     @Volatile private var activeSearchHighlightVisibleId: Long? = null
+    @Volatile private var activeSearchHighlightPageSignature: String? = null
+    @Volatile private var activeSearchHighlightPageNumber: Int? = null
     @Volatile private var activeSearchHighlightRenderLogId: Long? = null
     @Volatile private var activeSearchHighlightRenderLogCount: Int = 0
     @Volatile private var pendingSearchOriginRestore: Boolean = false
@@ -116,6 +121,19 @@ class ReaderHook(
                     currentEpubRef = null
                     currentPageRef = null
                     resetFullTextSearchState("ReaderViewModel cleared", removeOverlays = true)
+                }
+            })
+            XposedBridge.hookAllMethods(cls, "intent", object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val intent = param.args?.getOrNull(0) ?: return
+                    if (intent.javaClass.name != "$READER_UI_INTENT_CLASS\$Statistics") return
+                    val page = callNoArg(intent, "getPage") ?: return
+                    currentVisiblePageSignature = epubPageSignature(page)
+                    currentVisiblePageNumber = epubPageNumber(page)
+                    XposedBridge.log(
+                        "$LOG_PREFIX full-text search visible page " +
+                            "number=${currentVisiblePageNumber ?: -1} sig=${currentVisiblePageSignature.orEmpty()}",
+                    )
                 }
             })
         }.onFailure {
@@ -938,13 +956,19 @@ class ReaderHook(
                     method.isAccessible = true
                     XposedBridge.hookMethod(method, object : XC_MethodHook() {
                         override fun beforeHookedMethod(param: MethodHookParam) {
-                            currentPageRef = WeakReference(param.args?.getOrNull(1))
+                            val page = param.args?.getOrNull(1)
+                            currentPageRef = WeakReference(page)
+                            renderingEpubPage.set(page)
                             scheduleRestorePersistedSearchOrigin("page rendered")
                             val args = param.args ?: return
                             val marksIndex = 4
                             val originalMarks = args.getOrNull(marksIndex) as? List<*> ?: return
                             val nextMarks = appendActiveSearchHighlightMark(originalMarks, "EpubContainer") ?: return
                             args[marksIndex] = nextMarks
+                        }
+
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            renderingEpubPage.remove()
                         }
                     })
                 }
@@ -1788,6 +1812,8 @@ class ReaderHook(
         activeSearchHighlightId = id
         activeSearchHighlightMark = mark
         activeSearchHighlightVisibleId = null
+        activeSearchHighlightPageSignature = null
+        activeSearchHighlightPageNumber = null
         activeSearchHighlightRenderLogId = null
         activeSearchHighlightRenderLogCount = 0
         XposedBridge.log("$LOG_PREFIX full-text search highlight active ${describeSearchHighlightMark(mark)}")
@@ -1828,6 +1854,8 @@ class ReaderHook(
         activeSearchHighlightId = null
         activeSearchHighlightMark = null
         activeSearchHighlightVisibleId = null
+        activeSearchHighlightPageSignature = null
+        activeSearchHighlightPageNumber = null
         activeSearchHighlightRenderLogId = null
         activeSearchHighlightRenderLogCount = 0
         return updateSearchMarks(viewModel, "clear") { marks ->
@@ -1880,6 +1908,10 @@ class ReaderHook(
         val id = searchResultHighlightMarkId(mark) ?: searchResultHighlightResolvedMarkId(mark) ?: return
         if (status == "output" || status == "forced") {
             activeSearchHighlightVisibleId = id
+            renderingEpubPage.get()?.let { page ->
+                activeSearchHighlightPageSignature = epubPageSignature(page)
+                activeSearchHighlightPageNumber = epubPageNumber(page)
+            }
         }
         if (activeSearchHighlightRenderLogId != id) {
             activeSearchHighlightRenderLogId = id
@@ -1897,14 +1929,17 @@ class ReaderHook(
         val id = searchResultHighlightMarkId(mark) ?: return
         var attempts = 0
         val block = {
-            if (activeSearchHighlightId == id && activeSearchHighlightVisibleId != id) {
+            if (activeSearchHighlightId == id && !isSearchHighlightOnCurrentVisiblePage(id)) {
                 if (attempts < SEARCH_JUMP_MAX_CORRECTION_ATTEMPTS) {
                     attempts++
+                    val next = searchHighlightCorrectionNext()
                     XposedBridge.log(
-                        "$LOG_PREFIX full-text search highlight not visible after jump; " +
-                            "correcting to next page id=$id attempt=$attempts",
+                        "$LOG_PREFIX full-text search highlight not on current page; " +
+                            "correcting id=$id attempt=$attempts next=$next " +
+                            "current=${currentVisiblePageNumber ?: -1}/${currentVisiblePageSignature.orEmpty()} " +
+                            "target=${activeSearchHighlightPageNumber ?: -1}/${activeSearchHighlightPageSignature.orEmpty()}",
                     )
-                    dispatchTapDirection(receiver, viewModel, next = true)
+                    dispatchTapDirection(receiver, viewModel, next = next)
                 }
                 scheduleSearchResultHighlightRefresh(viewModel ?: currentViewModelRef?.get(), mark, id, 250L)
             }
@@ -1932,6 +1967,33 @@ class ReaderHook(
                 isDaemon = true
                 start()
             }
+        }
+    }
+
+    private fun isSearchHighlightOnCurrentVisiblePage(id: Long): Boolean {
+        if (activeSearchHighlightId != id) return false
+        val targetSignature = activeSearchHighlightPageSignature
+        val currentSignature = currentVisiblePageSignature
+        if (!targetSignature.isNullOrBlank() && !currentSignature.isNullOrBlank()) {
+            return targetSignature == currentSignature
+        }
+        val targetNumber = activeSearchHighlightPageNumber
+        val currentNumber = currentVisiblePageNumber
+        if (targetNumber != null && currentNumber != null) {
+            return targetNumber == currentNumber
+        }
+        return activeSearchHighlightVisibleId == id &&
+            targetSignature.isNullOrBlank() &&
+            currentSignature.isNullOrBlank()
+    }
+
+    private fun searchHighlightCorrectionNext(): Boolean {
+        val targetNumber = activeSearchHighlightPageNumber
+        val currentNumber = currentVisiblePageNumber
+        return if (targetNumber != null && currentNumber != null && targetNumber != currentNumber) {
+            targetNumber > currentNumber
+        } else {
+            true
         }
     }
 
@@ -2107,6 +2169,23 @@ class ReaderHook(
         val end = callString(mark, "getEndCfi")
         val quote = callString(mark, "getQuote").take(24)
         return "id=$id style=$style color=$color start=$start end=$end quote=$quote"
+    }
+
+    private fun epubPageNumber(page: Any?): Int? =
+        (callNoArg(page, "getNumber") as? Number)?.toInt()
+            ?: (callNoArg(page, "getIndex") as? Number)?.toInt()
+
+    private fun epubPageSignature(page: Any?): String? {
+        val range = callNoArg(page, "getRange")?.toString().orEmpty()
+        val anchor = callString(page, "getAnchor")
+            .ifBlank { callNoArg(page, "getStart")?.toString().orEmpty() }
+        val number = epubPageNumber(page)
+        val signature = listOfNotNull(
+            number?.let { "n=$it" },
+            range.takeIf { it.isNotBlank() }?.let { "r=$it" },
+            anchor.takeIf { it.isNotBlank() }?.let { "a=$it" },
+        ).joinToString("|")
+        return signature.takeIf { it.isNotBlank() }
     }
 
     private fun updateSearchMarks(viewModel: Any?, label: String, transform: (List<Any>) -> List<Any>): Boolean =
