@@ -18,14 +18,27 @@ class AssociationSearchOrderingTest {
         assertEquals(listOf("b", "d", "a", "c"), ordered.map { it.sourceBookId })
     }
 
+    @Test
+    fun matchingIgnoresStructuralPunctuationAndPrefersSameAuthor() {
+        val ordered = listOf(
+            result("a", "The Book", BookSource.YouShu, author = "Other Author"),
+            result("b", "The-Book", BookSource.WanFengLi, author = "Target Author"),
+            result("c", "The.Book", BookSource.Ciweimao, author = "Target Author"),
+            result("d", "The Book", BookSource.FanQie, author = "Another Author"),
+        ).orderAssociationMatches("The Book", "Target Author")
+
+        assertEquals(listOf("b", "a", "d", "c"), ordered.map { it.sourceBookId })
+    }
+
     private fun result(
         id: String,
         title: String,
         source: BookSource,
+        author: String = "author-$id",
     ): BookSearchResult =
         BookSearchResult(
             title = title,
-            author = "author-$id",
+            author = author,
             source = source,
             sourceBookId = id,
         )

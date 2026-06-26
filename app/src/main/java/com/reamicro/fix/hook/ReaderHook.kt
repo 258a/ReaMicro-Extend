@@ -72,6 +72,10 @@ class ReaderHook(
     @Volatile private var searchStateGeneration: Long = 0L
     @Volatile private var searchRunSeq: Long = 0L
     @Volatile private var readerBottomMenuVisible: Boolean = false
+    @Volatile private var activeSearchHighlightId: Long? = null
+    @Volatile private var activeSearchHighlightMark: Any? = null
+    @Volatile private var activeSearchHighlightRenderLogId: Long? = null
+    @Volatile private var activeSearchHighlightRenderLogCount: Int = 0
 
     fun install() {
         installNativeSelectionHooks()
@@ -123,6 +127,7 @@ class ReaderHook(
         hookNativeSelectionMenu()
         hookCurrentEpub()
         hookCurrentEpubPage()
+        hookSearchHighlightRenderInputs()
     }
 
     private fun hookReaderCatalog() {
@@ -201,6 +206,9 @@ class ReaderHook(
 
     private fun handleHomeBookshelfRendered(source: String) {
         val hadReaderSearchState = hasFullTextSearchState()
+        if (activeSearchNavigation != null) {
+            returnToSearchOrigin(clearNavigation = true, removeBar = false)
+        }
         currentEpubRef = null
         currentPageRef = null
         readerBottomMenuVisible = false
@@ -224,6 +232,7 @@ class ReaderHook(
     private fun resetFullTextSearchState(reason: String, removeOverlays: Boolean) {
         searchStateGeneration += 1
         searchRunSeq += 1
+        clearSearchResultHighlight()
         bottomSearchReceiverRef = null
         bottomSearchBookRef = null
         lastCatalogContext = null
@@ -536,15 +545,16 @@ class ReaderHook(
             renderSearchResults(activity, resultsContainer, keyword, results, colors, searching)
         }
 
-        fun renderCached() {
+        fun renderCached(): Boolean {
             val cached = lastSearchState?.takeIf { it.bookKey == bookKey(context) }
             if (cached == null) {
                 clearVisibleResults()
-                return
+                return false
             }
             keywordInput.setText(cached.keyword)
             keywordInput.setSelection(keywordInput.text?.length ?: 0)
             renderVisibleResults(cached.keyword, cached.results)
+            return cached.results.isNotEmpty()
         }
 
         fun runSearch() {
@@ -683,10 +693,16 @@ class ReaderHook(
         activity.registerComponentCallbacks(themeCallbacks)
         dialog.show()
         dialog.window?.let { window ->
-            configureFullTextSearchWindow(window, colors)
+            configureFullTextSearchWindow(window, colors, requestKeyboard = lastSearchState?.takeIf {
+                it.bookKey == bookKey(context)
+            }?.results.isNullOrEmpty())
         }
-        renderCached()
-        focusEditorAndShowKeyboard(activity, keywordInput)
+        val hasCachedResults = renderCached()
+        if (hasCachedResults) {
+            hideKeyboard(keywordInput)
+        } else {
+            focusEditorAndShowKeyboard(activity, keywordInput)
+        }
     }
 
     private fun searchKeywordInputBackground(context: Context, colors: DialogColors): GradientDrawable =
@@ -911,12 +927,156 @@ class ReaderHook(
                     XposedBridge.hookMethod(method, object : XC_MethodHook() {
                         override fun beforeHookedMethod(param: MethodHookParam) {
                             currentPageRef = WeakReference(param.args?.getOrNull(1))
+                            val args = param.args ?: return
+                            val marksIndex = 4
+                            val originalMarks = args.getOrNull(marksIndex) as? List<*> ?: return
+                            val nextMarks = appendActiveSearchHighlightMark(originalMarks, "EpubContainer") ?: return
+                            args[marksIndex] = nextMarks
                         }
                     })
                 }
             XposedBridge.log("$LOG_PREFIX current EpubPage hook installed")
         }.onFailure {
             XposedBridge.log("$LOG_PREFIX current EpubPage hook failed: ${it.stackTraceToString()}")
+        }
+    }
+
+    private fun hookSearchHighlightRenderInputs() {
+        hookSearchHighlightMarksArgument(
+            className = "org.epub.ui.BodyKt",
+            methodName = "Body",
+            marksIndex = 4,
+            label = "Body",
+        )
+        hookSearchHighlightResolvedPage()
+        hookSearchHighlightContentOverlays()
+        hookSearchHighlightMarksArgument(
+            className = "app.zhendong.reamicro.ui.reader.components.ScrollPagerKt",
+            methodName = "resolveMarksForElement",
+            marksIndex = 1,
+            label = "ScrollResolve",
+        )
+    }
+
+    private fun hookSearchHighlightMarksArgument(
+        className: String,
+        methodName: String,
+        marksIndex: Int,
+        label: String,
+    ) {
+        runCatching {
+            val targetClass = classLoader.loadClass(className)
+            var count = 0
+            targetClass.declaredMethods
+                .filter { it.name == methodName && it.parameterTypes.size > marksIndex }
+                .forEach { method ->
+                    method.isAccessible = true
+                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            val args = param.args ?: return
+                            val originalMarks = args.getOrNull(marksIndex) as? List<*> ?: return
+                            val nextMarks = appendActiveSearchHighlightMark(originalMarks, label) ?: return
+                            args[marksIndex] = nextMarks
+                        }
+                    })
+                    count++
+                }
+            XposedBridge.log("$LOG_PREFIX full-text search highlight $label hook installed count=$count")
+        }.onFailure {
+            XposedBridge.log("$LOG_PREFIX full-text search highlight $label hook failed: ${it.stackTraceToString()}")
+        }
+    }
+
+    private fun hookSearchHighlightResolvedPage() {
+        runCatching {
+            val bodyClass = classLoader.loadClass("org.epub.ui.BodyKt")
+            val methods = bodyClass.declaredMethods.filter {
+                it.name == "resolveMarksForPage" && it.parameterTypes.size >= 2
+            }
+            methods.forEach { method ->
+                method.isAccessible = true
+                XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val args = param.args ?: return
+                        val originalMarks = args.getOrNull(0) as? List<*> ?: return
+                        val nextMarks = appendActiveSearchHighlightMark(originalMarks, "ResolvePageInput") ?: return
+                        args[0] = nextMarks
+                    }
+
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val mark = activeSearchHighlightMark ?: return
+                        val id = searchResultHighlightMarkId(mark) ?: return
+                        val current = (param.result as? List<*>)?.filterNotNull().orEmpty()
+                        if (current.any { searchResultHighlightResolvedMarkId(it) == id }) {
+                            logSearchHighlightResolvePage("hit", current.size, mark)
+                            return
+                        }
+                        val resolved = createResolvedSearchHighlightMark(mark) ?: return
+                        param.result = ArrayList<Any>(current.size + 1).apply {
+                            addAll(current)
+                            add(resolved)
+                        }
+                        logSearchHighlightResolvePage("forced", current.size + 1, mark)
+                    }
+                })
+            }
+            XposedBridge.log("$LOG_PREFIX full-text search highlight ResolvePage hook installed count=${methods.size}")
+        }.onFailure {
+            XposedBridge.log("$LOG_PREFIX full-text search highlight ResolvePage hook failed: ${it.stackTraceToString()}")
+        }
+    }
+
+    private fun hookSearchHighlightContentOverlays() {
+        runCatching {
+            val contentClass = classLoader.loadClass("org.epub.ui.ContentKt")
+            val methods = contentClass.declaredMethods.filter { method ->
+                method.parameterTypes.size == 5 &&
+                    List::class.java.isAssignableFrom(method.returnType) &&
+                    List::class.java.isAssignableFrom(method.parameterTypes[1]) &&
+                    method.parameterTypes[3] == Int::class.javaPrimitiveType
+            }
+            methods.forEach { method ->
+                method.isAccessible = true
+                XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val args = param.args ?: return
+                        val resolved = createResolvedSearchHighlightMark(activeSearchHighlightMark ?: return) ?: return
+                        val current = (args.getOrNull(1) as? List<*>)?.filterNotNull().orEmpty()
+                        val id = searchResultHighlightResolvedMarkId(resolved) ?: return
+                        if (current.any { searchResultHighlightResolvedMarkId(it) == id }) return
+                        args[1] = ArrayList<Any>(current.size + 1).apply {
+                            addAll(current)
+                            add(resolved)
+                        }
+                        logSearchHighlightContentOverlay("input", current.size + 1, activeSearchHighlightMark ?: resolved)
+                    }
+
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val mark = activeSearchHighlightMark ?: return
+                        val id = searchResultHighlightMarkId(mark) ?: return
+                        val current = (param.result as? List<*>)?.filterNotNull().orEmpty()
+                        if (current.any { searchResultHighlightOverlayMarkId(it) == id }) {
+                            logSearchHighlightContentOverlay("output", current.size, mark)
+                            return
+                        }
+                        val args = param.args ?: return
+                        val forced = createSearchHighlightContentOverlay(
+                            contentDom = args.getOrNull(0),
+                            visibleWindow = args.getOrNull(2),
+                            renderedTextLength = (args.getOrNull(3) as? Number)?.toInt() ?: return,
+                            mark = mark,
+                        ) ?: return
+                        param.result = ArrayList<Any>(current.size + 1).apply {
+                            addAll(current)
+                            add(forced)
+                        }
+                        logSearchHighlightContentOverlay("forced", current.size + 1, mark)
+                    }
+                })
+            }
+            XposedBridge.log("$LOG_PREFIX full-text search highlight ContentOverlay hook installed count=${methods.size}")
+        }.onFailure {
+            XposedBridge.log("$LOG_PREFIX full-text search highlight ContentOverlay hook failed: ${it.stackTraceToString()}")
         }
     }
 
@@ -1076,10 +1236,17 @@ class ReaderHook(
                 return
             }
             jumped = runCatching {
+                val highlightMark = createSearchResultHighlightMark(result, resultIndex)
+                if (highlightMark != null) {
+                    applySearchResultHighlight(viewModel, highlightMark)
+                } else {
+                    clearSearchResultHighlight(viewModel)
+                }
                 jumpToCfi(
                     receiver = receiver,
                     viewModel = viewModel,
                     cfi = result.cfi,
+                    mark = highlightMark,
                     chapterIndex = result.chapterIndex.coerceAtLeast(0),
                     title = result.chapterTitle,
                     summary = result.snippet,
@@ -1108,43 +1275,24 @@ class ReaderHook(
         receiver: Any?,
         viewModel: Any?,
         cfi: String,
+        mark: Any? = null,
         chapterIndex: Int,
         title: String,
         summary: String,
     ): Boolean {
         val markJumped = runCatching {
             val markClass = classLoader.loadClass(MARK_CLASS)
-            val mark = markClass.getDeclaredConstructor(
-                Long::class.javaPrimitiveType,
-                Long::class.javaPrimitiveType,
-                String::class.java,
-                Int::class.javaPrimitiveType,
-                String::class.java,
-                String::class.java,
-                String::class.java,
-                String::class.java,
-                Int::class.javaPrimitiveType,
-                String::class.java,
-                Int::class.javaPrimitiveType,
-                Long::class.javaPrimitiveType,
-                Long::class.javaPrimitiveType,
-            ).newInstance(
-                -System.currentTimeMillis(),
-                (callNoArg(lastCatalogContext?.book, "getId") as? Number)?.toLong() ?: 0L,
-                title,
-                0,
-                cfi,
-                cfi,
-                summary,
-                "",
-                1,
-                "red",
-                0,
-                System.currentTimeMillis(),
-                System.currentTimeMillis(),
-            )
+            val targetMark = mark ?: createReaderMark(
+                id = -System.currentTimeMillis(),
+                chapter = title,
+                startCfi = cfi,
+                endCfi = cfi,
+                quote = summary,
+                style = MARK_STYLE_LINE,
+                color = MARK_COLOR_RED,
+            ) ?: return@runCatching false
             val intentClass = classLoader.loadClass("$READER_UI_INTENT_CLASS\$MarkJump")
-            val intent = intentClass.getDeclaredConstructor(markClass).newInstance(mark)
+            val intent = intentClass.getDeclaredConstructor(markClass).newInstance(targetMark)
             dispatchReaderIntent(receiver, viewModel, intent, "MarkJump")
         }.onFailure {
             XposedBridge.log("$LOG_PREFIX full-text search mark jump failed: ${it.stackTraceToString()}")
@@ -1209,7 +1357,10 @@ class ReaderHook(
         )
     }
 
-    private fun returnToSearchOrigin() {
+    private fun returnToSearchOrigin(
+        clearNavigation: Boolean = true,
+        removeBar: Boolean = true,
+    ) {
         val navigation = activeSearchNavigation ?: return
         if (!isSearchNavigationCurrent(navigation)) {
             clearStaleSearchNavigation()
@@ -1228,11 +1379,12 @@ class ReaderHook(
         }.onFailure {
             XposedBridge.log("$LOG_PREFIX full-text search return failed: ${it.stackTraceToString()}")
         }.getOrDefault(false)
-        activeSearchNavigation = null
+        if (clearNavigation) activeSearchNavigation = null
+        clearSearchResultHighlight()
         activityProvider()?.let { activity ->
             activity.runOnUiThread {
                 if (!jumped) Toast.makeText(activity, "\u8fd4\u56de\u8fdb\u5ea6\u5931\u8d25", Toast.LENGTH_SHORT).show()
-                removeSearchNavigationBar()
+                if (removeBar) removeSearchNavigationBar()
             }
         }
     }
@@ -1260,7 +1412,21 @@ class ReaderHook(
         val receiver = result.intentReceiver ?: lastCatalogContext?.intentReceiver
         val viewModel = currentViewModelRef?.get()
         val jumped = runCatching {
-            jumpToCfi(receiver, viewModel, cfi, result.chapterIndex.coerceAtLeast(0), result.chapterTitle, result.snippet)
+            val highlightMark = createSearchResultHighlightMark(result, nextIndex)
+            if (highlightMark != null) {
+                applySearchResultHighlight(viewModel, highlightMark)
+            } else {
+                clearSearchResultHighlight(viewModel)
+            }
+            jumpToCfi(
+                receiver = receiver,
+                viewModel = viewModel,
+                cfi = cfi,
+                mark = highlightMark,
+                chapterIndex = result.chapterIndex.coerceAtLeast(0),
+                title = result.chapterTitle,
+                summary = result.snippet,
+            )
         }.onFailure {
             XposedBridge.log("$LOG_PREFIX full-text search relative cfi jump failed: ${it.stackTraceToString()}")
         }.getOrDefault(false)
@@ -1315,6 +1481,7 @@ class ReaderHook(
                     setOnClickListener { returnToSearchOrigin() }
                     setOnLongClickListener {
                         activeSearchNavigation = null
+                        clearSearchResultHighlight()
                         removeSearchNavigationBar()
                         true
                     }
@@ -1387,7 +1554,393 @@ class ReaderHook(
 
     private fun clearStaleSearchNavigation() {
         activeSearchNavigation = null
+        clearSearchResultHighlight()
         activityProvider()?.runOnUiThread { removeSearchNavigationBar() }
+    }
+
+    private fun createSearchResultHighlightMark(result: FullTextSearchResult, resultIndex: Int): Any? {
+        val startCfi = result.cfi?.takeIf { it.isNotBlank() } ?: return null
+        val endCfi = result.endCfi?.takeIf { it.isNotBlank() && it != startCfi } ?: return null
+        return createReaderMark(
+            id = SEARCH_HIGHLIGHT_MARK_ID_BASE + resultIndex.coerceAtLeast(0),
+            chapter = result.chapterTitle,
+            startCfi = startCfi,
+            endCfi = endCfi,
+            quote = result.matchText,
+            style = MARK_STYLE_FILL,
+            color = MARK_COLOR_YELLOW,
+        )
+    }
+
+    private fun createReaderMark(
+        id: Long,
+        chapter: String,
+        startCfi: String,
+        endCfi: String,
+        quote: String,
+        style: Int,
+        color: String,
+    ): Any? =
+        runCatching {
+            val markClass = classLoader.loadClass(MARK_CLASS)
+            val now = System.currentTimeMillis()
+            markClass.getDeclaredConstructor(
+                Long::class.javaPrimitiveType,
+                Long::class.javaPrimitiveType,
+                String::class.java,
+                Int::class.javaPrimitiveType,
+                String::class.java,
+                String::class.java,
+                String::class.java,
+                String::class.java,
+                Int::class.javaPrimitiveType,
+                String::class.java,
+                Int::class.javaPrimitiveType,
+                Long::class.javaPrimitiveType,
+                Long::class.javaPrimitiveType,
+            ).newInstance(
+                id,
+                (callNoArg(lastCatalogContext?.book, "getId") as? Number)?.toLong() ?: 0L,
+                chapter,
+                MARK_KIND_HIGHLIGHT,
+                startCfi,
+                endCfi,
+                quote,
+                "",
+                style,
+                color,
+                MARK_SYNCED_NO,
+                now,
+                now,
+            )
+        }.onFailure {
+            XposedBridge.log("$LOG_PREFIX create search highlight mark failed: ${it.stackTraceToString()}")
+        }.getOrNull()
+
+    private fun applySearchResultHighlight(viewModel: Any?, mark: Any) {
+        val id = searchResultHighlightMarkId(mark) ?: return
+        activeSearchHighlightId = id
+        activeSearchHighlightMark = mark
+        activeSearchHighlightRenderLogId = null
+        activeSearchHighlightRenderLogCount = 0
+        XposedBridge.log("$LOG_PREFIX full-text search highlight active ${describeSearchHighlightMark(mark)}")
+        injectSearchResultHighlight(viewModel, mark)
+        scheduleSearchResultHighlightRefresh(viewModel, mark, id, 350L)
+        scheduleSearchResultHighlightRefresh(viewModel, mark, id, 900L)
+    }
+
+    private fun scheduleSearchResultHighlightRefresh(viewModel: Any?, mark: Any, id: Long, delayMs: Long) {
+        val view = activityProvider()?.window?.decorView
+        val block = {
+            if (activeSearchHighlightId == id) {
+                injectSearchResultHighlight(viewModel ?: currentViewModelRef?.get(), mark)
+            }
+        }
+        if (view != null) {
+            view.postDelayed(block, delayMs)
+        } else {
+            Thread {
+                runCatching {
+                    Thread.sleep(delayMs)
+                    block()
+                }
+            }.apply {
+                name = "ReaMicroSearchHighlight"
+                isDaemon = true
+                start()
+            }
+        }
+    }
+
+    private fun injectSearchResultHighlight(viewModel: Any?, mark: Any): Boolean =
+        updateSearchMarks(viewModel, "inject") { marks ->
+            marks.filterNot(::isSearchResultHighlightMark) + mark
+        }
+
+    private fun clearSearchResultHighlight(viewModel: Any? = currentViewModelRef?.get()): Boolean {
+        activeSearchHighlightId = null
+        activeSearchHighlightMark = null
+        activeSearchHighlightRenderLogId = null
+        activeSearchHighlightRenderLogCount = 0
+        return updateSearchMarks(viewModel, "clear") { marks ->
+            val filtered = marks.filterNot(::isSearchResultHighlightMark)
+            if (filtered.size == marks.size) marks else filtered
+        }
+    }
+
+    private fun appendActiveSearchHighlightMark(original: List<*>, label: String? = null): List<Any>? {
+        val mark = activeSearchHighlightMark ?: return null
+        val cleanMarks = original.filterNotNull().filterNot(::isSearchResultHighlightMark)
+        if (cleanMarks.size == original.size && cleanMarks.any { it === mark }) return null
+        return ArrayList<Any>(cleanMarks.size + 1).apply {
+            addAll(cleanMarks)
+            add(mark)
+        }.also { next ->
+            label?.let { logSearchHighlightRenderInput(it, original.size, next.size, mark) }
+        }
+    }
+
+    private fun logSearchHighlightRenderInput(label: String, before: Int, after: Int, mark: Any) {
+        val id = searchResultHighlightMarkId(mark) ?: return
+        if (activeSearchHighlightRenderLogId != id) {
+            activeSearchHighlightRenderLogId = id
+            activeSearchHighlightRenderLogCount = 0
+        }
+        if (activeSearchHighlightRenderLogCount >= 8) return
+        activeSearchHighlightRenderLogCount++
+        XposedBridge.log(
+            "$LOG_PREFIX full-text search highlight render $label marks $before->$after " +
+                describeSearchHighlightMark(mark),
+        )
+    }
+
+    private fun logSearchHighlightResolvePage(status: String, count: Int, mark: Any) {
+        val id = searchResultHighlightMarkId(mark) ?: return
+        if (activeSearchHighlightRenderLogId != id) {
+            activeSearchHighlightRenderLogId = id
+            activeSearchHighlightRenderLogCount = 0
+        }
+        if (activeSearchHighlightRenderLogCount >= 8) return
+        activeSearchHighlightRenderLogCount++
+        XposedBridge.log(
+            "$LOG_PREFIX full-text search highlight ResolvePage $status result=$count " +
+                describeSearchHighlightMark(mark),
+        )
+    }
+
+    private fun logSearchHighlightContentOverlay(status: String, count: Int, mark: Any) {
+        val id = searchResultHighlightMarkId(mark) ?: searchResultHighlightResolvedMarkId(mark) ?: return
+        if (activeSearchHighlightRenderLogId != id) {
+            activeSearchHighlightRenderLogId = id
+            activeSearchHighlightRenderLogCount = 0
+        }
+        if (activeSearchHighlightRenderLogCount >= 12) return
+        activeSearchHighlightRenderLogCount++
+        XposedBridge.log(
+            "$LOG_PREFIX full-text search highlight ContentOverlay $status count=$count " +
+                describeSearchHighlightMark(mark),
+        )
+    }
+
+    private fun createResolvedSearchHighlightMark(mark: Any): Any? =
+        runCatching {
+            val cfiClass = classLoader.loadClass("org.epub.html.EpubCFI")
+            val cfiObject = companionObject(cfiClass) ?: return@runCatching null
+            val create = cfiObject.javaClass.methods.firstOrNull {
+                it.name == "create" && it.parameterTypes.size == 1 && it.parameterTypes[0] == String::class.java
+            } ?: return@runCatching null
+            val start = create.invoke(cfiObject, callString(mark, "getStartCfi")) ?: return@runCatching null
+            val end = create.invoke(cfiObject, callString(mark, "getEndCfi")) ?: return@runCatching null
+            val resolvedClass = classLoader.loadClass("org.epub.ui.ResolvedMark")
+            resolvedClass.getDeclaredConstructor(
+                Long::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
+                cfiClass,
+                cfiClass,
+                Int::class.javaPrimitiveType,
+                String::class.java,
+                String::class.java,
+            ).newInstance(
+                (callNoArg(mark, "getId") as? Number)?.toLong() ?: return@runCatching null,
+                (callNoArg(mark, "getKind") as? Number)?.toInt() ?: MARK_KIND_HIGHLIGHT,
+                start,
+                end,
+                (callNoArg(mark, "getStyle") as? Number)?.toInt() ?: MARK_STYLE_FILL,
+                callString(mark, "getColor"),
+                callString(mark, "getNote"),
+            )
+        }.onFailure {
+            XposedBridge.log("$LOG_PREFIX create resolved search highlight failed: ${it.stackTraceToString()}")
+        }.getOrNull()
+
+    private fun createSearchHighlightContentOverlay(
+        contentDom: Any?,
+        visibleWindow: Any?,
+        renderedTextLength: Int,
+        mark: Any,
+    ): Any? =
+        runCatching {
+            if (renderedTextLength <= 0) return@runCatching null
+            val quote = callString(mark, "getQuote").takeIf { it.isNotBlank() } ?: return@runCatching null
+            val content = callString(contentDom, "getContent").takeIf { it.isNotBlank() } ?: return@runCatching null
+            val location = callNoArg(contentDom, "getLocation")
+            val baseOffset = ((callNoArg(callNoArg(location, "getOffset"), "getOffset") as? Number)?.toInt() ?: 0)
+            val visibleStart = ((callNoArg(visibleWindow, "getStart") as? Number)?.toInt() ?: baseOffset)
+            val visibleEnd = ((callNoArg(visibleWindow, "getEndExclusive") as? Number)?.toInt()
+                ?: (baseOffset + content.length))
+            val windowStart = (visibleStart - baseOffset).coerceIn(0, content.length)
+            val windowEnd = (visibleEnd - baseOffset).coerceIn(windowStart, content.length)
+            val expectedLocalStart = cfiCharacterOffset(callString(mark, "getStartCfi"))
+                ?.let { it - baseOffset }
+                ?.takeIf { it in 0..content.length }
+            val matchStart = searchHighlightQuoteStart(
+                content = content,
+                quote = quote,
+                windowStart = windowStart,
+                windowEnd = windowEnd,
+                expectedLocalStart = expectedLocalStart,
+            ) ?: return@runCatching null
+            val matchEnd = (matchStart + quote.length).coerceAtMost(content.length)
+            val localStart = (baseOffset + matchStart - visibleStart).coerceIn(0, renderedTextLength)
+            val localEnd = (baseOffset + matchEnd - visibleStart).coerceIn(localStart, renderedTextLength)
+            if (localEnd <= localStart) return@runCatching null
+            val resolved = createResolvedSearchHighlightMark(mark) ?: return@runCatching null
+            val textRange = textRange(localStart, localEnd) ?: return@runCatching null
+            val color = markColorTokenToColor(callString(mark, "getColor")) ?: return@runCatching null
+            val overlayClass = classLoader.loadClass("org.epub.ui.ContentMarkOverlay")
+            val ctor = overlayClass.declaredConstructors.firstOrNull { it.parameterTypes.size == 5 }
+                ?: return@runCatching null
+            ctor.isAccessible = true
+            ctor.newInstance(
+                resolved,
+                textRange,
+                (callNoArg(mark, "getStyle") as? Number)?.toInt() ?: MARK_STYLE_FILL,
+                color,
+                null,
+            )
+        }.onFailure {
+            XposedBridge.log("$LOG_PREFIX create search highlight overlay failed: ${it.stackTraceToString()}")
+        }.getOrNull()
+
+    private fun searchHighlightQuoteStart(
+        content: String,
+        quote: String,
+        windowStart: Int,
+        windowEnd: Int,
+        expectedLocalStart: Int?,
+    ): Int? {
+        if (expectedLocalStart != null &&
+            expectedLocalStart >= windowStart &&
+            expectedLocalStart + quote.length <= windowEnd &&
+            content.regionMatches(expectedLocalStart, quote, 0, quote.length)
+        ) {
+            return expectedLocalStart
+        }
+        val matches = generateSequence(content.indexOf(quote, windowStart)) { previous ->
+            content.indexOf(quote, previous + 1)
+        }.takeWhile { it >= 0 && it + quote.length <= windowEnd }.toList()
+        if (matches.isEmpty()) return null
+        return expectedLocalStart?.let { expected ->
+            matches.minByOrNull { kotlin.math.abs(it - expected) }
+        } ?: matches.first()
+    }
+
+    private fun cfiCharacterOffset(cfi: String): Int? =
+        Regex(""":(\d+)\)?$""").find(cfi)?.groupValues?.getOrNull(1)?.toIntOrNull()
+
+    private fun textRange(start: Int, end: Int): Long? =
+        runCatching {
+            val cls = classLoader.loadClass("androidx.compose.ui.text.TextRangeKt")
+            val method = cls.methods.firstOrNull {
+                it.name == "TextRange" &&
+                    it.parameterTypes.size == 2 &&
+                    it.parameterTypes[0] == Int::class.javaPrimitiveType &&
+                    it.parameterTypes[1] == Int::class.javaPrimitiveType
+            } ?: return@runCatching null
+            (method.invoke(null, start, end) as? Number)?.toLong()
+        }.getOrNull()
+
+    private fun markColorTokenToColor(token: String): Long? =
+        runCatching {
+            val cls = classLoader.loadClass("org.epub.ui.BodyKt")
+            val method = cls.methods.firstOrNull {
+                it.name == "markColorTokenToColor" &&
+                    it.parameterTypes.size == 1 &&
+                    it.parameterTypes[0] == String::class.java
+            } ?: return@runCatching null
+            (method.invoke(null, token) as? Number)?.toLong()
+        }.getOrNull()
+
+    private fun companionObject(cls: Class<*>): Any? {
+        for (fieldName in listOf("INSTANCE", "Companion")) {
+            runCatching {
+                return cls.getDeclaredField(fieldName).apply { isAccessible = true }.get(null)
+            }
+        }
+        return cls.declaredFields.firstNotNullOfOrNull { field ->
+            runCatching {
+                field.takeIf { java.lang.reflect.Modifier.isStatic(it.modifiers) }
+                    ?.takeIf { it.type.name.endsWith("\$Companion") || it.type.simpleName == "Companion" }
+                    ?.apply { isAccessible = true }
+                    ?.get(null)
+            }.getOrNull()
+        }
+    }
+
+    private fun describeSearchHighlightMark(mark: Any): String {
+        val id = (callNoArg(mark, "getId") as? Number)?.toLong() ?: 0L
+        val style = (callNoArg(mark, "getStyle") as? Number)?.toInt() ?: -1
+        val color = callString(mark, "getColor")
+        val start = callString(mark, "getStartCfi")
+        val end = callString(mark, "getEndCfi")
+        val quote = callString(mark, "getQuote").take(24)
+        return "id=$id style=$style color=$color start=$start end=$end quote=$quote"
+    }
+
+    private fun updateSearchMarks(viewModel: Any?, label: String, transform: (List<Any>) -> List<Any>): Boolean =
+        runCatching {
+            val target = viewModel ?: return@runCatching false.also {
+                XposedBridge.log("$LOG_PREFIX full-text search highlight $label skipped: no viewModel")
+            }
+            var cls: Class<*>? = target.javaClass
+            var marksField: java.lang.reflect.Field? = null
+            while (cls != null && marksField == null) {
+                marksField = cls.declaredFields.firstOrNull { it.name == "_marks" }
+                cls = cls.superclass
+            }
+            marksField ?: return@runCatching false.also {
+                XposedBridge.log("$LOG_PREFIX full-text search highlight $label skipped: _marks not found")
+            }
+            val marksFlow = marksField
+                .apply { isAccessible = true }
+                .get(target)
+                ?: return@runCatching false.also {
+                    XposedBridge.log("$LOG_PREFIX full-text search highlight $label skipped: marksFlow null")
+                }
+            val current = (callNoArg(marksFlow, "getValue") as? List<*>)?.filterNotNull().orEmpty()
+            val next = transform(current)
+            if (next === current) return@runCatching true
+            val setValue = marksFlow.javaClass.methods.firstOrNull {
+                it.name == "setValue" && it.parameterTypes.size == 1
+            } ?: return@runCatching false.also {
+                XposedBridge.log("$LOG_PREFIX full-text search highlight $label skipped: setValue not found")
+            }
+            setValue.invoke(marksFlow, next)
+            XposedBridge.log(
+                "$LOG_PREFIX full-text search highlight $label marks ${current.size}->${next.size} " +
+                    "active=${activeSearchHighlightId ?: 0L}",
+            )
+            true
+        }.onFailure {
+            XposedBridge.log("$LOG_PREFIX update search highlight marks failed: ${it.stackTraceToString()}")
+        }.getOrDefault(false)
+
+    private fun isSearchResultHighlightMark(mark: Any): Boolean {
+        val id = searchResultHighlightMarkId(mark) ?: return false
+        return id >= SEARCH_HIGHLIGHT_MARK_ID_BASE && id < SEARCH_HIGHLIGHT_MARK_ID_BASE + SEARCH_HIGHLIGHT_MARK_ID_RANGE
+    }
+
+    private fun searchResultHighlightMarkId(mark: Any): Long? {
+        val id = (callNoArg(mark, "getId") as? Number)?.toLong() ?: return null
+        return if (id >= SEARCH_HIGHLIGHT_MARK_ID_BASE && id < SEARCH_HIGHLIGHT_MARK_ID_BASE + SEARCH_HIGHLIGHT_MARK_ID_RANGE) {
+            id
+        } else {
+            null
+        }
+    }
+
+    private fun searchResultHighlightResolvedMarkId(mark: Any): Long? {
+        val id = (callNoArg(mark, "getId") as? Number)?.toLong() ?: return null
+        return if (id >= SEARCH_HIGHLIGHT_MARK_ID_BASE && id < SEARCH_HIGHLIGHT_MARK_ID_BASE + SEARCH_HIGHLIGHT_MARK_ID_RANGE) {
+            id
+        } else {
+            null
+        }
+    }
+
+    private fun searchResultHighlightOverlayMarkId(overlay: Any): Long? {
+        val mark = callNoArg(overlay, "getMark") ?: return null
+        return searchResultHighlightResolvedMarkId(mark)
     }
 
     private fun applySearchNavigationBarTheme(bar: View, colors: DialogColors) {
@@ -1569,6 +2122,7 @@ class ReaderHook(
             if (index < 0) break
             val snippet = snippetFor(document.text, index, index + keyword.length)
             val cfi = document.indexedText.cfiAt(index)
+            val endCfi = document.indexedText.cfiAtBoundary(index + keyword.length)
             results.add(
                 FullTextSearchResult(
                     chapterIndex = document.chapterIndex,
@@ -1576,10 +2130,12 @@ class ReaderHook(
                     chapterTitle = document.chapterTitle,
                     intentReceiver = context.intentReceiver,
                     cfi = cfi,
+                    endCfi = endCfi,
                     file = document.file,
                     snippet = snippet.text,
                     snippetMatchStart = snippet.matchStart,
                     snippetMatchEnd = snippet.matchEnd,
+                    matchText = document.text.substring(index, (index + keyword.length).coerceAtMost(document.text.length)),
                 ),
             )
             XposedBridge.log(
@@ -2255,6 +2811,14 @@ class ReaderHook(
         const val SEARCH_MENU_BUTTON_BOTTOM_MARGIN_DP = 166
         const val SEARCH_NAVIGATION_READER_BOTTOM_MARGIN_DP = 8
         const val SEARCH_NAVIGATION_MENU_BOTTOM_MARGIN_DP = 190
+        const val MARK_KIND_HIGHLIGHT = 0
+        const val MARK_STYLE_FILL = 0
+        const val MARK_STYLE_LINE = 1
+        const val MARK_SYNCED_NO = 0
+        const val MARK_COLOR_RED = "red"
+        const val MARK_COLOR_YELLOW = "yellow"
+        const val SEARCH_HIGHLIGHT_MARK_ID_BASE = -9_223_372_036_854_000_000L
+        const val SEARCH_HIGHLIGHT_MARK_ID_RANGE = 100_000L
         val BLOCK_SEARCH_TAGS = setOf(
             "p", "div", "section", "article", "li", "blockquote", "pre",
             "h1", "h2", "h3", "h4", "h5", "h6",
@@ -2355,9 +2919,21 @@ class ReaderHook(
     ) {
         fun cfiAt(index: Int): String? {
             val span = spans.firstOrNull { index >= it.start && index < it.end } ?: return null
-            val elementPath = span.elementSteps.joinToString(separator = "") { "/$it" }
-            val offset = (span.textOffset + index - span.start).coerceAtLeast(0)
-            return "epubcfi(/${span.base.spineIndex}/${span.base.itemRefIndex}/4$elementPath/${span.textStep}:$offset)"
+            return span.cfiAt(index - span.start)
+        }
+
+        fun cfiAtBoundary(index: Int): String? {
+            val bounded = index.coerceIn(0, text.length)
+            val span = spans.firstOrNull { bounded > it.start && bounded <= it.end }
+                ?: spans.firstOrNull { bounded >= it.start && bounded < it.end }
+                ?: return null
+            return span.cfiAt(bounded - span.start)
+        }
+
+        private fun TextSpan.cfiAt(relativeIndex: Int): String {
+            val elementPath = elementSteps.joinToString(separator = "") { "/$it" }
+            val offset = (textOffset + relativeIndex).coerceAtLeast(0)
+            return "epubcfi(/${base.spineIndex}/${base.itemRefIndex}/4$elementPath/${textStep}:$offset)"
         }
     }
 
@@ -2367,10 +2943,12 @@ class ReaderHook(
         val chapterTitle: String,
         val intentReceiver: Any?,
         val cfi: String?,
+        val endCfi: String?,
         val file: File,
         val snippet: String,
         val snippetMatchStart: Int,
         val snippetMatchEnd: Int,
+        val matchText: String,
     )
 
     private class SearchMenuButtonView(context: Context) : View(context) {
