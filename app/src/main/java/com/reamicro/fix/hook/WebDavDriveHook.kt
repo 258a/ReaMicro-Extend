@@ -2855,6 +2855,8 @@ class WebDavDriveHook(
         backupCode: String,
         publisher: String,
         cover: String? = null,
+        size: Long? = null,
+        updated: Long? = null,
     ): Any {
         val copyMethod = book.javaClass.methods.firstOrNull {
             it.name == "copy" && it.parameterTypes.size == 24
@@ -2870,7 +2872,7 @@ class WebDavDriveHook(
             book.callString("getSubtitle"),
             book.callString("getAuthor"),
             cover?.takeIf { it.isNotBlank() } ?: book.callString("getCover"),
-            book.callLong("getSize"),
+            size?.takeIf { it > 0L } ?: book.callLong("getSize"),
             book.callString("getUri"),
             book.callString("getGroup"),
             book.callLong("getCreated"),
@@ -2886,7 +2888,7 @@ class WebDavDriveHook(
                 book.callFloat("getProgress"),
                 book.callLong("getTotal"),
                 book.callLong("getFinished"),
-                book.callLong("getUpdated"),
+                updated?.takeIf { it > 0L } ?: book.callLong("getUpdated"),
                 book.callLong("getCloudId"),
                 backupType,
                 backupId,
@@ -5609,6 +5611,11 @@ class WebDavDriveHook(
     }
 
     private fun startOnlineCompletionChapterUpdate(book: Any, info: OnlineImportedBookSourceInfo) {
+        val context = currentContext()
+        if (context == null) {
+            showToast("无法启动章节更新：缺少 Context")
+            return
+        }
         val source = info.source ?: currentContext()?.let { context ->
             OnlineSourceStore.list(context).firstOrNull { source -> source.id == info.sourceId }
         }
@@ -5628,26 +5635,186 @@ class WebDavDriveHook(
             showToast("正在更新：$title")
             return
         }
-        runCatching {
-            val target = OnlineDownloadTarget(
-                source = source,
-                query = title,
-                result = OnlineBookSearchResult(
-                    sourceName = source.name,
-                    name = title,
-                    author = book.callString("getAuthor"),
-                    coverUrl = book.callString("getCover"),
-                    detailUrl = detailUrl,
-                    intro = "",
-                ),
-            )
-            startOnlineCompletionDownload(target)
-        }.onFailure {
-            XposedBridge.log("$LOG_PREFIX online completion update start failed: ${it.stackTraceToString()}")
-            showToast("章节更新启动失败：${it.message ?: title}")
-        }.also {
-            onlineCompletionRunningUpdates.remove(key)
+        val notificationId = onlineCompletionNotificationIds.incrementAndGet()
+        val tracker = currentWorkTracker()
+        val workId = tracker?.let { createOnlineCompletionTrackedTask(it, "$title 更新") }
+        val progressNotifier = OnlineCompletionProgressNotifier(
+            context = context,
+            notificationId = notificationId,
+            bookName = title,
+            tracker = tracker,
+            workId = workId,
+        )
+        progressNotifier.running(0, "准备更新", force = true)
+        showToast("开始检查更新：$title")
+        Thread({
+            runCatching {
+                val latest = findLocalBookByUuid(book.callLong("getUid"), book.callString("getUuid")) ?: book
+                val target = OnlineDownloadTarget(
+                    source = source,
+                    query = title,
+                    result = OnlineBookSearchResult(
+                        sourceName = source.name,
+                        name = title,
+                        author = latest.callString("getAuthor").ifBlank { book.callString("getAuthor") },
+                        coverUrl = latest.callString("getCover").ifBlank { book.callString("getCover") },
+                        detailUrl = detailUrl,
+                        intro = "",
+                    ),
+                )
+                val result = updateOnlineCompletionBookIncrementally(
+                    book = latest,
+                    target = target,
+                    onProgress = { progress, message ->
+                        progressNotifier.running(progress, message)
+                    },
+                )
+                val message = when {
+                    result.added <= 0 -> "已是最新章节"
+                    result.failed > 0 -> "已更新 ${result.added} 章，${result.failed} 章失败"
+                    else -> "已更新 ${result.added} 章"
+                }
+                progressNotifier.finish(message, detailUrl, success = true)
+                Handler(Looper.getMainLooper()).post {
+                    Toast.makeText(context, "$message：$title", Toast.LENGTH_SHORT).show()
+                }
+            }.onFailure {
+                XposedBridge.log("$LOG_PREFIX online completion update failed: ${it.stackTraceToString()}")
+                progressNotifier.finish(it.message ?: "章节更新失败", null, success = false)
+                Handler(Looper.getMainLooper()).post {
+                    Toast.makeText(context, "章节更新失败：${it.message ?: title}", Toast.LENGTH_SHORT).show()
+                }
+            }.also {
+                onlineCompletionRunningUpdates.remove(key)
+            }
+        }, "ReaMicroOnlineCompletionUpdate").start()
+    }
+
+    private fun updateOnlineCompletionBookIncrementally(
+        book: Any,
+        target: OnlineDownloadTarget,
+        onProgress: (Int, String) -> Unit,
+    ): OnlineChapterUpdateResult {
+        val bookDir = bookDirectory(book).canonicalFile
+        val textDir = File(bookDir, "OEBPS/Text")
+        val contentOpf = File(bookDir, "OEBPS/content.opf")
+        val tocNcx = File(bookDir, "OEBPS/toc.ncx")
+        if (!bookDir.isDirectory || !textDir.isDirectory || !contentOpf.isFile || !tocNcx.isFile) {
+            error("当前图书不是在线补全生成的标准 EPUB，暂不能增量更新")
         }
+        val existingCount = onlineCompletionLocalChapterCount(bookDir)
+        if (existingCount <= 0) {
+            error("未找到本地章节文件，暂不能增量更新")
+        }
+        val tocSnapshot = loadOnlineCompletionToc(target) { progress, message ->
+            onProgress(progress.coerceAtMost(12), message)
+        }
+        val remoteChapters = tocSnapshot.chapters
+        if (remoteChapters.size <= existingCount) {
+            logWebDav(
+                "online completion update no new chapters title=${target.result.name} " +
+                    "local=$existingCount remote=${remoteChapters.size}",
+            )
+            return OnlineChapterUpdateResult(0, 0)
+        }
+        val newRemoteChapters = remoteChapters.drop(existingCount)
+        logWebDav(
+            "online completion update start title=${target.result.name} " +
+                "local=$existingCount remote=${remoteChapters.size} new=${newRemoteChapters.size}",
+        )
+        val downloaded = MutableList<OnlineDownloadedChapter?>(newRemoteChapters.size) { null }
+        val attempts = IntArray(newRemoteChapters.size)
+        val failed = linkedSetOf<Int>()
+        val failureMessages = mutableMapOf<Int, String>()
+
+        fun attemptChapter(offset: Int, immediateRetry: Boolean): Boolean {
+            val chapter = newRemoteChapters[offset]
+            val remoteIndex = existingCount + offset
+            val maxAttemptsThisRound = if (immediateRetry) 2 else 1
+            var roundAttempts = 0
+            while (attempts[offset] < ONLINE_COMPLETION_CHAPTER_RETRY_LIMIT && roundAttempts < maxAttemptsThisRound) {
+                attempts[offset]++
+                roundAttempts++
+                val attempt = attempts[offset]
+                runCatching {
+                    downloadOnlineChapter(target, tocSnapshot.detail.url, tocSnapshot.detail.body, chapter, remoteIndex)
+                }.onSuccess { chapterContent ->
+                    downloaded[offset] = chapterContent
+                    failed.remove(offset)
+                    failureMessages.remove(offset)
+                    logWebDav(
+                        "online completion update chapter downloaded ${offset + 1}/${newRemoteChapters.size} " +
+                            "remote=${remoteIndex + 1}/${remoteChapters.size} attempt=$attempt " +
+                            "content=${chapterContent.content.length}",
+                    )
+                    return true
+                }.onFailure { error ->
+                    failed.add(offset)
+                    failureMessages[offset] = error.message.orEmpty().ifBlank { error.javaClass.name }
+                    logWebDav(
+                        "online completion update chapter failed ${offset + 1}/${newRemoteChapters.size} " +
+                            "remote=${remoteIndex + 1}/${remoteChapters.size} " +
+                            "attempt=$attempt/${ONLINE_COMPLETION_CHAPTER_RETRY_LIMIT} " +
+                            "title=${chapter.title} error=${error.javaClass.name}: ${error.message.orEmpty()}",
+                    )
+                }
+            }
+            return false
+        }
+
+        newRemoteChapters.forEachIndexed { offset, _ ->
+            val progress = 15 + ((offset + 1) * 68 / newRemoteChapters.size.coerceAtLeast(1))
+            onProgress(progress, "下载新增章节 ${offset + 1}/${newRemoteChapters.size}")
+            attemptChapter(offset, immediateRetry = true)
+        }
+        if (failed.any { attempts[it] < ONLINE_COMPLETION_CHAPTER_RETRY_LIMIT }) {
+            val retryCandidates = failed.filter { attempts[it] < ONLINE_COMPLETION_CHAPTER_RETRY_LIMIT }
+            onProgress(84, "等待重试新增章节 ${retryCandidates.size} 章")
+            Thread.sleep(ONLINE_COMPLETION_RETRY_DELAY_MS)
+            retryCandidates.forEachIndexed { retryIndex, offset ->
+                val progress = 84 + ((retryIndex + 1) * 4 / retryCandidates.size.coerceAtLeast(1))
+                onProgress(progress, "重试新增章节 ${offset + 1}/${newRemoteChapters.size}")
+                attemptChapter(offset, immediateRetry = false)
+            }
+        }
+        val successCount = downloaded.count { it != null }
+        if (successCount <= 0) {
+            error("新增章节全部下载失败，已停止更新：${target.result.name}")
+        }
+        val newDownloadedChapters = newRemoteChapters.mapIndexed { offset, chapter ->
+            downloaded[offset] ?: OnlineDownloadedChapter(
+                title = chapter.title.ifBlank { "第 ${existingCount + offset + 1} 章" },
+                content = "本章下载失败，已按在线源重试 ${attempts[offset]} 次。\n\n${failureMessages[offset].orEmpty()}",
+                volumeTitle = chapter.volumeTitle,
+                level = chapter.level,
+            )
+        }
+        onProgress(90, "写入新增章节")
+        appendOnlineCompletionChapters(
+            bookDir = bookDir,
+            target = target,
+            existingCount = existingCount,
+            remoteChapters = remoteChapters,
+            newChapters = newDownloadedChapters,
+        )
+        val newSize = bookDirectorySize(bookDir)
+        val latest = findLocalBookByUuid(book.callLong("getUid"), book.callString("getUuid")) ?: book
+        val updated = copyBookWithBackupAndPublisher(
+            book = latest,
+            backupType = BACKUP_TYPE_ONLINE_COMPLETION,
+            backupId = bookBackupIdOf(latest).ifBlank { onlineImportedBookBackupId(target) },
+            backupCode = latest.callString("getBackupCode").ifBlank { target.source.id },
+            publisher = "",
+            cover = latest.callString("getCover").ifBlank { target.result.coverUrl },
+            size = newSize,
+            updated = System.currentTimeMillis(),
+        )
+        updateLocalBook(updated)
+        logWebDav(
+            "online completion update complete title=${target.result.name} " +
+                "added=$successCount failed=${failed.size} total=${remoteChapters.size} size=$newSize",
+        )
+        return OnlineChapterUpdateResult(successCount, failed.size)
     }
 
     private fun onlineSourceIdFromEncodedValue(value: String): String {
@@ -5872,26 +6039,9 @@ class WebDavDriveHook(
         onProgress: (Int, String) -> Unit,
         onPartialReady: (File, Int) -> Unit,
     ) {
-        val detailUrl = target.result.detailUrl.ifBlank { error("搜索结果缺少详情页地址") }
-        onProgress(3, "读取详情页")
-        val detail = OnlineConcurrentRateLimiter.withLimitBlocking(target.source) {
-            requestOnlineSearch(target.source, detailUrl)
-        }
-        logWebDav("online completion detail ok url=${detail.url} bytes=${detail.body.length}")
-        val tocUrl = buildOnlineTocUrl(target.source, detail.url, detail.body)
-        logWebDav("online completion toc url=${tocUrl.ifBlank { detail.url }}")
-        val toc = if (tocUrl.isBlank() || tocUrl == detail.url) {
-            detail
-        } else {
-            onProgress(4, "读取目录")
-            OnlineConcurrentRateLimiter.withLimitBlocking(target.source) {
-                requestOnlineSearch(target.source, tocUrl)
-            }
-        }
-        val chapters = parseOnlineToc(target.source, target.result, toc.url, toc.body)
-        if (chapters.isEmpty()) {
-            error("在线源目录为空，已停止导入：${target.source.name}")
-        }
+        val tocSnapshot = loadOnlineCompletionToc(target, onProgress)
+        val detail = tocSnapshot.detail
+        val chapters = tocSnapshot.chapters
         logWebDav(
             "online completion chapters=${chapters.size} " +
                 "first=${chapters.firstOrNull()?.title.orEmpty()} firstUrl=${chapters.firstOrNull()?.url.orEmpty()}",
@@ -6017,6 +6167,33 @@ class WebDavDriveHook(
             "online completion epub ready path=${outputFile.absolutePath} " +
                 "chapters=${finalChapters.size} success=$successCount failed=${failed.size}",
         )
+    }
+
+    private fun loadOnlineCompletionToc(
+        target: OnlineDownloadTarget,
+        onProgress: (Int, String) -> Unit,
+    ): OnlineTocSnapshot {
+        val detailUrl = target.result.detailUrl.ifBlank { error("搜索结果缺少详情页地址") }
+        onProgress(3, "读取详情页")
+        val detail = OnlineConcurrentRateLimiter.withLimitBlocking(target.source) {
+            requestOnlineSearch(target.source, detailUrl)
+        }
+        logWebDav("online completion detail ok url=${detail.url} bytes=${detail.body.length}")
+        val tocUrl = buildOnlineTocUrl(target.source, detail.url, detail.body)
+        logWebDav("online completion toc url=${tocUrl.ifBlank { detail.url }}")
+        val toc = if (tocUrl.isBlank() || tocUrl == detail.url) {
+            detail
+        } else {
+            onProgress(4, "读取目录")
+            OnlineConcurrentRateLimiter.withLimitBlocking(target.source) {
+                requestOnlineSearch(target.source, tocUrl)
+            }
+        }
+        val chapters = parseOnlineToc(target.source, target.result, toc.url, toc.body)
+        if (chapters.isEmpty()) {
+            error("在线源目录为空，已停止导入：${target.source.name}")
+        }
+        return OnlineTocSnapshot(detail = detail, toc = toc, chapters = chapters)
     }
 
     private fun downloadOnlineChapter(
@@ -6412,6 +6589,74 @@ class WebDavDriveHook(
 
     private fun onlineConnectTimeoutMillis(source: OnlineSourceEntry): Int =
         onlineReadTimeoutMillis(source).coerceAtMost(30_000).coerceAtLeast(10_000)
+
+    private fun onlineCompletionLocalChapterCount(bookDir: File): Int {
+        val textDir = File(bookDir, "OEBPS/Text")
+        return textDir.listFiles()
+            ?.asSequence()
+            ?.mapNotNull { file ->
+                ONLINE_COMPLETION_CHAPTER_FILE_REGEX.matchEntire(file.name)
+                    ?.groupValues
+                    ?.getOrNull(1)
+                    ?.toIntOrNull()
+            }
+            ?.maxOrNull()
+            ?: 0
+    }
+
+    private fun appendOnlineCompletionChapters(
+        bookDir: File,
+        target: OnlineDownloadTarget,
+        existingCount: Int,
+        remoteChapters: List<OnlineChapter>,
+        newChapters: List<OnlineDownloadedChapter>,
+    ) {
+        val root = bookDir.canonicalFile
+        val textDir = File(root, "OEBPS/Text").canonicalFile
+        val rootPrefix = root.path.trimEnd(File.separatorChar) + File.separator
+        if (!textDir.path.startsWith(rootPrefix)) {
+            error("EPUB Text directory escapes book dir")
+        }
+        textDir.mkdirs()
+        newChapters.forEachIndexed { offset, chapter ->
+            val order = existingCount + offset + 1
+            val file = File(textDir, "chapter_${order.toString().padStart(4, '0')}.xhtml").canonicalFile
+            if (!file.path.startsWith(rootPrefix)) error("EPUB chapter path escapes book dir")
+            file.writeText(chapterXhtml(chapter.title, chapter.content), Charsets.UTF_8)
+        }
+        val tocChapters = remoteChapters.map { chapter ->
+            OnlineDownloadedChapter(
+                title = chapter.title,
+                content = "",
+                volumeTitle = chapter.volumeTitle,
+                level = chapter.level,
+            )
+        }
+        val coverExt = onlineCompletionExistingCoverExt(root)
+        File(root, "OEBPS/toc.ncx").writeText(onlineTocNcx(target, tocChapters), Charsets.UTF_8)
+        File(root, "OEBPS/content.opf").writeText(
+            onlineContentOpf(
+                target = target,
+                chapters = tocChapters,
+                coverExt = coverExt ?: "jpg",
+                hasCover = coverExt != null,
+            ),
+            Charsets.UTF_8,
+        )
+    }
+
+    private fun onlineCompletionExistingCoverExt(bookDir: File): String? =
+        File(bookDir, "OEBPS/Images").listFiles()
+            ?.firstOrNull { file ->
+                file.isFile && file.nameWithoutExtension.equals("cover", ignoreCase = true)
+            }
+            ?.extension
+            ?.takeIf { it.isNotBlank() }
+
+    private fun bookDirectorySize(bookDir: File): Long =
+        bookDir.walkTopDown()
+            .filter { it.isFile }
+            .fold(0L) { total, file -> total + file.length() }
 
     private fun writeOnlineCompletionEpub(
         file: File,
@@ -6966,10 +7211,33 @@ $paragraphs
             .replace(Regex("[\\s　:：、，,。.!！?？《》\"'“”‘’\\-—_]+"), "")
 
     private fun onlineTocNcx(target: OnlineDownloadTarget, chapters: List<OnlineDownloadedChapter>): String {
-        val points = chapters.mapIndexed { index, chapter ->
+        var playOrder = 1
+        fun chapterPoint(index: Int, chapter: OnlineDownloadedChapter): String {
             val order = index + 1
-            """<navPoint id="nav$order" playOrder="$order"><navLabel><text>${chapter.title.xmlEscape()}</text></navLabel><content src="Text/chapter_${order.toString().padStart(4, '0')}.xhtml"/></navPoint>"""
-        }.joinToString("")
+            val pointOrder = playOrder++
+            return """<navPoint id="chapter$order" playOrder="$pointOrder"><navLabel><text>${chapter.title.xmlEscape()}</text></navLabel><content src="Text/chapter_${order.toString().padStart(4, '0')}.xhtml"/></navPoint>"""
+        }
+        val points = StringBuilder()
+        var index = 0
+        while (index < chapters.size) {
+            val volumeTitle = chapters[index].volumeTitle.trim()
+            if (volumeTitle.isBlank()) {
+                points.append(chapterPoint(index, chapters[index]))
+                index += 1
+                continue
+            }
+            val startIndex = index
+            val volumeOrder = playOrder++
+            val children = StringBuilder()
+            while (index < chapters.size && chapters[index].volumeTitle.trim() == volumeTitle) {
+                children.append(chapterPoint(index, chapters[index]))
+                index += 1
+            }
+            val href = "Text/chapter_${(startIndex + 1).toString().padStart(4, '0')}.xhtml"
+            points.append(
+                """<navPoint id="volume$volumeOrder" playOrder="$volumeOrder"><navLabel><text>${volumeTitle.xmlEscape()}</text></navLabel><content src="$href"/>$children</navPoint>""",
+            )
+        }
         return """<?xml version="1.0" encoding="UTF-8"?>
 <ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
 <head><meta name="dtb:uid" content="${onlineBookUuid(target).xmlEscape()}"/></head>
@@ -9263,6 +9531,12 @@ img{max-width:100%;max-height:100%;height:auto;}
         val body: String,
     )
 
+    private data class OnlineTocSnapshot(
+        val detail: OnlineHttpResponse,
+        val toc: OnlineHttpResponse,
+        val chapters: List<OnlineChapter>,
+    )
+
     private data class OnlineSearchGroup(
         val source: OnlineSourceEntry,
         val query: String,
@@ -9290,6 +9564,11 @@ img{max-width:100%;max-height:100%;height:auto;}
         val sourceName: String,
         val detailUrl: String,
         val source: OnlineSourceEntry?,
+    )
+
+    private data class OnlineChapterUpdateResult(
+        val added: Int,
+        val failed: Int,
     )
 
     private data class OnlineChapter(
@@ -10079,6 +10358,7 @@ img{max-width:100%;max-height:100%;height:auto;}
             Regex("^(第\\s*[0-9０-９一二三四五六七八九十百千万〇零两]+\\s*[章节卷回集部篇])\\s*(.+)$")
         val ONLINE_SPECIAL_HEADING_SPLIT_REGEX =
             Regex("^(番外|后日谈|后记|序章|楔子|终章)\\s*[:：、.\\-—]?\\s*(.+)$")
+        val ONLINE_COMPLETION_CHAPTER_FILE_REGEX = Regex("""chapter_(\d+)\.xhtml""", RegexOption.IGNORE_CASE)
         val BOOK_EXTENSIONS = setOf(".epub", ".mobi", ".azw3", ".txt")
         val WEBDAV_UPLOAD_RETRY_CODES = setOf(405, 409, 412, 423)
         const val WEBDAV_PROPFIND_BODY =
