@@ -5388,10 +5388,15 @@ class WebDavDriveHook(
             .ifBlank { ONLINE_COMPLETION_TITLE }
 
     private fun onlineCompletionGroupVisibleCloudBooks(group: OnlineSearchGroup): List<Any> {
-        val books = group.results.take(ONLINE_COMPLETION_RESULT_LIMIT).mapIndexed { index, result ->
-            newOnlineCompletionResultCloudBook(group.source, group.query, result, index)
+        if (group.results.isEmpty()) return listOf(newOnlineCompletionSourceCloudBook(group))
+        if (group.results.size == 1) {
+            return listOf(newOnlineCompletionResultCloudBook(group.source, group.query, group.results.first(), 0))
         }
-        return books.ifEmpty { listOf(newOnlineCompletionSourceCloudBook(group)) }
+        val expanded = onlineCompletionExpandedSources[group.source.id] == true
+        if (!expanded) return listOf(newOnlineCompletionSourceCloudBook(group))
+        return group.results.take(ONLINE_COMPLETION_RESULT_LIMIT).mapIndexed { index, result ->
+            newOnlineCompletionResultCloudBook(group.source, group.query, result, index)
+        } + newOnlineCompletionSourceCloudBook(group)
     }
 
     private fun newOnlineCompletionResultCloudBook(
