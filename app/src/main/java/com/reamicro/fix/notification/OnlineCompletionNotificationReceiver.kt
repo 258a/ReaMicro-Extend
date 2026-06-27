@@ -1,0 +1,68 @@
+package com.reamicro.fix.notification
+
+import android.Manifest
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
+import android.util.Log
+import com.reamicro.fix.R
+
+class OnlineCompletionNotificationReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action != ACTION_ONLINE_COMPLETION_NOTIFICATION) return
+        if (
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            Log.i(LOG_TAG, "module notification permission denied")
+            return
+        }
+        val id = intent.getIntExtra(EXTRA_ID, 0).takeIf { it > 0 } ?: return
+        val title = intent.getStringExtra(EXTRA_TITLE).orEmpty().ifBlank { ONLINE_COMPLETION_TITLE }
+        val text = intent.getStringExtra(EXTRA_TEXT).orEmpty()
+        val progress = intent.getIntExtra(EXTRA_PROGRESS, 0).coerceIn(0, 100)
+        val done = intent.getBooleanExtra(EXTRA_DONE, false)
+        val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            manager.createNotificationChannel(
+                NotificationChannel(
+                    ONLINE_COMPLETION_NOTIFICATION_CHANNEL,
+                    ONLINE_COMPLETION_TITLE,
+                    NotificationManager.IMPORTANCE_LOW,
+                ),
+            )
+        }
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(context, ONLINE_COMPLETION_NOTIFICATION_CHANNEL)
+        } else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(context)
+        }
+        builder
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle("$ONLINE_COMPLETION_TITLE：$title")
+            .setContentText(text)
+            .setOnlyAlertOnce(true)
+            .setOngoing(!done)
+            .setAutoCancel(done)
+            .setProgress(100, progress, false)
+        manager.notify(id, builder.build())
+    }
+
+    private companion object {
+        const val LOG_TAG = "ReaMicroNotify"
+        const val ACTION_ONLINE_COMPLETION_NOTIFICATION = "com.reamicro.fix.ONLINE_COMPLETION_NOTIFICATION"
+        const val EXTRA_ID = "id"
+        const val EXTRA_TITLE = "title"
+        const val EXTRA_TEXT = "text"
+        const val EXTRA_PROGRESS = "progress"
+        const val EXTRA_DONE = "done"
+        const val ONLINE_COMPLETION_TITLE = "在线补全"
+        const val ONLINE_COMPLETION_NOTIFICATION_CHANNEL = "reamicro_online_completion_download"
+    }
+}

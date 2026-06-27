@@ -148,6 +148,13 @@ class XposedModuleSettings(
         putBoolean(ModuleSettings.searchSourceKey(groupId), enabled)
     }
 
+    fun setOnlineSourceEnabled(sourceId: String, enabled: Boolean) {
+        putBoolean(ModuleSettings.onlineSourceKey(sourceId), enabled)
+    }
+
+    fun isOnlineSourceEnabled(sourceId: String): Boolean =
+        prefs()?.getBoolean(ModuleSettings.onlineSourceKey(sourceId), false) ?: false
+
     fun fontSettings(): FontSettingsSnapshot {
         val now = System.currentTimeMillis()
         cachedFontSettings?.takeIf { now - cachedFontSettingsAtMs < CACHE_WINDOW_MS }?.let { return it }

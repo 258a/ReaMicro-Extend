@@ -35,6 +35,7 @@ object ModuleSettings {
     const val KEY_ROTATION_REVERSE_ENABLED = "rotation_reverse_enabled"
 
     private const val KEY_ASSOCIATION_SOURCE_PREFIX = "association_source_"
+    private const val KEY_ONLINE_SOURCE_PREFIX = "online_source_"
     const val DEFAULT_MODULE_ENABLED = true
     const val DEFAULT_ASSOCIATION_ENABLED = false
     const val DEFAULT_ASSOCIATION_MANUAL_EDIT_ENABLED = false
@@ -79,6 +80,8 @@ object ModuleSettings {
 
 
     fun searchSourceKey(groupId: String): String = "$KEY_ASSOCIATION_SOURCE_PREFIX$groupId"
+
+    fun onlineSourceKey(sourceId: String): String = "$KEY_ONLINE_SOURCE_PREFIX$sourceId"
 
     fun defaultAssociationSearchSources(): Map<String, Boolean> =
         DEFAULT_SEARCH_SOURCE_GROUP_IDS.associateWith { true }

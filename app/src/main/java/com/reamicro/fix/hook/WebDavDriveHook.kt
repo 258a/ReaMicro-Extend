@@ -2,6 +2,9 @@
 
 import android.app.Activity
 import android.app.Dialog
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -14,6 +17,7 @@ import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.os.Handler
 import android.os.Looper
+import android.os.Build
 import android.provider.DocumentsContract
 import android.text.Editable
 import android.text.InputType
@@ -36,6 +40,10 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import android.webkit.JavascriptInterface
+import com.reamicro.fix.online.OnlineConcurrentRateLimiter
+import com.reamicro.fix.online.OnlineSourceEntry
+import com.reamicro.fix.online.OnlineSourceStore
+import com.reamicro.fix.settings.ModuleSettings
 import com.reamicro.fix.settings.ModuleSettingsSnapshot
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
@@ -49,7 +57,9 @@ import java.io.OutputStream
 import java.lang.ref.WeakReference
 import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Method
+import java.lang.reflect.Modifier
 import java.lang.reflect.Proxy
+import java.net.HttpURLConnection
 import java.net.URI
 import java.net.URL
 import java.net.URLDecoder
@@ -61,13 +71,18 @@ import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CancellationException
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.zip.CRC32
 import java.util.zip.ZipEntry
+import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 import javax.xml.parsers.DocumentBuilderFactory
 import kotlin.math.max
+import org.json.JSONArray
+import org.json.JSONObject
 import org.w3c.dom.Element
 
 class WebDavDriveHook(
@@ -90,6 +105,11 @@ class WebDavDriveHook(
     private val localLibraryIconDepth = ThreadLocal<Int>()
     private val localLibraryCloudTitleDepth = ThreadLocal<Int>()
     private val localLibraryCloudScreenDepth = ThreadLocal<Int>()
+    private val onlineCompletionCloudTitleDepth = ThreadLocal<Int>()
+    private val onlineCompletionCloudTitleText = ThreadLocal<String?>()
+    private val onlineCompletionRenderTypesBySource = ConcurrentHashMap<String, Int>()
+    private val onlineCompletionRenderSourceByType = ConcurrentHashMap<Int, String>()
+    private val onlineCompletionRenderTitles = ConcurrentHashMap<Int, String>()
     private val localLibraryCloudTreeDepth = ThreadLocal<Int>()
     private val localLibraryAccountScreenDepth = ThreadLocal<Int>()
     private val localLibraryAccountNavGraphScope = ThreadLocal<Any?>()
@@ -105,6 +125,7 @@ class WebDavDriveHook(
     private val webDavRunningSyncAuthCardDepth = ThreadLocal<Int>()
     private val homeWebDavSearchRender = ThreadLocal<HomeSearchRenderContext?>()
     private val cloudBookRowExtendedDisplay = ThreadLocal<CloudBookRowExtendedDisplayContext?>()
+    private val onlineCompletionBookRowInfoDepth = ThreadLocal<Int>()
     private val webDavBackupCardDepth = ThreadLocal<Int>()
     private var webDavAccountNavGraphScopeRef: WeakReference<Any>? = null
     private var localLibraryAccountNavGraphScopeRef: WeakReference<Any>? = null
@@ -123,6 +144,8 @@ class WebDavDriveHook(
     private var localLibraryAccountAuthFlow: Any? = null
     private var webDavHttpClient: Any? = null
     private val webDavCleartextAllowed = ThreadLocal<Boolean>()
+    private val webDavCleartextAllowedHosts = ConcurrentHashMap<String, Boolean>()
+    private val webDavCleartextAllowedLoggedHosts = ConcurrentHashMap<String, Boolean>()
     private val webDavStorageViewModels = mutableListOf<WeakReference<Any>>()
     private var cloudStorageRepositoryRef: WeakReference<Any>? = null
     private var bookshelfRepositoryRef: WeakReference<Any>? = null
@@ -135,6 +158,17 @@ class WebDavDriveHook(
     private val webDavDownloadCancelPrompts = ConcurrentHashMap<String, Long>()
     private val webDavHomeSearchSeq = AtomicLong(0L)
     private val localLibraryHomeSearchSeq = AtomicLong(0L)
+    private val onlineCompletionHomeSearchSeq = AtomicLong(0L)
+    private val onlineCompletionExpandedSources = ConcurrentHashMap<String, Boolean>()
+    private val onlineCompletionSearchTargets = ConcurrentHashMap<String, OnlineDownloadTarget>()
+    private val onlineCompletionRunningDownloads = ConcurrentHashMap<String, Boolean>()
+    private val onlineCompletionNotificationIds = AtomicInteger(4300)
+    private val onlineCompletionNotificationBlockedLogged = AtomicBoolean(false)
+    private val onlineCompletionModuleServiceUnavailable = AtomicBoolean(false)
+    @Volatile private var lastHomeSearchViewModelRef: WeakReference<Any>? = null
+    @Volatile private var lastHomeSearchQuery: String = ""
+    @Volatile private var lastHomeSearchWebDavResults: List<Any> = emptyList()
+    @Volatile private var lastHomeSearchLocalResults: List<Any> = emptyList()
     private val cloudStorageScreenRefreshAt = ConcurrentHashMap<String, Long>()
     private val localLibraryListCache = ConcurrentHashMap<String, LocalLibraryListCache>()
     private val localLibrarySearchIndexLock = Any()
@@ -149,6 +183,9 @@ class WebDavDriveHook(
         logWebDav("install start")
         hookWebDavCleartextPolicy()
         hookBackupTypeName()
+        hookOnlineCompletionBookRowDuration()
+        hookHomeCloudResultListRenderContext()
+        hookHomeViewModelDependencies()
         hookWebDavRowIcon()
         hookWebDavYun115Icon()
         hookWebDavFileFolderIcon()
@@ -236,25 +273,130 @@ class WebDavDriveHook(
     private fun canCancelCloudDownload(): Boolean =
         settingsProvider().canCancelCloudDownload
 
-    private fun hookWebDavCleartextPolicy() {
+    private fun hookOnlineCompletionBookRowDuration() {
         runCatching {
-            val policyClass = Class.forName(NETWORK_SECURITY_POLICY_CLASS)
-            policyClass.declaredMethods.filter {
-                it.name == "isCleartextTrafficPermitted" &&
-                    (it.parameterTypes.isEmpty() || (it.parameterTypes.size == 1 && it.parameterTypes[0] == String::class.java))
-            }.forEach { method ->
-                method.isAccessible = true
-                XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (webDavCleartextAllowed.get() == true) {
-                            param.result = true
-                        }
+            val bookRowInfo = cls(BOOK_ROW_INFO_CLASS).declaredMethods.first {
+                it.name == BOOK_ROW_INFO_METHOD &&
+                    it.parameterTypes.size == 4 &&
+                    it.parameterTypes[1].name == BOOK_CLASS
+            }.apply { isAccessible = true }
+            XposedBridge.hookMethod(bookRowInfo, object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val book = param.args?.getOrNull(1) ?: return
+                    if (!isOnlineCompletionLocalBook(book)) return
+                    onlineCompletionBookRowInfoDepth.set((onlineCompletionBookRowInfoDepth.get() ?: 0) + 1)
+                }
+
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val next = (onlineCompletionBookRowInfoDepth.get() ?: 0) - 1
+                    if (next <= 0) onlineCompletionBookRowInfoDepth.remove() else onlineCompletionBookRowInfoDepth.set(next)
+                }
+            })
+
+            val secondToHours = cls(TIME_EXT_KT_CLASS).declaredMethods.first {
+                it.name == SECOND_TO_HOURS_METHOD &&
+                    it.parameterTypes.size == 1 &&
+                    it.parameterTypes[0] == java.lang.Long.TYPE
+            }.apply { isAccessible = true }
+            XposedBridge.hookMethod(secondToHours, object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    if ((onlineCompletionBookRowInfoDepth.get() ?: 0) > 0) {
+                        param.result = ""
                     }
-                })
-            }
-            logWebDav("cleartext policy hook installed")
+                }
+            })
+            logWebDav("online completion book row duration hook installed")
         }.onFailure {
-            logWebDav("failed to hook cleartext policy: ${it.stackTraceToString()}")
+            XposedBridge.log("$LOG_PREFIX failed to hook online completion book row duration: ${it.stackTraceToString()}")
+        }
+    }
+
+    private fun hookWebDavCleartextPolicy() {
+        val hooked = mutableListOf<String>()
+        fun hookClass(className: String, loader: ClassLoader? = null) {
+            runCatching {
+                val policyClass = if (loader == null) Class.forName(className) else XposedHelpers.findClass(className, loader)
+                policyClass.declaredMethods.filter {
+                    it.name == "isCleartextTrafficPermitted" &&
+                        (it.parameterTypes.isEmpty() || (it.parameterTypes.size == 1 && it.parameterTypes[0] == String::class.java))
+                }.forEach { method ->
+                    method.isAccessible = true
+                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            if (shouldAllowCleartext(param.args)) {
+                                logCleartextAllowed(param.args?.firstOrNull(), "$className/${method.parameterTypes.size}")
+                                param.result = true
+                            }
+                        }
+                    })
+                    hooked += "$className/${method.parameterTypes.size}"
+                }
+            }.onFailure {
+                logWebDav("cleartext policy class skipped $className: ${it.message}")
+            }
+        }
+        fun hookCleartextUrlFilter() {
+            runCatching {
+                val filterClass = Class.forName(ANDROID_OKHTTP_CLEARTEXT_FILTER_CLASS)
+                filterClass.declaredMethods.filter {
+                    it.name == "checkURLPermitted" &&
+                        it.parameterTypes.size == 1 &&
+                        URL::class.java.isAssignableFrom(it.parameterTypes[0])
+                }.forEach { method ->
+                    method.isAccessible = true
+                    XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            if (shouldAllowCleartext(param.args)) {
+                                logCleartextAllowed(param.args?.firstOrNull(), "$ANDROID_OKHTTP_CLEARTEXT_FILTER_CLASS/checkURLPermitted")
+                                param.result = null
+                            }
+                        }
+                    })
+                    hooked += "$ANDROID_OKHTTP_CLEARTEXT_FILTER_CLASS/${method.name}"
+                }
+            }.onFailure {
+                logWebDav("cleartext url filter skipped $ANDROID_OKHTTP_CLEARTEXT_FILTER_CLASS: ${it.message}")
+            }
+        }
+        hookClass(NETWORK_SECURITY_POLICY_CLASS)
+        hookCleartextUrlFilter()
+        hookClass(ANDROID_OKHTTP_PLATFORM_CLASS)
+        hookClass(OKHTTP_PLATFORM_CLASS, classLoader)
+        hookClass(OKHTTP_ANDROID_PLATFORM_CLASS, classLoader)
+        hookClass(OKHTTP_ANDROID10_PLATFORM_CLASS, classLoader)
+        logWebDav("cleartext policy hook installed: ${hooked.joinToString().ifBlank { "none" }}")
+    }
+
+    private fun shouldAllowCleartext(args: Array<Any?>?): Boolean {
+        if (webDavCleartextAllowed.get() == true) return true
+        val host = cleartextHostOf(args?.firstOrNull())
+        return host.isNotBlank() && webDavCleartextAllowedHosts[host] == true
+    }
+
+    private fun cleartextHostOf(value: Any?): String =
+        when (value) {
+            null -> ""
+            is URL -> value.host.orEmpty()
+            is URI -> value.host.orEmpty()
+            is String -> {
+                val text = value.trim()
+                if (text.isBlank()) {
+                    ""
+                } else if (text.contains("://")) {
+                    runCatching { URI(text).host.orEmpty() }
+                        .getOrDefault("")
+                        .ifBlank { runCatching { URL(text).host.orEmpty() }.getOrDefault("") }
+                } else {
+                    text.substringBefore('/').substringBefore(':').trim()
+                }
+            }
+            else -> cleartextHostOf(value.toString())
+        }
+
+    private fun logCleartextAllowed(value: Any?, via: String) {
+        val host = cleartextHostOf(value).ifBlank { "*" }
+        if (webDavCleartextAllowedLoggedHosts.putIfAbsent("$via|$host", true) == null) {
+            logWebDav("cleartext allowed via=$via host=$host")
         }
     }
 
@@ -269,12 +411,19 @@ class WebDavDriveHook(
                     if (
                         type == BACKUP_TYPE_WEBDAV ||
                         type == BACKUP_TYPE_LOCAL_LIBRARY ||
+                        isOnlineCompletionRenderType(type) ||
+                        ((onlineCompletionCloudTitleDepth.get() ?: 0) > 0 && type == BACKUP_TYPE_WEBDAV) ||
                         ((webDavAccountScreenDepth.get() ?: 0) > 0 && type == BACKUP_TYPE_BAIDU) ||
                         ((localLibraryAccountScreenDepth.get() ?: 0) > 0 && type == BACKUP_TYPE_YUN115) ||
                         ((webDavBackupCardDepth.get() ?: 0) > 0 && type == BACKUP_TYPE_YUN115) ||
                         ((webDavRunningSyncAuthCardDepth.get() ?: 0) > 0 && type == BACKUP_TYPE_YUN115)
                     ) {
                         param.result = if (
+                            ((onlineCompletionCloudTitleDepth.get() ?: 0) > 0 && type == BACKUP_TYPE_WEBDAV) ||
+                                isOnlineCompletionRenderType(type)
+                        ) {
+                            onlineCompletionTitleForType(type)
+                        } else if (
                             type == BACKUP_TYPE_LOCAL_LIBRARY ||
                             ((localLibraryAccountScreenDepth.get() ?: 0) > 0 && type == BACKUP_TYPE_YUN115)
                         ) {
@@ -296,6 +445,32 @@ class WebDavDriveHook(
             logWebDav("backup type name hook installed")
         }.onFailure {
             logWebDav("failed to hook WebDAV backup type name: ${it.stackTraceToString()}")
+        }
+    }
+
+    private fun hookHomeCloudResultListRenderContext() {
+        runCatching {
+            val method = cls(HOME_SEARCH_BAR_CLASS).declaredMethods.first {
+                it.name == HOME_CLOUD_RESULT_LIST_METHOD && it.parameterTypes.size == 6
+            }.apply { isAccessible = true }
+            XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val type = (param.args?.getOrNull(1) as? Number)?.toInt() ?: return
+                    if (!isOnlineCompletionRenderType(type)) return
+                    pushOnlineCompletionCloudTitle(onlineCompletionTitleForType(type))
+                    pushWebDavIcon()
+                }
+
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val type = (param.args?.getOrNull(1) as? Number)?.toInt() ?: return
+                    if (!isOnlineCompletionRenderType(type)) return
+                    popWebDavIcon()
+                    popOnlineCompletionCloudTitle()
+                }
+            })
+            logWebDav("home cloud result render context hook installed")
+        }.onFailure {
+            XposedBridge.log("$LOG_PREFIX failed to hook home cloud result render context: ${it.stackTraceToString()}")
         }
     }
 
@@ -332,6 +507,7 @@ class WebDavDriveHook(
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     if (
                         (webDavIconDepth.get() ?: 0) <= 0 &&
+                        (onlineCompletionCloudTitleDepth.get() ?: 0) <= 0 &&
                         (localLibraryIconDepth.get() ?: 0) <= 0 &&
                         (webDavBackupCardDepth.get() ?: 0) <= 0 &&
                         (webDavRunningSyncAuthCardDepth.get() ?: 0) <= 0
@@ -1364,6 +1540,22 @@ class WebDavDriveHook(
         }
     }
 
+    private fun hookHomeViewModelDependencies() {
+        runCatching {
+            cls(HOME_VIEW_MODEL_CLASS).declaredConstructors.forEach { constructor ->
+                constructor.isAccessible = true
+                XposedBridge.hookMethod(constructor, object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        rememberHomeViewModelDependencies(param.thisObject)
+                    }
+                })
+            }
+            XposedBridge.log("$LOG_PREFIX home viewModel dependency hook installed")
+        }.onFailure {
+            XposedBridge.log("$LOG_PREFIX failed to hook home viewModel dependencies: ${it.stackTraceToString()}")
+        }
+    }
+
     private fun hookHomeWebDavSearch() {
         runCatching {
             val method = cls(HOME_VIEW_MODEL_CLASS).declaredMethods.first {
@@ -1373,14 +1565,37 @@ class WebDavDriveHook(
             }.apply { isAccessible = true }
             XposedBridge.hookMethod(method, object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
+                    rememberHomeViewModelDependencies(param.thisObject)
                     val query = param.args?.getOrNull(0)?.toString().orEmpty()
                     val seq = webDavHomeSearchSeq.incrementAndGet()
                     val localSeq = localLibraryHomeSearchSeq.incrementAndGet()
+                    val onlineSeq = onlineCompletionHomeSearchSeq.incrementAndGet()
                     Thread({
                         runCatching {
                             if (query.isNotBlank()) {
                                 Thread.sleep(HOME_SEARCH_DEBOUNCE_MS)
-                                if (webDavHomeSearchSeq.get() != seq || localLibraryHomeSearchSeq.get() != localSeq) {
+                                if (onlineCompletionHomeSearchSeq.get() != onlineSeq) return@runCatching
+                            }
+                            val onlineResults = if (query.isBlank()) emptyList() else searchOnlineCompletionSources(query)
+                            if (onlineCompletionHomeSearchSeq.get() != onlineSeq) return@runCatching
+                            Handler(Looper.getMainLooper()).post {
+                                if (onlineCompletionHomeSearchSeq.get() == onlineSeq) {
+                                    updateHomeOnlineCompletionSearchResults(param.thisObject, onlineResults)
+                                }
+                            }
+                            logWebDav("home online search query=$query online=${onlineResults.size}")
+                        }.onFailure {
+                            XposedBridge.log("$LOG_PREFIX online completion home search failed: ${it.stackTraceToString()}")
+                        }
+                    }, "ReaMicroOnlineCompletionHomeSearch").start()
+                    Thread({
+                        runCatching {
+                            if (query.isNotBlank()) {
+                                Thread.sleep(HOME_SEARCH_DEBOUNCE_MS)
+                                if (
+                                    webDavHomeSearchSeq.get() != seq ||
+                                    localLibraryHomeSearchSeq.get() != localSeq
+                                ) {
                                     return@runCatching
                                 }
                             }
@@ -1396,7 +1611,15 @@ class WebDavDriveHook(
                             }
                             if (webDavHomeSearchSeq.get() != seq) return@runCatching
                             if (localLibraryHomeSearchSeq.get() != localSeq) return@runCatching
-                            updateHomeWebDavSearchResults(param.thisObject, webDavResults, localResults)
+                            rememberHomeSearchSnapshot(param.thisObject, query, webDavResults, localResults)
+                            Handler(Looper.getMainLooper()).post {
+                                if (
+                                    webDavHomeSearchSeq.get() == seq &&
+                                    localLibraryHomeSearchSeq.get() == localSeq
+                                ) {
+                                    updateHomeWebDavSearchResults(param.thisObject, webDavResults, localResults, null)
+                                }
+                            }
                             scheduleLocalLibrarySearchRefresh(param.thisObject, query, webDavResults, seq, localSeq, LOCAL_LIBRARY_SEARCH_REFRESH_DELAY_MS)
                             scheduleLocalLibrarySearchRefresh(param.thisObject, query, webDavResults, seq, localSeq, LOCAL_LIBRARY_SEARCH_LATE_REFRESH_DELAY_MS)
                             logWebDav("home search query=$query webdav=${webDavResults.size} local=${localResults.size}")
@@ -1422,12 +1645,24 @@ class WebDavDriveHook(
                     val map = param.args?.getOrNull(2) as? Map<*, *> ?: return
                     val sections = buildList {
                         (map[BACKUP_TYPE_WEBDAV] as? List<*>)?.takeIf { it.isNotEmpty() }?.let {
-                            add(HomeSearchSection(BACKUP_TYPE_WEBDAV, it))
+                            add(HomeSearchSection(type = BACKUP_TYPE_WEBDAV, results = it))
                         }
                         (map[BACKUP_TYPE_LOCAL_LIBRARY] as? List<*>)?.takeIf {
                             canShowLocalLibraryEntry() && it.isNotEmpty()
                         }?.let {
-                            add(HomeSearchSection(BACKUP_TYPE_LOCAL_LIBRARY, it))
+                            add(HomeSearchSection(type = BACKUP_TYPE_LOCAL_LIBRARY, results = it))
+                        }
+                        (map[BACKUP_TYPE_ONLINE_COMPLETION] as? List<*>)?.forEach { item ->
+                            val group = item as? OnlineSearchGroup ?: return@forEach
+                            val title = onlineCompletionGroupTitle(group)
+                            val renderType = onlineCompletionRenderTypeForSource(group.source, title)
+                            add(
+                                HomeSearchSection(
+                                    type = renderType,
+                                    title = title,
+                                    results = onlineCompletionGroupVisibleCloudBooks(group),
+                                ),
+                            )
                         }
                     }
                     if (sections.isEmpty()) return
@@ -1450,7 +1685,7 @@ class WebDavDriveHook(
                     val lazyListScope = param.args?.getOrNull(0) ?: return
                     context.rendered = true
                     context.sections.forEach { section ->
-                        addHomeWebDavSearchSection(lazyListScope, section.type, section.results, context.intentReceiver)
+                        addHomeWebDavSearchSection(lazyListScope, section.type, section.title, section.results, context.intentReceiver)
                     }
                 }
             })
@@ -1467,6 +1702,11 @@ class WebDavDriveHook(
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     val book = param.args?.getOrNull(1) ?: return
                     val type = book.callInt("getType")
+                    if (type == BACKUP_TYPE_ONLINE_COMPLETION || isOnlineCompletionPath(cloudPathOf(book))) {
+                        handleOnlineCompletionSearchTap(book)
+                        param.result = targetUnit()
+                        return
+                    }
                     if (tryHandleRunningCloudDownloadTap(book, type)) {
                         param.result = targetUnit()
                     }
@@ -1489,16 +1729,26 @@ class WebDavDriveHook(
         Handler(Looper.getMainLooper()).postDelayed({
             Thread({
                 runCatching {
-                    if (webDavHomeSearchSeq.get() != webDavSeq || localLibraryHomeSearchSeq.get() != localSeq) return@runCatching
+                    if (
+                        webDavHomeSearchSeq.get() != webDavSeq ||
+                        localLibraryHomeSearchSeq.get() != localSeq
+                    ) return@runCatching
                     val refreshedLocalResults = if (query.isBlank() || !canShowLocalLibraryEntry()) {
                         emptyList()
                     } else {
                         searchLocalLibraryBooks(query)
                     }
-                    if (webDavHomeSearchSeq.get() != webDavSeq || localLibraryHomeSearchSeq.get() != localSeq) return@runCatching
+                    if (
+                        webDavHomeSearchSeq.get() != webDavSeq ||
+                        localLibraryHomeSearchSeq.get() != localSeq
+                    ) return@runCatching
                     Handler(Looper.getMainLooper()).post {
-                        if (webDavHomeSearchSeq.get() == webDavSeq && localLibraryHomeSearchSeq.get() == localSeq) {
-                            updateHomeWebDavSearchResults(viewModel, webDavResults, refreshedLocalResults)
+                        if (
+                            webDavHomeSearchSeq.get() == webDavSeq &&
+                            localLibraryHomeSearchSeq.get() == localSeq
+                        ) {
+                            rememberHomeSearchSnapshot(viewModel, query, webDavResults, refreshedLocalResults)
+                            updateHomeWebDavSearchResults(viewModel, webDavResults, refreshedLocalResults, null)
                         }
                     }
                 }.onFailure {
@@ -1506,6 +1756,37 @@ class WebDavDriveHook(
                 }
             }, "ReaMicroLocalLibrarySearchRefresh").start()
         }, delayMs)
+    }
+
+    private fun rememberHomeSearchSnapshot(
+        viewModel: Any?,
+        query: String,
+        webDavResults: List<Any>,
+        localResults: List<Any>,
+    ) {
+        if (viewModel != null) lastHomeSearchViewModelRef = WeakReference(viewModel)
+        lastHomeSearchQuery = query
+        lastHomeSearchWebDavResults = webDavResults
+        lastHomeSearchLocalResults = localResults
+    }
+
+    private fun refreshOnlineCompletionSearch(query: String = lastHomeSearchQuery) {
+        val viewModel = lastHomeSearchViewModelRef?.get() ?: return
+        if (query.isBlank()) return
+        val seq = onlineCompletionHomeSearchSeq.incrementAndGet()
+        Thread({
+            runCatching {
+                val onlineResults = searchOnlineCompletionSources(query)
+                if (onlineCompletionHomeSearchSeq.get() != seq) return@runCatching
+                Handler(Looper.getMainLooper()).post {
+                    if (onlineCompletionHomeSearchSeq.get() == seq) {
+                        updateHomeOnlineCompletionSearchResults(viewModel, onlineResults)
+                    }
+                }
+            }.onFailure {
+                XposedBridge.log("$LOG_PREFIX online completion refresh failed: ${it.stackTraceToString()}")
+            }
+        }, "ReaMicroOnlineCompletionRefresh").start()
     }
 
     private fun hookWebDavCloudDownload() {
@@ -2385,6 +2666,9 @@ class WebDavDriveHook(
                             }
                             (localLibraryCloudTitleDepth.get() ?: 0) > 0 -> param.result = LOCAL_LIBRARY_TITLE
                             (webDavCloudTitleDepth.get() ?: 0) > 0 -> param.result = WEBDAV_TITLE
+                            (onlineCompletionCloudTitleDepth.get() ?: 0) > 0 -> {
+                                param.result = onlineCompletionCloudTitleText.get().orEmpty().ifBlank { ONLINE_COMPLETION_TITLE }
+                            }
                             webDavNotAuthTipPending.get() == true -> {
                                 webDavNotAuthTipPending.set(false)
                                 param.result = WEBDAV_AUTH_TIPS
@@ -3652,6 +3936,503 @@ class WebDavDriveHook(
             .map { newLocalLibraryCloudBook(it) }
     }
 
+    private fun searchOnlineCompletionSources(query: String): List<Any> {
+        val context = currentContext() ?: return emptyList()
+        val needle = query.trim()
+        if (needle.isBlank()) return emptyList()
+        val prefs = context.getSharedPreferences(ModuleSettings.PREFS_NAME, Context.MODE_PRIVATE)
+        val sources = OnlineSourceStore.list(context)
+            .filter { source -> prefs.getBoolean(ModuleSettings.onlineSourceKey(source.id), false) }
+        logWebDav("online completion search query=$needle sources=${sources.size}")
+        onlineCompletionSearchTargets.clear()
+        val selectedSources = sources.take(HOME_SEARCH_RESULT_LIMIT)
+        return searchOnlineCompletionSourcesConcurrent(selectedSources, needle)
+    }
+
+    private fun searchOnlineCompletionSourcesConcurrent(
+        sources: List<OnlineSourceEntry>,
+        query: String,
+    ): List<OnlineSearchGroup> {
+        if (sources.isEmpty()) return emptyList()
+        val latch = CountDownLatch(sources.size)
+        val groups = arrayOfNulls<OnlineSearchGroup>(sources.size)
+        sources.forEachIndexed { index, source ->
+            Thread({
+                try {
+                    groups[index] = searchOnlineCompletionSource(source, query)
+                } finally {
+                    latch.countDown()
+                }
+            }, "ReaMicroOnlineSourceSearch-${source.id.takeLast(6)}").start()
+        }
+        latch.await(ONLINE_COMPLETION_SEARCH_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        return groups.mapIndexed { index, group ->
+            group ?: OnlineSearchGroup(sources[index], query, emptyList(), "搜索超时")
+        }
+    }
+
+    private fun searchOnlineCompletionSource(source: OnlineSourceEntry, query: String): OnlineSearchGroup {
+        if (source.searchUrl.isBlank()) {
+            return OnlineSearchGroup(source, query, emptyList(), "源缺少 searchUrl")
+        }
+        return runCatching {
+            val requestUrl = buildOnlineSearchUrl(source, query)
+            if (requestUrl.isBlank()) error("暂不支持脚本型 searchUrl")
+            val response = OnlineConcurrentRateLimiter.withLimitBlocking(source) {
+                requestOnlineSearch(source, requestUrl)
+            }
+            val results = parseOnlineSearchResults(source, query, response)
+                .distinctBy { "${it.name}|${it.author}|${it.detailUrl}" }
+                .take(ONLINE_COMPLETION_RESULT_LIMIT)
+            logWebDav("online completion source ok name=${source.name} results=${results.size} first=${results.firstOrNull()?.name.orEmpty()}")
+            OnlineSearchGroup(source, query, results, "")
+        }.getOrElse {
+            logWebDav("online completion source failed name=${source.name} error=${it.message}")
+            OnlineSearchGroup(source, query, emptyList(), it.message.orEmpty().ifBlank { "搜索失败" })
+        }
+    }
+
+    private fun buildOnlineSearchUrl(source: OnlineSourceEntry, query: String): String {
+        val text = source.searchUrl.trim()
+        val raw = if (text.startsWith("@js:", ignoreCase = true) || text.startsWith("<js>", ignoreCase = true)) {
+            text
+        } else {
+            text.lineSequence().map { it.trim() }.firstOrNull { it.isNotBlank() }.orEmpty()
+        }
+        if (raw.startsWith("@js:", ignoreCase = true) || raw.startsWith("<js>", ignoreCase = true)) {
+            return buildOnlineSearchUrlFromJs(source, raw, query)
+        }
+        val urlPart = raw.substringBefore(",{").substringBefore(", {").trim()
+        val resolved = applyOnlineTemplate(urlPart, null, sourceBaseUrl(source), query, encodeQuery = true)
+        return resolveOnlineUrl(sourceBaseUrl(source), resolved)
+    }
+
+    private fun buildOnlineSearchUrlFromJs(source: OnlineSourceEntry, raw: String, query: String): String {
+        val templates = Regex("""return\s+`([^`]+)`""").findAll(raw).map { it.groupValues[1] }.toList()
+        val selected = when {
+            templates.isEmpty() -> return ""
+            query.all { it.isDigit() } -> templates.first()
+            else -> templates.last()
+        }
+        return resolveOnlineUrl(
+            sourceBaseUrl(source),
+            applyOnlineTemplate(selected, null, sourceBaseUrl(source), query, encodeQuery = true),
+        )
+    }
+
+    private fun requestOnlineSearch(source: OnlineSourceEntry, requestUrl: String): OnlineHttpResponse {
+        if (requestUrl.startsWith("data:", ignoreCase = true)) {
+            return OnlineHttpResponse(requestUrl, onlineDataUrlStringResponse(requestUrl))
+        }
+        return withOnlineCleartextAllowed(requestUrl) {
+            val connection = (URL(requestUrl).openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = onlineConnectTimeoutMillis(source)
+                readTimeout = onlineReadTimeoutMillis(source)
+                setRequestProperty("User-Agent", "Mozilla/5.0 ReaMicro-Extend/online-source")
+                setRequestProperty("Accept", "application/json,text/html,application/xhtml+xml,*/*")
+                parseOnlineHeaders(source.header).forEach { (name, value) ->
+                    if (name.isNotBlank() && value.isNotBlank()) setRequestProperty(name, value)
+                }
+            }
+            try {
+                val code = connection.responseCode
+                val stream = if (code in 200..299) connection.inputStream else connection.errorStream
+                val body = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
+                if (code !in 200..299) error("HTTP $code")
+                OnlineHttpResponse(connection.url.toString(), body)
+            } finally {
+                connection.disconnect()
+            }
+        }
+    }
+
+    private fun onlineDataUrlStringResponse(url: String): String {
+        val dataPart = url.substringAfter("base64,", "")
+            .substringBefore(",{")
+            .substringBefore(";")
+            .trim()
+        if (dataPart.isBlank()) return ""
+        val bytes = Base64.decode(dataPart, Base64.DEFAULT)
+        return if (url.substringAfter(dataPart, "").contains(""""type"""")) {
+            bytes.toLowerHexString()
+        } else {
+            String(bytes, Charsets.UTF_8)
+        }
+    }
+
+    private fun parseOnlineHeaders(raw: String): Map<String, String> {
+        val text = raw.trim()
+        if (text.isBlank()) return emptyMap()
+        return runCatching {
+            val json = JSONObject(text)
+            json.keys().asSequence().associateWith { key -> json.optString(key, "") }
+        }.getOrElse {
+            text.lineSequence()
+                .mapNotNull { line ->
+                    val index = line.indexOf(':')
+                    if (index <= 0) null else line.take(index).trim() to line.substring(index + 1).trim()
+                }
+                .toMap()
+        }
+    }
+
+    private fun parseOnlineSearchResults(
+        source: OnlineSourceEntry,
+        query: String,
+        response: OnlineHttpResponse,
+    ): List<OnlineBookSearchResult> {
+        val body = response.body.trim()
+        if (body.isBlank()) return emptyList()
+        return if (body.startsWith("{") || body.startsWith("[")) {
+            parseOnlineJsonResults(source, response.url, body)
+        } else {
+            parseOnlineHtmlResults(source, query, response.url, body)
+        }
+    }
+
+    private fun parseOnlineJsonResults(
+        source: OnlineSourceEntry,
+        baseUrl: String,
+        body: String,
+    ): List<OnlineBookSearchResult> {
+        val root = parseOnlineJsonRoot(body) ?: return emptyList()
+        parseOnlineJsonResultsByRule(source, baseUrl, root).takeIf { it.isNotEmpty() }?.let { return it }
+        val results = mutableListOf<OnlineBookSearchResult>()
+        fun visit(value: Any?) {
+            if (results.size >= ONLINE_COMPLETION_RESULT_LIMIT) return
+            when (value) {
+                is JSONArray -> for (index in 0 until value.length()) visit(value.opt(index))
+                is JSONObject -> {
+                    jsonObjectToOnlineResult(source, baseUrl, value)?.let(results::add)
+                    value.keys().asSequence().forEach { key ->
+                        val child = value.opt(key)
+                        if (child is JSONArray || child is JSONObject) visit(child)
+                    }
+                }
+            }
+        }
+        visit(root)
+        return results
+    }
+
+    private fun parseOnlineJsonRoot(body: String): Any? =
+        runCatching {
+            val text = body.trim()
+            if (text.startsWith("[")) JSONArray(text) else JSONObject(text)
+        }.getOrNull()
+
+    private fun parseOnlineJsonResultsByRule(
+        source: OnlineSourceEntry,
+        baseUrl: String,
+        root: Any,
+    ): List<OnlineBookSearchResult> {
+        val rule = runCatching { JSONObject(source.ruleSearch) }.getOrNull() ?: return emptyList()
+        val nodes = onlineJsonRuleValues(root, rule.optString("bookList", ""))
+        if (nodes.isEmpty()) return emptyList()
+        return nodes.mapNotNull { node ->
+            val name = onlineRuleValue(node, rule.optString("name", ""), baseUrl).cleanOnlineText()
+            if (name.isBlank() || name.length > 120) return@mapNotNull null
+            val author = onlineRuleValue(node, rule.optString("author", ""), baseUrl).cleanOnlineText()
+            val detail = onlineRuleValue(node, rule.optString("bookUrl", ""), baseUrl)
+            val cover = onlineRuleValue(node, rule.optString("coverUrl", ""), baseUrl)
+            val intro = onlineRuleValue(node, rule.optString("intro", ""), baseUrl).cleanOnlineText()
+            OnlineBookSearchResult(
+                sourceName = source.name,
+                name = name,
+                author = author,
+                coverUrl = resolveOnlineUrl(baseUrl, cover),
+                detailUrl = resolveOnlineUrl(baseUrl, detail),
+                intro = intro,
+            )
+        }.distinctBy { "${it.name}|${it.author}|${it.detailUrl}" }
+            .take(ONLINE_COMPLETION_RESULT_LIMIT)
+    }
+
+    private fun jsonObjectToOnlineResult(
+        source: OnlineSourceEntry,
+        baseUrl: String,
+        json: JSONObject,
+    ): OnlineBookSearchResult? {
+        val name = firstJsonString(json, "bookName", "name", "title", "bookTitle", "novelName").cleanOnlineText()
+        if (name.isBlank() || name.length > 120) return null
+        val author = firstJsonString(json, "author", "bookAuthor", "writer", "authorName").cleanOnlineText()
+        val detail = firstJsonString(json, "bookUrl", "detailUrl", "url", "href", "link")
+        val cover = firstJsonString(json, "coverUrl", "cover", "img", "image", "bookCover")
+        val intro = firstJsonString(json, "intro", "desc", "description", "bookDesc").cleanOnlineText()
+        return OnlineBookSearchResult(
+            sourceName = source.name,
+            name = name,
+            author = author,
+            coverUrl = resolveOnlineUrl(baseUrl, cover),
+            detailUrl = resolveOnlineUrl(baseUrl, detail),
+            intro = intro,
+        )
+    }
+
+    private fun parseOnlineHtmlResults(
+        source: OnlineSourceEntry,
+        query: String,
+        baseUrl: String,
+        html: String,
+    ): List<OnlineBookSearchResult> {
+        val results = mutableListOf<OnlineBookSearchResult>()
+        val anchorRegex = Regex("""(?is)<a\b[^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>""")
+        anchorRegex.findAll(html).forEach { match ->
+            if (results.size >= ONLINE_COMPLETION_RESULT_LIMIT) return@forEach
+            val title = match.groupValues[2].cleanOnlineText()
+            if (title.isBlank() || title.length > 120) return@forEach
+            if (!title.contains(query, ignoreCase = true) && results.size >= 3) return@forEach
+            val href = match.groupValues[1].trim()
+            val start = (match.range.first - 240).coerceAtLeast(0)
+            val end = (match.range.last + 360).coerceAtMost(html.length)
+            val window = html.substring(start, end)
+            val author = Regex("""(?is)(?:作者|author)\s*[:：]?\s*</?[^>]*>\s*([^<\s]{1,40})""")
+                .find(window)?.groupValues?.getOrNull(1).orEmpty().cleanOnlineText()
+            val cover = Regex("""(?is)<img\b[^>]*\bsrc\s*=\s*["']([^"']+)["']""")
+                .find(window)?.groupValues?.getOrNull(1).orEmpty()
+            results.add(
+                OnlineBookSearchResult(
+                    sourceName = source.name,
+                    name = title,
+                    author = author,
+                    coverUrl = resolveOnlineUrl(baseUrl, cover),
+                    detailUrl = resolveOnlineUrl(baseUrl, href),
+                    intro = "",
+                ),
+            )
+        }
+        return results
+    }
+
+    private fun firstJsonString(json: JSONObject, vararg names: String): String =
+        names.asSequence()
+            .map { json.optString(it, "").trim() }
+            .firstOrNull { it.isNotBlank() && it != "null" }
+            .orEmpty()
+
+    private fun onlineRuleValue(node: Any?, rawRule: String, baseUrl: String, query: String? = null): String {
+        var rule = rawRule.trim()
+        if (rule.isBlank() || node == null || node == JSONObject.NULL) return ""
+        if (rule.startsWith("<js>", ignoreCase = true)) return ""
+        if (rule.startsWith("@js:", ignoreCase = true)) {
+            if (rule.contains("replaceCover", ignoreCase = true)) {
+                return replaceFanqieCover(onlineRuleValue(node, "thumb_url", baseUrl))
+            }
+            return ""
+        }
+        rule = rule.substringBefore("\n<js>", rule).substringBefore("\n@js:", rule).trim()
+        if (rule.contains("{{") && rule.contains("}}")) {
+            return applyOnlineTemplate(rule, node, baseUrl, query)
+        }
+        val parts = rule.split("##", limit = 3)
+        val selector = parts.firstOrNull().orEmpty().trim()
+        val value = selector.split("||")
+            .asSequence()
+            .map { candidate -> onlineJsonString(node, candidate.trim()) }
+            .firstOrNull { it.isNotBlank() }
+            .orEmpty()
+        if (parts.size >= 2 && parts[1].isNotBlank()) {
+            return runCatching {
+                value.replace(Regex(parts[1]), parts.getOrNull(2).orEmpty())
+            }.getOrDefault(value)
+        }
+        return value
+    }
+
+    private fun applyOnlineTemplate(
+        raw: String,
+        node: Any?,
+        baseUrl: String,
+        query: String?,
+        page: Int = 1,
+        encodeQuery: Boolean = false,
+    ): String {
+        var text = raw
+            .replace("{{(page-1)*10}}", ((page - 1) * 10).toString())
+            .replace("{{(page - 1) * 10}}", ((page - 1) * 10).toString())
+            .replace("{{page}}", page.toString())
+        if (query != null) {
+            val key = if (encodeQuery) URLEncoder.encode(query, "UTF-8") else query
+            listOf("{{key}}", "{{keyword}}", "{{searchKey}}", "{key}", "{keyword}", "%s").forEach { token ->
+                text = text.replace(token, key, ignoreCase = true)
+            }
+        }
+        return Regex("""\{\{([^{}]+)\}\}""").replace(text) { match ->
+            val expr = match.groupValues[1].trim()
+            when {
+                Regex("""^baseUrl\s*\+\s*['"]([^'"]*)['"]$""").matchEntire(expr) != null ->
+                    baseUrl.trimEnd('/') + Regex("""^baseUrl\s*\+\s*['"]([^'"]*)['"]$""")
+                        .matchEntire(expr)
+                        ?.groupValues
+                        ?.getOrNull(1)
+                        .orEmpty()
+                expr.startsWith("$") || expr.startsWith(".") -> onlineJsonString(node, expr)
+                expr.equals("page", ignoreCase = true) -> page.toString()
+                expr.equals("key", ignoreCase = true) || expr.equals("keyword", ignoreCase = true) ->
+                    query?.let { if (encodeQuery) URLEncoder.encode(it, "UTF-8") else it }.orEmpty()
+                else -> ""
+            }
+        }
+    }
+
+    private fun onlineJsonString(node: Any?, rule: String): String =
+        onlineJsonValues(node, rule).firstOrNull()?.let(::onlineJsonPrimitive).orEmpty()
+
+    private fun onlineJsonRuleValues(node: Any?, rule: String): List<Any?> {
+        if (node == null || rule.isBlank()) return emptyList()
+        onlineJsonCandidateRoots(node).forEach { candidate ->
+            val values = onlineJsonValues(candidate, rule)
+            if (values.isNotEmpty()) return values
+        }
+        return emptyList()
+    }
+
+    private fun onlineJsonCandidateRoots(node: Any?): List<Any?> {
+        val roots = linkedSetOf<Any?>()
+        fun add(value: Any?) {
+            if (value != null && value != JSONObject.NULL) roots.add(value)
+        }
+        add(node)
+        if (node is JSONObject) {
+            listOf("data", "result", "book", "chapter", "rows", "ret_data").forEach { key ->
+                add(node.opt(key))
+            }
+            (node.opt("data") as? JSONObject)?.let { data ->
+                listOf("data", "result", "book", "chapter", "rows", "ret_data").forEach { key ->
+                    add(data.opt(key))
+                }
+            }
+        }
+        return roots.toList()
+    }
+
+    private fun onlineJsonValues(node: Any?, rawRule: String): List<Any?> {
+        val rule = rawRule.trim()
+        if (node == null || rule.isBlank()) return emptyList()
+        return rule.split("||")
+            .asSequence()
+            .map { onlineJsonValuesSingle(node, it.trim()) }
+            .firstOrNull { it.isNotEmpty() }
+            .orEmpty()
+    }
+
+    private fun onlineJsonValuesSingle(node: Any?, rawRule: String): List<Any?> {
+        if (node == null || rawRule.isBlank()) return emptyList()
+        if (rawRule.startsWith("$..")) {
+            val name = rawRule.removePrefix("$..").substringBefore('.').substringBefore('[')
+            return onlineJsonRecursiveValues(node, name)
+        }
+        var path = rawRule
+        if (path.startsWith("$.")) path = path.drop(2)
+        else if (path.startsWith(".")) path = path.drop(1)
+        else if (path == "$") return listOf(node)
+        if (path.isBlank()) return listOf(node)
+        var current: List<Any?> = listOf(node)
+        path.split('.').filter { it.isNotBlank() }.forEach { token ->
+            current = current.flatMap { value -> onlineJsonStep(value, token) }
+            if (current.isEmpty()) return emptyList()
+        }
+        return current.filter { it != null && it != JSONObject.NULL }
+    }
+
+    private fun onlineJsonStep(value: Any?, token: String): List<Any?> {
+        if (value == null || value == JSONObject.NULL) return emptyList()
+        if (token == "*" || token == "*[*]") {
+            val children = when (value) {
+                is JSONObject -> value.keys().asSequence().map { value.opt(it) }.toList()
+                is JSONArray -> (0 until value.length()).map { value.opt(it) }
+                else -> emptyList()
+            }
+            return if (token.endsWith("[*]")) children.flatMap { onlineJsonArrayItems(it) } else children
+        }
+        val match = Regex("""^([^\[]+)(?:\[(\d+|\*)])?$""").matchEntire(token) ?: return emptyList()
+        val name = match.groupValues[1]
+        val index = match.groupValues.getOrNull(2).orEmpty()
+        val values = when (value) {
+            is JSONObject -> listOf(value.opt(name))
+            is JSONArray -> (0 until value.length()).mapNotNull { idx ->
+                (value.opt(idx) as? JSONObject)?.opt(name)
+            }
+            else -> emptyList()
+        }
+        return when (index) {
+            "" -> values
+            "*" -> values.flatMap { onlineJsonArrayItems(it) }
+            else -> values.mapNotNull { arrayValue ->
+                (arrayValue as? JSONArray)?.opt(index.toIntOrNull() ?: return@mapNotNull null)
+            }
+        }
+    }
+
+    private fun onlineJsonArrayItems(value: Any?): List<Any?> =
+        when (value) {
+            is JSONArray -> (0 until value.length()).map { value.opt(it) }
+            is JSONObject -> value.keys().asSequence().map { value.opt(it) }.toList()
+            null, JSONObject.NULL -> emptyList()
+            else -> listOf(value)
+        }
+
+    private fun onlineJsonRecursiveValues(value: Any?, name: String): List<Any?> {
+        val results = mutableListOf<Any?>()
+        fun visit(item: Any?) {
+            when (item) {
+                is JSONObject -> {
+                    if (item.has(name)) results.add(item.opt(name))
+                    item.keys().asSequence().forEach { visit(item.opt(it)) }
+                }
+                is JSONArray -> for (index in 0 until item.length()) visit(item.opt(index))
+            }
+        }
+        visit(value)
+        return results.filter { it != null && it != JSONObject.NULL }
+    }
+
+    private fun onlineJsonPrimitive(value: Any?): String =
+        when (value) {
+            null, JSONObject.NULL -> ""
+            is String -> value
+            is Number, is Boolean -> value.toString()
+            else -> value.toString()
+        }.trim()
+
+    private fun replaceFanqieCover(raw: String): String {
+        var url = raw.trim()
+        if (url.isBlank()) return ""
+        url = url.removePrefix("https://").removePrefix("http://")
+        val parts = url.split('/').toMutableList()
+        if (parts.isNotEmpty()) parts[0] = "https://p6-novel.byteimg.com/origin"
+        return parts.joinToString("/") { part -> part.substringBefore('~').substringBefore('?') }
+    }
+
+    private fun sourceBaseUrl(source: OnlineSourceEntry): String =
+        Regex("""https?://[^\s#]+""").find(source.sourceUrl)?.value.orEmpty()
+
+    private fun resolveOnlineUrl(baseUrl: String, value: String): String {
+        val raw = value.trim()
+        if (raw.isBlank()) return ""
+        return runCatching {
+            when {
+                raw.startsWith("http://", ignoreCase = true) || raw.startsWith("https://", ignoreCase = true) -> raw
+                baseUrl.isBlank() -> raw
+                else -> URL(URL(baseUrl), raw).toString()
+            }
+        }.getOrDefault(raw)
+    }
+
+    private fun String.cleanOnlineText(): String =
+        replace(Regex("(?is)<script[\\s\\S]*?</script>"), " ")
+            .replace(Regex("(?is)<style[\\s\\S]*?</style>"), " ")
+            .replace(Regex("(?is)<[^>]+>"), " ")
+            .replace("&nbsp;", " ")
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+
     private fun buildLocalLibrarySearchIndex(
         rootsKey: String,
         maxDurationMs: Long,
@@ -3717,8 +4498,14 @@ class WebDavDriveHook(
         }, "ReaMicroLocalLibraryIndex").start()
     }
 
-    private fun updateHomeWebDavSearchResults(viewModel: Any?, webDavResults: List<Any>, localResults: List<Any>) {
+    private fun updateHomeWebDavSearchResults(
+        viewModel: Any?,
+        webDavResults: List<Any>,
+        localResults: List<Any>,
+        onlineResults: List<Any>? = null,
+    ) {
         if (viewModel == null) return
+        rememberHomeViewModelDependencies(viewModel)
         runCatching {
             val updateMethod = viewModel.javaClass.superclass?.methods?.firstOrNull {
                 it.name == "updateUiState" && it.parameterTypes.size == 1
@@ -3729,22 +4516,31 @@ class WebDavDriveHook(
                 viewModel,
                 functionProxy("WebDavHomeSearchState", FUNCTION1_CLASS) { args ->
                     val state = args?.getOrNull(0) ?: return@functionProxy args?.getOrNull(0)
-                    val current = state.javaClass.methods.firstOrNull {
-                        it.name == "getCloudSearchResults" && it.parameterTypes.isEmpty()
-                    }?.apply { isAccessible = true }?.invoke(state) as? Map<*, *>
-                    val merged = linkedMapOf<Any?, Any?>()
-                    current?.forEach { (key, value) -> merged[key] = value }
-                    if (webDavResults.isEmpty()) {
-                        merged.remove(BACKUP_TYPE_WEBDAV)
-                    } else {
-                        merged[BACKUP_TYPE_WEBDAV] = webDavResults
-                    }
-                    if (localResults.isEmpty()) {
-                        merged.remove(BACKUP_TYPE_LOCAL_LIBRARY)
-                    } else {
-                        merged[BACKUP_TYPE_LOCAL_LIBRARY] = localResults
-                    }
-                    copyHomeUiStateWithCloudResults(state, merged)
+                    runCatching {
+                        val current = homeCloudSearchResults(state)
+                        val merged = linkedMapOf<Any?, Any?>()
+                        current?.forEach { (key, value) -> merged[key] = value }
+                        if (webDavResults.isEmpty()) {
+                            merged.remove(BACKUP_TYPE_WEBDAV)
+                        } else {
+                            merged[BACKUP_TYPE_WEBDAV] = webDavResults
+                        }
+                        if (localResults.isEmpty()) {
+                            merged.remove(BACKUP_TYPE_LOCAL_LIBRARY)
+                        } else {
+                            merged[BACKUP_TYPE_LOCAL_LIBRARY] = localResults
+                        }
+                        if (onlineResults != null) {
+                            if (onlineResults.isEmpty()) {
+                                merged.remove(BACKUP_TYPE_ONLINE_COMPLETION)
+                            } else {
+                                merged[BACKUP_TYPE_ONLINE_COMPLETION] = onlineResults
+                            }
+                        }
+                        copyHomeUiStateWithCloudResults(state, merged)
+                    }.onFailure {
+                        XposedBridge.log("$LOG_PREFIX failed to copy WebDAV home search state: ${it.stackTraceToString()}")
+                    }.getOrDefault(state)
                 },
             )
         }.onFailure {
@@ -3752,10 +4548,89 @@ class WebDavDriveHook(
         }
     }
 
+    private fun updateHomeOnlineCompletionSearchResults(viewModel: Any?, onlineResults: List<Any>) {
+        if (viewModel == null) return
+        rememberHomeViewModelDependencies(viewModel)
+        runCatching {
+            val updateMethod = viewModel.javaClass.superclass?.methods?.firstOrNull {
+                it.name == "updateUiState" && it.parameterTypes.size == 1
+            } ?: viewModel.javaClass.methods.first {
+                it.name == "updateUiState" && it.parameterTypes.size == 1
+            }
+            updateMethod.apply { isAccessible = true }.invoke(
+                viewModel,
+                functionProxy("OnlineCompletionHomeSearchState", FUNCTION1_CLASS) { args ->
+                    val state = args?.getOrNull(0) ?: return@functionProxy args?.getOrNull(0)
+                    runCatching {
+                        val current = homeCloudSearchResults(state)
+                        val merged = linkedMapOf<Any?, Any?>()
+                        current?.forEach { (key, value) -> merged[key] = value }
+                        if (onlineResults.isEmpty()) {
+                            merged.remove(BACKUP_TYPE_ONLINE_COMPLETION)
+                        } else {
+                            merged[BACKUP_TYPE_ONLINE_COMPLETION] = onlineResults
+                        }
+                        copyHomeUiStateWithCloudResults(state, merged)
+                    }.onFailure {
+                        XposedBridge.log("$LOG_PREFIX failed to copy online completion search state: ${it.stackTraceToString()}")
+                    }.getOrDefault(state)
+                },
+            )
+        }.onFailure {
+            XposedBridge.log("$LOG_PREFIX failed to update online completion search state: ${it.stackTraceToString()}")
+        }
+    }
+
+    private fun homeCloudSearchResults(state: Any): Map<*, *>? =
+        state.javaClass.methods.firstOrNull {
+            it.name == "getCloudSearchResults" && it.parameterTypes.isEmpty()
+        }?.apply { isAccessible = true }?.invoke(state) as? Map<*, *>
+
     private fun copyHomeUiStateWithCloudResults(state: Any, cloudResults: Map<Any?, Any?>): Any {
-        val copyMethod = state.javaClass.methods.first {
+        val currentCloudResults = homeCloudSearchResults(state)
+        val stateClass = state.javaClass
+        val copyMethods = stateClass.methods
+            .filter { it.name == "copy" && it.returnType == stateClass && it.parameterTypes.isNotEmpty() }
+            .sortedByDescending { it.parameterTypes.size }
+        val failures = mutableListOf<String>()
+        copyMethods.forEach { copyMethod ->
+            runCatching {
+                copyMethod.isAccessible = true
+                val args = Array<Any?>(copyMethod.parameterTypes.size) { index ->
+                    state.invokeNoArg("component${index + 1}")
+                }
+                val cloudIndex = args.indexOfFirst { it === currentCloudResults }
+                    .takeIf { it >= 0 }
+                    ?: homeCloudSearchResultsComponentIndex(state, copyMethod.parameterTypes.size)
+                    ?: copyMethod.parameterTypes.mapIndexedNotNull { index, type ->
+                        index.takeIf { Map::class.java.isAssignableFrom(type) }
+                    }.singleOrNull()
+                    ?: throw IllegalStateException("cloudSearchResults parameter not found for ${copyMethod.parameterTypes.size}-arg HomeUiState.copy")
+                args[cloudIndex] = cloudResults
+                val copied = copyMethod.invoke(state, *args)
+                if (stateClass.isInstance(copied)) return copied
+                failures += "${copyMethod.parameterTypes.size}: returned ${copied?.javaClass?.name}"
+            }.onFailure {
+                failures += "${copyMethod.parameterTypes.size}: ${it.javaClass.name}: ${it.message}"
+            }
+        }
+        XposedBridge.log("$LOG_PREFIX HomeUiState dynamic copy failed: ${failures.joinToString(" | ")}")
+        return copyHomeUiStateWithCloudResultsLegacy(state, cloudResults)
+    }
+
+    private fun homeCloudSearchResultsComponentIndex(state: Any, parameterCount: Int): Int? {
+        val current = homeCloudSearchResults(state) ?: return null
+        for (index in 0 until parameterCount) {
+            val component = state.invokeNoArg("component${index + 1}")
+            if (component === current) return index
+        }
+        return null
+    }
+
+    private fun copyHomeUiStateWithCloudResultsLegacy(state: Any, cloudResults: Map<Any?, Any?>): Any {
+        val copyMethod = state.javaClass.methods.firstOrNull {
             it.name == "copy" && it.parameterTypes.size == 13
-        }.apply { isAccessible = true }
+        }?.apply { isAccessible = true } ?: return state
         return copyMethod.invoke(
             state,
             state.invokeNoArg("getModel"),
@@ -3774,7 +4649,7 @@ class WebDavDriveHook(
         )
     }
 
-    private fun addHomeWebDavSearchSection(lazyListScope: Any, type: Int, results: List<*>, intentReceiver: Any) {
+    private fun addHomeWebDavSearchSection(lazyListScope: Any, type: Int, title: String, results: List<*>, intentReceiver: Any) {
         runCatching {
             val itemMethod = lazyListScope.javaClass.methods.firstOrNull {
                 it.name == "item" && it.parameterTypes.size == 3
@@ -3784,7 +4659,7 @@ class WebDavDriveHook(
             itemMethod.isAccessible = true
             itemMethod.invoke(
                 lazyListScope,
-                "cloud-search-$type",
+                "cloud-search-$type-${title.ifBlank { type.toString() }.hashCode()}",
                 type,
                 functionProxy("WebDavHomeSearchItem", FUNCTION3_CLASS) { args ->
                     val item = args?.getOrNull(0) ?: return@functionProxy targetUnit()
@@ -3797,7 +4672,9 @@ class WebDavDriveHook(
                             results,
                             functionProxy("WebDavHomeSearchTap", FUNCTION1_CLASS) { tapArgs ->
                                 tapArgs?.getOrNull(0)?.let { book ->
-                                    if (!tryHandleRunningCloudDownloadTap(book, type)) {
+                                    if (isOnlineCompletionPath(cloudPathOf(book))) {
+                                        handleOnlineCompletionSearchTap(book)
+                                    } else if (!tryHandleRunningCloudDownloadTap(book, type)) {
                                         method(HOME_SEARCH_BAR_CLASS, HOME_SEARCH_TAP_METHOD, 2).invoke(
                                             null,
                                             intentReceiver,
@@ -3818,13 +4695,27 @@ class WebDavDriveHook(
                         } finally {
                             popLocalLibraryIcon()
                         }
+                    } else if (isOnlineCompletionRenderType(type)) {
+                        pushOnlineCompletionCloudTitle(onlineCompletionTitleForType(type, title))
+                        try {
+                            withWebDavIcon { render() }
+                        } finally {
+                            popOnlineCompletionCloudTitle()
+                        }
                     } else {
                         withWebDavIcon { render() }
                     }
                     targetUnit()
                 },
             )
-            logWebDav("home search section rendered type=$type results=${results.size}")
+            val firstBook = results.firstOrNull()
+            val firstType = firstBook?.callInt("getType") ?: 0
+            val firstId = firstBook?.callString("getId").orEmpty()
+            val firstPath = cloudPathOf(firstBook)
+            logWebDav(
+                "home search section rendered type=$type results=${results.size} " +
+                    "firstType=$firstType firstId=$firstId firstPath=$firstPath",
+            )
         }.onFailure {
             XposedBridge.log("$LOG_PREFIX failed to render WebDAV home search section: ${it.stackTraceToString()}")
         }
@@ -4029,6 +4920,178 @@ class WebDavDriveHook(
         )
     }
 
+    private fun newOnlineCompletionSourceCloudBook(group: OnlineSearchGroup): Any {
+        val encodedQuery = URLEncoder.encode(group.query, "UTF-8")
+        val path = "$ONLINE_COMPLETION_SOURCE_PREFIX${group.source.id}?q=$encodedQuery"
+        val expanded = onlineCompletionExpandedSources[group.source.id] == true
+        val best = group.results.firstOrNull()
+        val status = when {
+            group.error.isNotBlank() -> group.error
+            best == null -> "无结果"
+            expanded -> "已展开 ${group.results.size} 条结果"
+            else -> best.name
+        }
+        val subtitle = listOfNotNull(
+            best?.author?.takeIf { it.isNotBlank() }?.let { "作者 $it" },
+            group.source.name.takeIf { it.isNotBlank() },
+            if (best != null && !expanded && group.results.size > 1) "${group.results.size} 条结果，点按展开" else null,
+            if (best == null) group.source.sourceUrl.takeIf { it.isNotBlank() } else null,
+        ).joinToString(" · ")
+        return newOnlineCompletionCloudBook(
+            path = path,
+            name = status,
+            subtitle = subtitle,
+            result = best,
+        )
+    }
+
+    private fun onlineCompletionGroupTitle(group: OnlineSearchGroup): String =
+        "$ONLINE_COMPLETION_TITLE-${group.source.name.ifBlank { "未知来源" }}"
+
+    private fun onlineCompletionRenderTypeForSource(source: OnlineSourceEntry, title: String): Int {
+        val sourceId = source.id.ifBlank { source.name }
+        val type = onlineCompletionRenderTypesBySource[sourceId] ?: synchronized(onlineCompletionRenderTypesBySource) {
+            onlineCompletionRenderTypesBySource[sourceId] ?: run {
+                var candidate = ONLINE_COMPLETION_RENDER_TYPE_BASE +
+                    ((sourceId.hashCode() and Int.MAX_VALUE) % ONLINE_COMPLETION_RENDER_TYPE_BUCKETS)
+                while (true) {
+                    val existing = onlineCompletionRenderSourceByType[candidate]
+                    if (existing == null || existing == sourceId) {
+                        onlineCompletionRenderSourceByType[candidate] = sourceId
+                        onlineCompletionRenderTypesBySource[sourceId] = candidate
+                        break
+                    }
+                    candidate += 1
+                    if (candidate >= ONLINE_COMPLETION_RENDER_TYPE_BASE + ONLINE_COMPLETION_RENDER_TYPE_BUCKETS) {
+                        candidate = ONLINE_COMPLETION_RENDER_TYPE_BASE
+                    }
+                }
+                candidate
+            }
+        }
+        onlineCompletionRenderTitles[type] = title.ifBlank { ONLINE_COMPLETION_TITLE }
+        return type
+    }
+
+    private fun isOnlineCompletionRenderType(type: Int): Boolean =
+        type == BACKUP_TYPE_ONLINE_COMPLETION || onlineCompletionRenderTitles.containsKey(type)
+
+    private fun onlineCompletionTitleForType(type: Int, fallback: String = ONLINE_COMPLETION_TITLE): String =
+        onlineCompletionRenderTitles[type].orEmpty()
+            .ifBlank { onlineCompletionCloudTitleText.get().orEmpty() }
+            .ifBlank { fallback }
+            .ifBlank { ONLINE_COMPLETION_TITLE }
+
+    private fun onlineCompletionGroupVisibleCloudBooks(group: OnlineSearchGroup): List<Any> {
+        val books = group.results.take(ONLINE_COMPLETION_RESULT_LIMIT).mapIndexed { index, result ->
+            newOnlineCompletionResultCloudBook(group.source, group.query, result, index)
+        }
+        return books.ifEmpty { listOf(newOnlineCompletionSourceCloudBook(group)) }
+    }
+
+    private fun newOnlineCompletionResultCloudBook(
+        source: OnlineSourceEntry,
+        query: String,
+        result: OnlineBookSearchResult,
+        index: Int,
+    ): Any {
+        val encodedQuery = URLEncoder.encode(query, "UTF-8")
+        val path = "$ONLINE_COMPLETION_BOOK_PREFIX${source.id}/$index?q=$encodedQuery"
+        onlineCompletionSearchTargets[path] = OnlineDownloadTarget(source, query, result)
+        val subtitle = listOfNotNull(
+            result.author.takeIf { it.isNotBlank() }?.let { "作者 $it" },
+            result.sourceName.takeIf { it.isNotBlank() },
+            result.detailUrl.takeIf { it.isNotBlank() },
+        ).joinToString(" · ")
+        return newOnlineCompletionCloudBook(
+            path = path,
+            name = result.name,
+            subtitle = subtitle,
+            result = result,
+        )
+    }
+
+    private fun newOnlineCompletionCloudBook(
+        path: String,
+        name: String,
+        subtitle: String,
+        result: OnlineBookSearchResult? = null,
+    ): Any {
+        val localFlow = result?.let {
+            runCatching { flowOf(newOnlineCompletionLocalBook(path, it)) }
+                .onFailure { error ->
+                    XposedBridge.log("$LOG_PREFIX online completion synthetic book failed: ${error.stackTraceToString()}")
+                }
+                .getOrNull()
+        } ?: emptyFlow()
+        return cls(CLOUD_BOOK_CLASS).getDeclaredConstructor(
+            String::class.java,
+            String::class.java,
+            java.lang.Integer.TYPE,
+            String::class.java,
+            java.lang.Long.TYPE,
+            java.lang.Long.TYPE,
+            String::class.java,
+            String::class.java,
+            cls(FLOW_CLASS),
+            cls(FLOW_CLASS),
+        ).apply { isAccessible = true }.newInstance(
+            path,
+            name,
+            BACKUP_TYPE_ONLINE_COMPLETION,
+            path,
+            0L,
+            System.currentTimeMillis(),
+            path,
+            subtitle,
+            localFlow,
+            webDavWorkFlow(path),
+        )
+    }
+
+    private fun newOnlineCompletionLocalBook(path: String, result: OnlineBookSearchResult): Any {
+        val now = System.currentTimeMillis()
+        val bookClass = cls(BOOK_CLASS)
+        val constructor = bookClass.declaredConstructors
+            .filter { it.parameterTypes.size == 24 || it.parameterTypes.size == 23 }
+            .maxByOrNull { it.parameterTypes.size }
+            ?.apply { isAccessible = true }
+            ?: error("Book constructor not found")
+        val args = mutableListOf<Any?>(
+            0L,
+            UUID.nameUUIDFromBytes(path.toByteArray(Charsets.UTF_8)).toString(),
+            0L,
+            result.name,
+            "",
+            result.author,
+            result.coverUrl,
+            0L,
+            result.detailUrl.ifBlank { path },
+            "",
+            now,
+            0,
+        )
+        if (constructor.parameterTypes.size == 24) {
+            args.add(0)
+        }
+        args.addAll(
+            listOf(
+                "",
+                "",
+                0f,
+                0L,
+                0L,
+                now,
+                0L,
+                BACKUP_TYPE_ONLINE_COMPLETION,
+                path,
+                "",
+                result.sourceName,
+            ),
+        )
+        return constructor.newInstance(*args.toTypedArray())
+    }
+
     private fun syntheticWebDavBookEntry(path: String): WebDavEntry {
         val normalized = normalizeWebDavPath(path)
         val name = normalized.substringAfterLast('/').ifBlank { WEBDAV_TITLE }
@@ -4077,6 +5140,1038 @@ class WebDavDriveHook(
             it.name == "getPath" && it.parameterTypes.isEmpty()
         }?.apply { isAccessible = true }?.invoke(value)?.toString().orEmpty()
 
+    private fun isOnlineCompletionPath(path: String): Boolean =
+        path.startsWith(ONLINE_COMPLETION_SOURCE_PREFIX) || path.startsWith(ONLINE_COMPLETION_BOOK_PREFIX)
+
+    private fun isOnlineCompletionLocalBook(book: Any): Boolean =
+        bookBackupTypeOf(book) == BACKUP_TYPE_ONLINE_COMPLETION ||
+            isOnlineCompletionPath(bookBackupIdOf(book)) ||
+            isOnlineCompletionPath(book.callString("getUri"))
+
+    private fun handleOnlineCompletionSearchTap(book: Any): Boolean {
+        val path = cloudPathOf(book)
+        logWebDav("online completion tap path=$path")
+        return when {
+            path.startsWith(ONLINE_COMPLETION_SOURCE_PREFIX) -> {
+                val sourceId = path.removePrefix(ONLINE_COMPLETION_SOURCE_PREFIX).substringBefore('?')
+                val nextExpanded = !(onlineCompletionExpandedSources[sourceId] == true)
+                onlineCompletionExpandedSources[sourceId] = nextExpanded
+                Toast.makeText(
+                    currentContext(),
+                    if (nextExpanded) "已展开在线补全结果" else "已折叠在线补全结果",
+                    Toast.LENGTH_SHORT,
+                ).show()
+                refreshOnlineCompletionSearch(queryFromOnlineCompletionPath(path))
+                true
+            }
+            path.startsWith(ONLINE_COMPLETION_BOOK_PREFIX) -> {
+                val target = onlineCompletionSearchTargets[path]
+                if (target == null) {
+                    logWebDav("online completion target expired path=$path known=${onlineCompletionSearchTargets.size}")
+                    Toast.makeText(currentContext(), "在线补全结果已过期，请重新搜索", Toast.LENGTH_SHORT).show()
+                } else {
+                    startOnlineCompletionDownload(target)
+                }
+                true
+            }
+            else -> false
+        }
+    }
+
+    private fun queryFromOnlineCompletionPath(path: String): String {
+        val raw = path.substringAfter("?q=", "")
+        return runCatching { URLDecoder.decode(raw, "UTF-8") }.getOrDefault(raw)
+    }
+
+    private fun startOnlineCompletionDownload(target: OnlineDownloadTarget) {
+        val context = currentContext()
+        if (context == null) {
+            showToast("无法启动在线补全下载：缺少 Context")
+            return
+        }
+        val key = "${target.source.id}|${target.result.detailUrl}|${target.result.name}"
+        if (onlineCompletionRunningDownloads.putIfAbsent(key, true) == true) {
+            showToast("正在下载：${target.result.name}")
+            return
+        }
+        val notificationId = onlineCompletionNotificationIds.incrementAndGet()
+        showToast("已开始下载：${target.result.name}")
+        logWebDav(
+            "online completion download start source=${target.source.name} " +
+                "book=${target.result.name} detail=${target.result.detailUrl}",
+        )
+        val tracker = currentWorkTracker()
+        val workId = tracker?.let { createOnlineCompletionTrackedTask(it, target.result.name) }
+        val notificationReady = updateOnlineCompletionNotification(context, notificationId, target.result.name, "准备下载", 0, false)
+        if (!notificationReady) {
+            showToast("阅微通知权限未开启，下载继续在后台进行")
+        }
+        Thread({
+            runCatching {
+                val localFile = importCacheFile(
+                    context.cacheDir,
+                    "reamicro-online-completion",
+                    "${safeOnlineFileName(target.result.name)}.epub",
+                )
+                localFile.parentFile?.mkdirs()
+                downloadOnlineCompletionBook(
+                    target = target,
+                    outputFile = localFile,
+                    onProgress = { progress, message ->
+                        if (tracker != null && workId != null) {
+                            setTrackedWorkState(tracker, workId, "Running", progress, null, null, "${target.result.name}：$message")
+                        }
+                        updateOnlineCompletionNotification(context, notificationId, target.result.name, message, progress, false)
+                    },
+                    onPartialReady = { partialFile, count ->
+                        if (tracker != null && workId != null) {
+                            setTrackedWorkState(tracker, workId, "Running", 48, null, null, "${target.result.name}：导入前 $count 章")
+                        }
+                        updateOnlineCompletionNotification(context, notificationId, target.result.name, "正在导入前 $count 章", 48, false)
+                        importOnlineCompletionBook(partialFile, target)
+                        if (tracker != null && workId != null) {
+                            setTrackedWorkState(tracker, workId, "Running", 50, null, null, "${target.result.name}：继续下载")
+                        }
+                        updateOnlineCompletionNotification(context, notificationId, target.result.name, "已导入前 $count 章，继续下载", 50, false)
+                    },
+                )
+                if (tracker != null && workId != null) {
+                    setTrackedWorkState(tracker, workId, "Running", 94, null, null, "${target.result.name}：正在导入")
+                }
+                updateOnlineCompletionNotification(context, notificationId, target.result.name, "正在导入阅微", 94, false)
+                importOnlineCompletionBook(localFile, target)
+                if (tracker != null && workId != null) {
+                    setTrackedWorkState(tracker, workId, "Success", 100, null, target.result.detailUrl, target.result.name)
+                }
+                updateOnlineCompletionNotification(context, notificationId, target.result.name, "已导入阅微", 100, true)
+                logWebDav("online completion download imported file=${localFile.absolutePath} size=${localFile.length()}")
+                Handler(Looper.getMainLooper()).post {
+                    Toast.makeText(context, "已导入：${target.result.name}", Toast.LENGTH_SHORT).show()
+                }
+            }.onFailure {
+                XposedBridge.log("$LOG_PREFIX online completion download failed: ${it.stackTraceToString()}")
+                updateOnlineCompletionNotification(
+                    context,
+                    notificationId,
+                    target.result.name,
+                    it.message ?: "下载失败",
+                    100,
+                    true,
+                )
+                if (tracker != null && workId != null) {
+                    setTrackedWorkState(tracker, workId, "Error", 100, it.message ?: "下载失败", null, target.result.name)
+                }
+                Handler(Looper.getMainLooper()).post {
+                    Toast.makeText(context, "在线补全下载失败：${it.message ?: target.result.name}", Toast.LENGTH_SHORT).show()
+                }
+            }.also {
+                onlineCompletionRunningDownloads.remove(key)
+            }
+        }, "ReaMicroOnlineCompletionDownload").start()
+    }
+
+    private fun createOnlineCompletionTrackedTask(tracker: Any, bookName: String): String? =
+        runCatching {
+            val id = "online-${UUID.randomUUID()}"
+            tracker.javaClass.methods.first {
+                it.name == "createTask" && it.parameterTypes.size == 4
+            }.apply { isAccessible = true }.invoke(
+                tracker,
+                id,
+                "download",
+                "$ONLINE_COMPLETION_TITLE-$bookName",
+                newWorkState("Running", 0, null, null, bookName),
+            )
+            logWebDav("online completion tracked task created id=$id book=$bookName")
+            id
+        }.getOrElse {
+            logWebDav("online completion tracked task failed: ${it.message ?: it.javaClass.name}")
+            null
+        }
+
+    private fun downloadOnlineCompletionBook(
+        target: OnlineDownloadTarget,
+        outputFile: File,
+        onProgress: (Int, String) -> Unit,
+        onPartialReady: (File, Int) -> Unit,
+    ) {
+        val detailUrl = target.result.detailUrl.ifBlank { error("搜索结果缺少详情页地址") }
+        onProgress(3, "读取详情页")
+        val detail = OnlineConcurrentRateLimiter.withLimitBlocking(target.source) {
+            requestOnlineSearch(target.source, detailUrl)
+        }
+        logWebDav("online completion detail ok url=${detail.url} bytes=${detail.body.length}")
+        val tocUrl = buildOnlineTocUrl(target.source, detail.url, detail.body)
+        logWebDav("online completion toc url=${tocUrl.ifBlank { detail.url }}")
+        val toc = if (tocUrl.isBlank() || tocUrl == detail.url) {
+            detail
+        } else {
+            onProgress(4, "读取目录")
+            OnlineConcurrentRateLimiter.withLimitBlocking(target.source) {
+                requestOnlineSearch(target.source, tocUrl)
+            }
+        }
+        val chapters = parseOnlineToc(target.source, target.result, toc.url, toc.body)
+        if (chapters.isEmpty()) {
+            error("在线源目录为空，已停止导入：${target.source.name}")
+        }
+        logWebDav(
+            "online completion chapters=${chapters.size} " +
+                "first=${chapters.firstOrNull()?.title.orEmpty()} firstUrl=${chapters.firstOrNull()?.url.orEmpty()}",
+        )
+        val downloaded = MutableList<OnlineDownloadedChapter?>(chapters.size) { null }
+        val attempts = IntArray(chapters.size)
+        val failed = linkedSetOf<Int>()
+        val failureMessages = mutableMapOf<Int, String>()
+        val cover = target.result.coverUrl.takeIf { it.isNotBlank() }?.let { coverUrl ->
+            runCatching {
+                OnlineConcurrentRateLimiter.withLimitBlocking(target.source) {
+                    downloadOnlineBytes(target.source, coverUrl)
+                }
+            }.getOrNull()
+        }
+        val shouldImportFirstBatch = chapters.size > ONLINE_COMPLETION_PARTIAL_IMPORT_THRESHOLD
+        var firstBatchImported = false
+        fun downloadedCount(): Int = downloaded.count { it != null }
+
+        fun maybeImportFirstBatch(progress: Int) {
+            if (!shouldImportFirstBatch || firstBatchImported) return
+            val firstBatch = downloaded.take(ONLINE_COMPLETION_PARTIAL_IMPORT_CHAPTERS)
+            if (firstBatch.size < ONLINE_COMPLETION_PARTIAL_IMPORT_CHAPTERS || firstBatch.any { it == null }) return
+            firstBatchImported = true
+            val partialFile = File(
+                outputFile.parentFile ?: outputFile.absoluteFile.parentFile ?: File("/data/local/tmp"),
+                "${outputFile.nameWithoutExtension}_first_${ONLINE_COMPLETION_PARTIAL_IMPORT_CHAPTERS}.epub",
+            )
+            onProgress(progress, "生成前 ${ONLINE_COMPLETION_PARTIAL_IMPORT_CHAPTERS} 章 EPUB")
+            writeOnlineCompletionEpub(partialFile, target, firstBatch.filterNotNull(), cover)
+            logWebDav("online completion partial epub ready path=${partialFile.absolutePath} chapters=${firstBatch.size}")
+            onPartialReady(partialFile, ONLINE_COMPLETION_PARTIAL_IMPORT_CHAPTERS)
+        }
+
+        fun attemptChapter(index: Int, immediateRetry: Boolean): Boolean {
+            val chapter = chapters[index]
+            val maxAttemptsThisRound = if (immediateRetry) 2 else 1
+            var roundAttempts = 0
+            while (attempts[index] < ONLINE_COMPLETION_CHAPTER_RETRY_LIMIT && roundAttempts < maxAttemptsThisRound) {
+                attempts[index]++
+                roundAttempts++
+                val attempt = attempts[index]
+                runCatching {
+                    downloadOnlineChapter(target, detail.url, detail.body, chapter, index)
+                }.onSuccess { chapterContent ->
+                    downloaded[index] = chapterContent
+                    failed.remove(index)
+                    failureMessages.remove(index)
+                    if (index == 0 || (index + 1) % 20 == 0 || index == chapters.lastIndex || attempt > 1) {
+                        logWebDav(
+                            "online completion chapter downloaded ${index + 1}/${chapters.size} " +
+                                "attempt=$attempt content=${chapterContent.content.length} url=${chapter.url.take(120)}",
+                        )
+                    }
+                    return true
+                }.onFailure { error ->
+                    failed.add(index)
+                    failureMessages[index] = error.message.orEmpty().ifBlank { error.javaClass.name }
+                    logWebDav(
+                        "online completion chapter failed ${index + 1}/${chapters.size} " +
+                            "attempt=$attempt/${ONLINE_COMPLETION_CHAPTER_RETRY_LIMIT} " +
+                            "title=${chapter.title} url=${chapter.url.take(120)} " +
+                            "error=${error.javaClass.name}: ${error.message.orEmpty()}",
+                    )
+                }
+            }
+            return false
+        }
+
+        chapters.forEachIndexed { index, chapter ->
+            val progress = 5 + ((index + 1) * 78 / chapters.size.coerceAtLeast(1))
+            onProgress(progress, "下载章节 ${index + 1}/${chapters.size}")
+            attemptChapter(index, immediateRetry = true)
+            maybeImportFirstBatch(progress)
+        }
+        if (failed.any { attempts[it] < ONLINE_COMPLETION_CHAPTER_RETRY_LIMIT }) {
+            val retryCandidates = failed.filter { attempts[it] < ONLINE_COMPLETION_CHAPTER_RETRY_LIMIT }
+            onProgress(84, "等待重试失败章节 ${retryCandidates.size} 章")
+            logWebDav(
+                "online completion delayed retry scheduled failed=${retryCandidates.size} " +
+                    "downloaded=${downloadedCount()}/${chapters.size}",
+            )
+            Thread.sleep(ONLINE_COMPLETION_RETRY_DELAY_MS)
+            retryCandidates.forEachIndexed { retryIndex, chapterIndex ->
+                val progress = 84 + ((retryIndex + 1) * 4 / retryCandidates.size.coerceAtLeast(1))
+                onProgress(progress, "重试章节 ${chapterIndex + 1}/${chapters.size}")
+                attemptChapter(chapterIndex, immediateRetry = false)
+                maybeImportFirstBatch(progress)
+            }
+        }
+        val successCount = downloadedCount()
+        if (successCount <= 0) {
+            error("所有章节下载失败，已停止导入：${target.result.name}")
+        }
+        if (failed.isNotEmpty()) {
+            onProgress(88, "仍有 ${failed.size} 章失败，继续生成 EPUB")
+            logWebDav(
+                "online completion chapters still failed count=${failed.size} " +
+                    "success=$successCount/${chapters.size} failures=" +
+                    failed.take(20).joinToString { "${it + 1}:${failureMessages[it].orEmpty()}" },
+            )
+        }
+        val finalChapters = chapters.mapIndexed { index, chapter ->
+            downloaded[index] ?: OnlineDownloadedChapter(
+                title = chapter.title.ifBlank { "第 ${index + 1} 章" },
+                content = "本章下载失败，已按在线源重试 ${attempts[index]} 次。\n\n${failureMessages[index].orEmpty()}",
+            )
+        }
+        onProgress(88, "生成 EPUB")
+        writeOnlineCompletionEpub(outputFile, target, finalChapters, cover)
+        logWebDav(
+            "online completion epub ready path=${outputFile.absolutePath} " +
+                "chapters=${finalChapters.size} success=$successCount failed=${failed.size}",
+        )
+    }
+
+    private fun downloadOnlineChapter(
+        target: OnlineDownloadTarget,
+        detailUrl: String,
+        detailBody: String,
+        chapter: OnlineChapter,
+        index: Int,
+    ): OnlineDownloadedChapter {
+        val body = if (chapter.url == detailUrl) {
+            detailBody
+        } else {
+            OnlineConcurrentRateLimiter.withLimitBlocking(target.source) {
+                requestOnlineSearch(target.source, chapter.url)
+            }.body
+        }
+        val content = extractOnlineChapterContent(target.source, chapter.url, body)
+        if (content.isBlank()) {
+            error("章节正文为空 body=${body.length}")
+        }
+        return OnlineDownloadedChapter(
+            title = chapter.title.ifBlank { "第 ${index + 1} 章" },
+            content = content,
+        )
+    }
+
+    private fun buildOnlineTocUrl(
+        source: OnlineSourceEntry,
+        detailUrl: String,
+        detailBody: String,
+    ): String {
+        val rule = runCatching { JSONObject(source.ruleBookInfo) }.getOrNull() ?: return ""
+        val tocRule = rule.optString("tocUrl", "").trim()
+        if (tocRule.isBlank()) return ""
+        val root = parseOnlineJsonRoot(detailBody) ?: return resolveOnlineUrl(detailUrl, tocRule)
+        val node = rule.optString("init", "").trim()
+            .takeIf { it.isNotBlank() }
+            ?.let { onlineJsonRuleValues(root, it).firstOrNull() }
+            ?: root
+        return resolveOnlineUrl(detailUrl, onlineRuleValue(node, tocRule, detailUrl))
+    }
+
+    private fun parseOnlineToc(
+        source: OnlineSourceEntry,
+        result: OnlineBookSearchResult,
+        baseUrl: String,
+        html: String,
+    ): List<OnlineChapter> {
+        val body = html.trim()
+        if (body.startsWith("{") || body.startsWith("[")) {
+            val root = parseOnlineJsonRoot(body)
+            val chapters = root?.let { parseOnlineJsonToc(source, result, baseUrl, it) }.orEmpty()
+            if (chapters.isNotEmpty()) return chapters
+        }
+        val anchors = Regex("""(?is)<a\b[^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>""")
+            .findAll(html)
+            .mapNotNull { match ->
+                val title = match.groupValues[2].cleanOnlineText()
+                if (title.isBlank() || title.length > 80) return@mapNotNull null
+                val href = resolveOnlineUrl(baseUrl, match.groupValues[1])
+                if (href.isBlank()) return@mapNotNull null
+                val looksChapter = ONLINE_CHAPTER_TITLE_REGEX.containsMatchIn(title) ||
+                    href.contains("chapter", ignoreCase = true) ||
+                    href.contains("read", ignoreCase = true)
+                if (!looksChapter) return@mapNotNull null
+                OnlineChapter(title, href)
+            }
+            .distinctBy { it.url }
+            .toList()
+        if (anchors.isNotEmpty()) return anchors
+        return Regex("""(?is)<option\b[^>]*\bvalue\s*=\s*["']([^"']+)["'][^>]*>(.*?)</option>""")
+            .findAll(html)
+            .mapNotNull { match ->
+                val title = match.groupValues[2].cleanOnlineText()
+                val href = resolveOnlineUrl(baseUrl, match.groupValues[1])
+                if (title.isBlank() || href.isBlank()) null else OnlineChapter(title, href)
+            }
+            .distinctBy { it.url }
+            .toList()
+    }
+
+    private fun parseOnlineJsonToc(
+        source: OnlineSourceEntry,
+        result: OnlineBookSearchResult,
+        baseUrl: String,
+        root: Any,
+    ): List<OnlineChapter> {
+        val rule = runCatching { JSONObject(source.ruleToc) }.getOrNull() ?: return emptyList()
+        val nodes = onlineJsonRuleValues(root, rule.optString("chapterList", ""))
+        logWebDav(
+            "online completion toc nodes=${nodes.size} rule=${rule.optString("chapterList", "").take(120)}",
+        )
+        if (nodes.isEmpty()) return emptyList()
+        val titleRule = rule.optString("chapterName", "")
+        val urlRule = rule.optString("chapterUrl", "")
+        return nodes.mapIndexedNotNull { index, node ->
+            val title = onlineRuleValue(node, titleRule, baseUrl).cleanOnlineText()
+                .ifBlank { "第 ${index + 1} 章" }
+            val ruleRawUrl = onlineRuleValue(node, urlRule, baseUrl)
+            val fallbackRawUrl = if (ruleRawUrl.isBlank()) fallbackOnlineChapterRawUrl(node) else ""
+            val rawUrl = ruleRawUrl.ifBlank { fallbackRawUrl }
+            if (index == 0) {
+                logWebDav(
+                    "online completion toc first title=$title urlRuleLen=${urlRule.length} " +
+                        "ruleRaw=${ruleRawUrl.take(80)} fallbackRaw=${fallbackRawUrl.take(80)}",
+                )
+            }
+            val url = buildOnlineChapterUrl(source, baseUrl, urlRule, rawUrl)
+            if (url.isBlank()) null else OnlineChapter(title, url)
+        }.distinctBy { it.url }
+    }
+
+    private fun fallbackOnlineChapterRawUrl(node: Any?): String =
+        listOf("$.itemId", "$.item_id", "$.chapter_id", "$.id", "$.url", "$.href", "itemId", "chapter_id", "id")
+            .asSequence()
+            .map { onlineJsonString(node, it) }
+            .firstOrNull { it.isNotBlank() }
+            .orEmpty()
+
+    private fun buildOnlineChapterUrl(
+        source: OnlineSourceEntry,
+        baseUrl: String,
+        urlRule: String,
+        rawUrl: String,
+    ): String {
+        val value = rawUrl.trim()
+        if (value.isBlank()) return ""
+        if (value.startsWith("http://", ignoreCase = true) || value.startsWith("https://", ignoreCase = true)) {
+            return value
+        }
+        if (urlRule.contains("<js>", ignoreCase = true) || urlRule.contains("@js:", ignoreCase = true)) {
+            evaluateOnlineChapterUrlJs(urlRule, value)?.let { return it }
+        }
+        if (value.isNotBlank()) {
+            onlineContentProxyTemplate(source)?.let { template ->
+                return resolveOnlineUrl(baseUrl, template.replace("\${itemId}", value))
+            }
+        }
+        return resolveOnlineUrl(baseUrl, value)
+    }
+
+    private fun evaluateOnlineChapterUrlJs(urlRule: String, result: String): String? {
+        if (!urlRule.contains("java.base64Encode(result)", ignoreCase = true)) return null
+        val template = Regex("`([^`]*java\\.base64Encode\\(result\\)[^`]*)`")
+            .find(urlRule)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?: return null
+        val encoded = Base64.encodeToString(result.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+        return template.replace("\${java.base64Encode(result)}", encoded)
+    }
+
+    private fun onlineContentProxyTemplate(source: OnlineSourceEntry): String? {
+        val contentRule = runCatching { JSONObject(source.ruleContent).optString("content", "") }.getOrNull().orEmpty()
+        return extractOnlineBacktickTemplates(contentRule)
+            .firstOrNull { it.contains("\${itemId}") }
+    }
+
+    private fun extractOnlineBacktickTemplates(rule: String): List<String> {
+        if (rule.isBlank()) return emptyList()
+        val templates = mutableListOf<String>()
+        var index = 0
+        while (index < rule.length) {
+            val start = rule.indexOf('`', index)
+            if (start < 0) break
+            val builder = StringBuilder()
+            var cursor = start + 1
+            var escaped = false
+            while (cursor < rule.length) {
+                val char = rule[cursor]
+                when {
+                    escaped -> {
+                        builder.append(char)
+                        escaped = false
+                    }
+                    char == '\\' -> {
+                        builder.append(char)
+                        escaped = true
+                    }
+                    char == '`' -> break
+                    else -> builder.append(char)
+                }
+                cursor++
+            }
+            if (cursor >= rule.length) break
+            templates.add(builder.toString())
+            index = cursor + 1
+        }
+        return templates
+    }
+
+    private fun extractOnlineChapterContent(source: OnlineSourceEntry, baseUrl: String, body: String): String {
+        val contentRule = runCatching { JSONObject(source.ruleContent).optString("content", "") }.getOrNull().orEmpty()
+        if (contentRule.startsWith("<js>", ignoreCase = true)) {
+            evaluateOnlineContentJs(source, contentRule, body)?.let { return normalizeOnlineChapterText(it) }
+        }
+        val text = body.trim()
+        if (text.startsWith("{") || text.startsWith("[")) {
+            val root = parseOnlineJsonRoot(text)
+            if (root != null) {
+                val rule = runCatching { JSONObject(source.ruleContent) }.getOrNull()
+                val jsonContentRule = rule?.optString("content", "").orEmpty()
+                val rawContent = when {
+                    jsonContentRule.isNotBlank() && !jsonContentRule.startsWith("<js>", ignoreCase = true) ->
+                        onlineRuleValue(root, jsonContentRule, baseUrl)
+                    else -> ""
+                }.ifBlank {
+                    onlineJsonString(root, "$.data.content")
+                        .ifBlank { onlineJsonString(root, "$.chapter.text") }
+                        .ifBlank { onlineJsonString(root, "$..content") }
+                        .ifBlank { onlineJsonString(root, "$..text") }
+                }
+                return normalizeOnlineChapterText(rawContent)
+            }
+        }
+        return extractOnlineHtmlChapterContent(body)
+    }
+
+    private fun evaluateOnlineContentJs(
+        source: OnlineSourceEntry,
+        contentRule: String,
+        result: String,
+    ): String? {
+        if (!contentRule.contains("java.ajax", ignoreCase = true)) return null
+        val itemId = if (contentRule.contains("java.hexDecodeToString(result)", ignoreCase = true)) {
+            result.hexDecodeToString()
+        } else {
+            result
+        }.trim()
+        if (itemId.isBlank()) return null
+        val template = onlineContentProxyTemplate(source) ?: return null
+        val requestUrl = template.replace("\${itemId}", itemId)
+        val response = OnlineConcurrentRateLimiter.withLimitBlocking(source) {
+            requestOnlineSearch(source, requestUrl)
+        }
+        val root = parseOnlineJsonRoot(response.body) ?: return response.body
+        return onlineJsonString(root, "$.data.content")
+            .ifBlank { onlineJsonString(root, "$.chapter.text") }
+            .ifBlank { onlineJsonString(root, "$..content") }
+            .ifBlank { response.body }
+    }
+
+    private fun extractOnlineHtmlChapterContent(html: String): String {
+        val cleaned = html
+            .replace(Regex("(?is)<script[\\s\\S]*?</script>"), " ")
+            .replace(Regex("(?is)<style[\\s\\S]*?</style>"), " ")
+        val container = listOf(
+            Regex("""(?is)<article\b[^>]*>(.*?)</article>"""),
+            Regex("""(?is)<div\b[^>]*(?:id|class)\s*=\s*["'][^"']*(?:content|chapter|reader|read)[^"']*["'][^>]*>(.*?)</div>"""),
+            Regex("""(?is)<body\b[^>]*>(.*?)</body>"""),
+        ).asSequence()
+            .mapNotNull { it.find(cleaned)?.groupValues?.getOrNull(1) }
+            .firstOrNull()
+            ?: cleaned
+        return container
+            .replace(Regex("(?i)<br\\s*/?>"), "\n")
+            .replace(Regex("(?i)</p\\s*>"), "\n")
+            .replace(Regex("(?i)</div\\s*>"), "\n")
+            .let(::normalizeOnlineChapterText)
+    }
+
+    private fun normalizeOnlineChapterText(raw: String): String {
+        if (raw.isBlank()) return ""
+        return raw
+            .replace(Regex("(?is)<script[\\s\\S]*?</script>"), " ")
+            .replace(Regex("(?is)<style[\\s\\S]*?</style>"), " ")
+            .replace(Regex("(?i)<br\\s*/?>"), "\n")
+            .replace(Regex("(?i)</p\\s*>"), "\n")
+            .replace(Regex("(?i)</div\\s*>"), "\n")
+            .replace(Regex("(?is)<[^>]+>"), " ")
+            .replace("&nbsp;", " ")
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace(Regex("[ \\t\\r\\f]+"), " ")
+            .lineSequence()
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .joinToString("\n\n")
+    }
+
+    private fun ByteArray.toLowerHexString(): String =
+        joinToString("") { "%02x".format(it.toInt() and 0xff) }
+
+    private fun String.hexDecodeToString(): String {
+        val clean = trim().filterNot { it.isWhitespace() }
+        if (clean.length < 2 || clean.length % 2 != 0) return this
+        return runCatching {
+            val bytes = ByteArray(clean.length / 2) { index ->
+                clean.substring(index * 2, index * 2 + 2).toInt(16).toByte()
+            }
+            String(bytes, Charsets.UTF_8)
+        }.getOrDefault(this)
+    }
+
+    private fun downloadOnlineBytes(source: OnlineSourceEntry, requestUrl: String): OnlineBinaryPayload {
+        return withOnlineCleartextAllowed(requestUrl) {
+            val connection = (URL(requestUrl).openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = onlineConnectTimeoutMillis(source)
+                readTimeout = onlineReadTimeoutMillis(source)
+                setRequestProperty("User-Agent", "Mozilla/5.0 ReaMicro-Extend/online-source")
+                parseOnlineHeaders(source.header).forEach { (name, value) ->
+                    if (name.isNotBlank() && value.isNotBlank()) setRequestProperty(name, value)
+                }
+            }
+            try {
+                val code = connection.responseCode
+                if (code !in 200..299) error("HTTP $code")
+                OnlineBinaryPayload(
+                    bytes = connection.inputStream.use { it.readBytes() },
+                    mimeType = connection.contentType?.substringBefore(';')?.trim().orEmpty(),
+                    url = connection.url.toString(),
+                )
+            } finally {
+                connection.disconnect()
+            }
+        }
+    }
+
+    private fun onlineReadTimeoutMillis(source: OnlineSourceEntry): Int =
+        source.respondTime.coerceIn(15_000, 300_000)
+
+    private fun onlineConnectTimeoutMillis(source: OnlineSourceEntry): Int =
+        onlineReadTimeoutMillis(source).coerceAtMost(30_000).coerceAtLeast(10_000)
+
+    private fun writeOnlineCompletionEpub(
+        file: File,
+        target: OnlineDownloadTarget,
+        chapters: List<OnlineDownloadedChapter>,
+        cover: OnlineBinaryPayload?,
+    ) {
+        ZipOutputStream(file.outputStream().buffered()).use { zip ->
+            writeStoredTextZipEntry(zip, "mimetype", "application/epub+zip")
+            writeTextZipEntry(
+                zip,
+                "META-INF/container.xml",
+                """<?xml version="1.0" encoding="UTF-8"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>""",
+            )
+            val coverExt = cover?.url?.substringBefore('?')?.substringAfterLast('.', "jpg")?.takeIf { it.length in 3..5 } ?: "jpg"
+            cover?.let {
+                writeBytesZipEntry(zip, "OEBPS/Images/cover.$coverExt", it.bytes)
+            }
+            chapters.forEachIndexed { index, chapter ->
+                writeTextZipEntry(
+                    zip,
+                    "OEBPS/Text/chapter_${(index + 1).toString().padStart(4, '0')}.xhtml",
+                    chapterXhtml(chapter.title, chapter.content),
+                )
+            }
+            writeTextZipEntry(zip, "OEBPS/toc.ncx", onlineTocNcx(target, chapters))
+            writeTextZipEntry(zip, "OEBPS/content.opf", onlineContentOpf(target, chapters, coverExt, cover != null))
+        }
+    }
+
+    private fun importOnlineCompletionBook(file: File, target: OnlineDownloadTarget) {
+        val bookshelf = currentBookshelfRepository() ?: error("阅微导入服务暂不可用，请先打开书架后重试")
+        val unzipDirFile = unzipOnlineCompletionEpub(file)
+        val unzipDir = okioPath(unzipDirFile)
+        val booksDir = currentOnlineCompletionBooksDir(bookshelf)
+        val imported = importOnlineCompletionEpubDirectory(unzipDir, booksDir)
+        val bookDir = imported.first
+        val opf = imported.second
+        val platformFile = platformFile(file)
+        rememberPendingWebDavImport(
+            platformFile = platformFile,
+            localFile = file,
+            sourceUrl = target.result.detailUrl.ifBlank { target.source.sourceUrl },
+            sourceSize = file.length(),
+        )
+        logWebDav(
+            "online completion epub imported dir=$bookDir " +
+                "title=${callStringPath(opf, "metadata", "title", "value")} " +
+                "uuid=${callStringPath(opf, "metadata", "uuid", "value")}",
+        )
+        val importMethod = (bookshelf.javaClass.methods.asSequence() + bookshelf.javaClass.declaredMethods.asSequence())
+            .first { it.name == "importBook" && it.parameterTypes.size == 6 }
+            .apply { isAccessible = true }
+        val result = invokeSuspendBlocking(
+            importMethod,
+            bookshelf,
+            platformFile,
+            bookDir,
+            opf,
+            target.result.detailUrl.ifBlank { target.source.sourceUrl },
+            java.lang.Long.valueOf(file.length()),
+        )
+        logWebDav("online completion importBook result=$result file=${file.absolutePath} size=${file.length()}")
+        if (result != true) {
+            error("阅微导入返回失败：$result")
+        }
+    }
+
+    private fun currentOnlineCompletionBooksDir(bookshelf: Any): Any {
+        val userStorage = fieldValue(bookshelf, "userStorage")
+            ?: bookshelf.javaClass.methods.firstOrNull { it.name == "getUserStorage" && it.parameterTypes.isEmpty() }
+                ?.apply { isAccessible = true }
+                ?.invoke(bookshelf)
+            ?: error("阅微书库目录不可用：UserStorage 未找到")
+        val defaultMethod = (userStorage.javaClass.methods.asSequence() + userStorage.javaClass.declaredMethods.asSequence())
+            .firstOrNull {
+                it.name == "userBooksDir\$default" &&
+                    Modifier.isStatic(it.modifiers) &&
+                    it.parameterTypes.size == 4
+            }
+        if (defaultMethod != null) {
+            defaultMethod.isAccessible = true
+            return defaultMethod.invoke(null, userStorage, null, 1, null)
+                ?: error("阅微书库目录不可用：userBooksDir 返回空")
+        }
+        val uid = fieldValue(userStorage, "uid")
+        val method = (userStorage.javaClass.methods.asSequence() + userStorage.javaClass.declaredMethods.asSequence())
+            .first { it.name == "userBooksDir" && it.parameterTypes.size == 1 }
+            .apply { isAccessible = true }
+        return method.invoke(userStorage, uid) ?: error("阅微书库目录不可用：userBooksDir 返回空")
+    }
+
+    private fun importOnlineCompletionEpubDirectory(unzipDir: Any, booksDir: Any): Pair<Any, Any> {
+        val managerClass = cls(EPUB_FILE_MANAGER_CLASS)
+        val manager = runCatching {
+            managerClass.getDeclaredField("INSTANCE").apply { isAccessible = true }.get(null)
+        }.getOrNull() ?: error("阅微 EpubFileManager INSTANCE 未找到")
+        val importMethod = (managerClass.methods.asSequence() + managerClass.declaredMethods.asSequence())
+            .firstOrNull { candidate ->
+                candidate.parameterTypes.size == 2 &&
+                    candidate.parameterTypes.all { it.name == OKIO_PATH_CLASS } &&
+                    candidate.returnType.name == KOTLIN_PAIR_CLASS
+            }
+            ?.apply { isAccessible = true }
+            ?: error("阅微 EpubFileManager.import 方法未找到")
+        val pair = importMethod.invoke(manager, unzipDir, booksDir)
+            ?: error("阅微 EpubFileManager.import 返回空")
+        val first = pair.javaClass.methods.first { it.name == "getFirst" && it.parameterTypes.isEmpty() }
+            .apply { isAccessible = true }
+            .invoke(pair)
+            ?: error("阅微 EpubFileManager.import 未返回 bookDir")
+        val second = pair.javaClass.methods.first { it.name == "getSecond" && it.parameterTypes.isEmpty() }
+            .apply { isAccessible = true }
+            .invoke(pair)
+            ?: error("阅微 EpubFileManager.import 未返回 OPF")
+        return first to second
+    }
+
+    private fun unzipOnlineCompletionEpub(file: File): File {
+        val outputDir = File(
+            file.parentFile ?: file.absoluteFile.parentFile ?: File("/data/local/tmp"),
+            "${file.nameWithoutExtension}_unzipped",
+        )
+        if (outputDir.exists()) outputDir.deleteRecursively()
+        outputDir.mkdirs()
+        val root = outputDir.canonicalFile
+        ZipInputStream(BufferedInputStream(file.inputStream())).use { zip ->
+            while (true) {
+                val entry = zip.nextEntry ?: break
+                try {
+                    val target = File(root, entry.name).canonicalFile
+                    val rootPrefix = root.path.trimEnd(File.separatorChar) + File.separator
+                    if (target != root && !target.path.startsWith(rootPrefix)) {
+                        error("EPUB entry escapes output dir: ${entry.name}")
+                    }
+                    if (entry.isDirectory) {
+                        target.mkdirs()
+                    } else {
+                        target.parentFile?.mkdirs()
+                        target.outputStream().buffered().use { out -> zip.copyTo(out) }
+                    }
+                } finally {
+                    zip.closeEntry()
+                }
+            }
+        }
+        logWebDav("online completion epub unzipped dir=${outputDir.absolutePath}")
+        return outputDir
+    }
+
+    private fun okioPath(file: File): Any =
+        cls(OKIO_PATH_CLASS).getDeclaredMethod("get", File::class.java)
+            .apply { isAccessible = true }
+            .invoke(null, file)
+
+    private fun obtainOnlineCompletionOpf(bookDir: Any): Any {
+        val opfClass = cls(OPF_CLASS)
+        val companion = sequenceOf("INSTANCE", "Companion")
+            .mapNotNull { fieldName ->
+                runCatching {
+                    opfClass.companionField(fieldName)?.let { field ->
+                        field.isAccessible = true
+                        field.get(null)
+                    }
+                }.getOrNull()
+            }
+            .firstOrNull()
+            ?: (opfClass.declaredFields.asSequence() + opfClass.fields.asSequence())
+                .filter { Modifier.isStatic(it.modifiers) && it.type.name.contains("Opf\$Companion") }
+                .mapNotNull { field ->
+                    runCatching {
+                        field.isAccessible = true
+                        field.get(null)
+                    }.getOrNull()
+                }
+                .firstOrNull()
+            ?: error(
+                "EPUB OPF Companion 未找到: fields=" +
+                    opfClass.declaredFields.joinToString { "${it.name}:${it.type.name}" },
+            )
+        val obtain = (companion.javaClass.methods.asSequence() + companion.javaClass.declaredMethods.asSequence())
+            .firstOrNull { it.name == "obtain" && it.parameterTypes.size == 1 }
+            ?: error(
+                "EPUB OPF obtain 方法未找到: companion=${companion.javaClass.name}, methods=" +
+                    companion.javaClass.declaredMethods.joinToString { "${it.name}/${it.parameterTypes.size}" },
+            )
+        obtain.isAccessible = true
+        return obtain.invoke(companion, bookDir) ?: error("EPUB OPF 解析失败")
+    }
+
+    private fun Class<*>.companionField(name: String) =
+        runCatching { getDeclaredField(name) }
+            .recoverCatching { getField(name) }
+            .getOrNull()
+
+    private fun updateOnlineCompletionNotification(
+        context: Context,
+        id: Int,
+        title: String,
+        text: String,
+        progress: Int,
+        done: Boolean,
+    ): Boolean {
+        val moduleRelaySent = sendOnlineCompletionNotificationViaModule(context, id, title, text, progress, done)
+        return runCatching {
+            val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return false
+            if (!manager.areNotificationsEnabled()) {
+                if (onlineCompletionNotificationBlockedLogged.compareAndSet(false, true)) {
+                    logWebDav(
+                        "online completion host notification blocked by system for ${context.packageName}, " +
+                            "moduleRelaySent=$moduleRelaySent",
+                    )
+                }
+                return moduleRelaySent
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                manager.createNotificationChannel(
+                    NotificationChannel(
+                        ONLINE_COMPLETION_NOTIFICATION_CHANNEL,
+                        ONLINE_COMPLETION_TITLE,
+                        NotificationManager.IMPORTANCE_LOW,
+                    ),
+                )
+            }
+            val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                Notification.Builder(context, ONLINE_COMPLETION_NOTIFICATION_CHANNEL)
+            } else {
+                @Suppress("DEPRECATION")
+                Notification.Builder(context)
+            }
+            builder
+                .setSmallIcon(context.applicationInfo.icon)
+                .setContentTitle("$ONLINE_COMPLETION_TITLE：$title")
+                .setContentText(text)
+                .setOnlyAlertOnce(true)
+                .setOngoing(!done)
+                .setAutoCancel(done)
+                .setProgress(100, progress.coerceIn(0, 100), false)
+            manager.notify(id, builder.build())
+            logWebDav("online completion host notification posted id=$id moduleRelaySent=$moduleRelaySent")
+            true
+        }.getOrElse {
+            logWebDav("online completion notification failed: ${it.message ?: it.javaClass.name}")
+            moduleRelaySent
+        }
+    }
+
+    private fun sendOnlineCompletionNotificationViaModule(
+        context: Context,
+        id: Int,
+        title: String,
+        text: String,
+        progress: Int,
+        done: Boolean,
+    ): Boolean {
+        val serviceSent = if (onlineCompletionModuleServiceUnavailable.get()) {
+            false
+        } else {
+            runCatching {
+                val intent = onlineCompletionNotificationIntent(id, title, text, progress, done).apply {
+                    setClassName(MODULE_PACKAGE_NAME, ONLINE_COMPLETION_NOTIFICATION_SERVICE_CLASS)
+                }
+                val component = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !done) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+                if (component == null) {
+                    onlineCompletionModuleServiceUnavailable.set(true)
+                    logWebDav("online completion module foreground notification unresolved; fallback to receiver")
+                    false
+                } else {
+                    true
+                }
+            }.getOrElse {
+                logWebDav("online completion module foreground notification failed: ${it.message ?: it.javaClass.name}")
+                false
+            }
+        }
+        if (serviceSent) return true
+        return runCatching {
+            val intent = onlineCompletionNotificationIntent(id, title, text, progress, done).apply {
+                setClassName(MODULE_PACKAGE_NAME, ONLINE_COMPLETION_NOTIFICATION_RECEIVER_CLASS)
+            }
+            context.sendBroadcast(intent)
+            logWebDav("online completion module notification broadcast sent")
+            true
+        }.getOrElse {
+            logWebDav("online completion module notification relay failed: ${it.message ?: it.javaClass.name}")
+            false
+        }
+    }
+
+    private fun onlineCompletionNotificationIntent(
+        id: Int,
+        title: String,
+        text: String,
+        progress: Int,
+        done: Boolean,
+    ): Intent =
+        Intent(ONLINE_COMPLETION_NOTIFICATION_ACTION).apply {
+                addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
+                putExtra(ONLINE_COMPLETION_NOTIFICATION_EXTRA_ID, id)
+                putExtra(ONLINE_COMPLETION_NOTIFICATION_EXTRA_TITLE, title)
+                putExtra(ONLINE_COMPLETION_NOTIFICATION_EXTRA_TEXT, text)
+                putExtra(ONLINE_COMPLETION_NOTIFICATION_EXTRA_PROGRESS, progress.coerceIn(0, 100))
+                putExtra(ONLINE_COMPLETION_NOTIFICATION_EXTRA_DONE, done)
+        }
+
+    private fun writeStoredTextZipEntry(zip: ZipOutputStream, path: String, text: String) {
+        val bytes = text.toByteArray(Charsets.UTF_8)
+        val crc = CRC32().apply { update(bytes) }
+        val entry = ZipEntry(path).apply {
+            method = ZipEntry.STORED
+            size = bytes.size.toLong()
+            compressedSize = bytes.size.toLong()
+            this.crc = crc.value
+        }
+        zip.putNextEntry(entry)
+        zip.write(bytes)
+        zip.closeEntry()
+    }
+
+    private fun writeTextZipEntry(zip: ZipOutputStream, path: String, text: String) =
+        writeBytesZipEntry(zip, path, text.toByteArray(Charsets.UTF_8))
+
+    private fun writeBytesZipEntry(zip: ZipOutputStream, path: String, bytes: ByteArray) {
+        zip.putNextEntry(ZipEntry(path))
+        zip.write(bytes)
+        zip.closeEntry()
+    }
+
+    private fun chapterXhtml(title: String, content: String): String {
+        val paragraphs = content.lineSequence()
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .joinToString("\n") { "<p>${it.xmlEscape()}</p>" }
+            .ifBlank { "<p>${title.xmlEscape()}</p>" }
+        return """<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>${title.xmlEscape()}</title></head>
+<body><h1>${title.xmlEscape()}</h1>
+$paragraphs
+</body>
+</html>"""
+    }
+
+    private fun onlineTocNcx(target: OnlineDownloadTarget, chapters: List<OnlineDownloadedChapter>): String {
+        val points = chapters.mapIndexed { index, chapter ->
+            val order = index + 1
+            """<navPoint id="nav$order" playOrder="$order"><navLabel><text>${chapter.title.xmlEscape()}</text></navLabel><content src="Text/chapter_${order.toString().padStart(4, '0')}.xhtml"/></navPoint>"""
+        }.joinToString("")
+        return """<?xml version="1.0" encoding="UTF-8"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+<head><meta name="dtb:uid" content="${onlineBookUuid(target).xmlEscape()}"/></head>
+<docTitle><text>${target.result.name.xmlEscape()}</text></docTitle>
+<navMap>$points</navMap>
+</ncx>"""
+    }
+
+    private fun onlineContentOpf(
+        target: OnlineDownloadTarget,
+        chapters: List<OnlineDownloadedChapter>,
+        coverExt: String,
+        hasCover: Boolean,
+    ): String {
+        val manifestChapters = chapters.indices.joinToString("") { index ->
+            val order = index + 1
+            """<item id="chapter$order" href="Text/chapter_${order.toString().padStart(4, '0')}.xhtml" media-type="application/xhtml+xml"/>"""
+        }
+        val spine = chapters.indices.joinToString("") { index -> """<itemref idref="chapter${index + 1}"/>""" }
+        val coverManifest = if (hasCover) {
+            """<item id="cover-image" href="Images/cover.$coverExt" media-type="${coverMimeType(coverExt)}"/>"""
+        } else {
+            ""
+        }
+        val coverMeta = if (hasCover) """<meta name="cover" content="cover-image"/>""" else ""
+        return """<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="BookId" version="2.0">
+<metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
+<dc:identifier id="BookId">${onlineBookUuid(target).xmlEscape()}</dc:identifier>
+<dc:title>${target.result.name.xmlEscape()}</dc:title>
+<dc:creator>${target.result.author.xmlEscape()}</dc:creator>
+<dc:language>zh-CN</dc:language>
+<dc:publisher>${target.source.name.xmlEscape()}</dc:publisher>
+$coverMeta
+</metadata>
+<manifest><item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>$coverManifest$manifestChapters</manifest>
+<spine toc="ncx">$spine</spine>
+</package>"""
+    }
+
+    private fun onlineBookUuid(target: OnlineDownloadTarget): String =
+        "reamicro-online-${target.source.id}-${(target.result.detailUrl.ifBlank { target.result.name }).hashCode().toUInt()}"
+
+    private fun coverMimeType(ext: String): String =
+        when (ext.lowercase(Locale.ROOT)) {
+            "png" -> "image/png"
+            "webp" -> "image/webp"
+            "gif" -> "image/gif"
+            else -> "image/jpeg"
+        }
+
+    private fun safeOnlineFileName(name: String): String =
+        name.replace(Regex("""[\\/:*?"<>|\p{Cntrl}]+"""), "_")
+            .trim()
+            .take(80)
+            .ifBlank { "online_completion" }
+
+    private fun String.xmlEscape(): String =
+        replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\"", "&quot;")
+            .replace("'", "&apos;")
+
     private fun rememberCloudStorageRepository(repository: Any?) {
         if (repository == null) return
         cloudStorageRepositoryRef = WeakReference(repository)
@@ -4085,6 +6180,27 @@ class WebDavDriveHook(
         }
         fieldValue(repository, "workerManager")?.let {
             rememberWorkerManager(it)
+        }
+    }
+
+    private fun rememberHomeViewModelDependencies(viewModel: Any?) {
+        if (viewModel == null) return
+        val repository = fieldValue(viewModel, "repository")
+        if (repository != null && bookshelfRepositoryRef?.get() !== repository) {
+            rememberBookshelfRepository(repository)
+            logWebDav("home viewModel bookshelf repository registered")
+        }
+        fieldValue(viewModel, "cloudStorageRepository")?.let { cloudRepository ->
+            if (cloudStorageRepositoryRef?.get() !== cloudRepository) {
+                rememberCloudStorageRepository(cloudRepository)
+                logWebDav("home viewModel cloud repository registered")
+            }
+        }
+        fieldValue(viewModel, "workers")?.let { workerManager ->
+            if (workerManagerRef?.get() !== workerManager) {
+                rememberWorkerManager(workerManager)
+                logWebDav("home viewModel worker manager registered")
+            }
         }
     }
 
@@ -5133,6 +7249,22 @@ class WebDavDriveHook(
         }
     }
 
+    private inline fun <T> withOnlineCleartextAllowed(requestUrl: String, block: () -> T): T {
+        rememberCleartextHost(requestUrl)
+        return withWebDavCleartextAllowed(block)
+    }
+
+    private fun rememberCleartextHost(requestUrl: String) {
+        val uri = runCatching { URI(requestUrl) }.getOrNull()
+        if (!uri?.scheme.equals("http", ignoreCase = true)) return
+        val host = uri?.host.orEmpty().ifBlank {
+            runCatching { URL(requestUrl).host }.getOrDefault("")
+        }
+        if (host.isNotBlank()) {
+            webDavCleartextAllowedHosts[host] = true
+        }
+    }
+
     private fun buildWebDavUrl(baseUrl: String, path: String, directory: Boolean = false): URL {
         val base = URI(baseUrl.trimEnd('/') + "/")
         val segments = normalizeWebDavPath(path).trim('/').split('/').filter { it.isNotBlank() }
@@ -5721,6 +7853,21 @@ class WebDavDriveHook(
         }
     }
 
+    private fun pushOnlineCompletionCloudTitle(title: String = ONLINE_COMPLETION_TITLE) {
+        onlineCompletionCloudTitleDepth.set((onlineCompletionCloudTitleDepth.get() ?: 0) + 1)
+        onlineCompletionCloudTitleText.set(title.ifBlank { ONLINE_COMPLETION_TITLE })
+    }
+
+    private fun popOnlineCompletionCloudTitle() {
+        val next = (onlineCompletionCloudTitleDepth.get() ?: 0) - 1
+        if (next <= 0) {
+            onlineCompletionCloudTitleDepth.remove()
+            onlineCompletionCloudTitleText.remove()
+        } else {
+            onlineCompletionCloudTitleDepth.set(next)
+        }
+    }
+
     private fun pushWebDavBackupCard() {
         webDavBackupCardDepth.set((webDavBackupCardDepth.get() ?: 0) + 1)
     }
@@ -5937,6 +8084,17 @@ class WebDavDriveHook(
             ?.invoke(this)
             ?.toString()
             .orEmpty()
+
+    private fun callStringPath(root: Any?, vararg methodNames: String): String {
+        var current = root ?: return ""
+        methodNames.forEach { name ->
+            current = current.javaClass.methods.firstOrNull { it.name == "get${name.replaceFirstChar(Char::titlecase)}" && it.parameterTypes.isEmpty() }
+                ?.apply { isAccessible = true }
+                ?.invoke(current)
+                ?: return ""
+        }
+        return current.toString()
+    }
 
     private fun Any.callLong(methodName: String): Long {
         val value = javaClass.methods.firstOrNull { it.name == methodName && it.parameterTypes.isEmpty() }
@@ -6166,7 +8324,51 @@ class WebDavDriveHook(
 
     private data class HomeSearchSection(
         val type: Int,
+        val title: String = "",
         val results: List<*>,
+    )
+
+    private data class OnlineHttpResponse(
+        val url: String,
+        val body: String,
+    )
+
+    private data class OnlineSearchGroup(
+        val source: OnlineSourceEntry,
+        val query: String,
+        val results: List<OnlineBookSearchResult>,
+        val error: String,
+    )
+
+    private data class OnlineBookSearchResult(
+        val sourceName: String,
+        val name: String,
+        val author: String,
+        val coverUrl: String,
+        val detailUrl: String,
+        val intro: String,
+    )
+
+    private data class OnlineDownloadTarget(
+        val source: OnlineSourceEntry,
+        val query: String,
+        val result: OnlineBookSearchResult,
+    )
+
+    private data class OnlineChapter(
+        val title: String,
+        val url: String,
+    )
+
+    private data class OnlineDownloadedChapter(
+        val title: String,
+        val content: String,
+    )
+
+    private data class OnlineBinaryPayload(
+        val bytes: ByteArray,
+        val mimeType: String,
+        val url: String,
     )
 
     private data class WebDavBackupSnapshot(
@@ -6691,6 +8893,10 @@ class WebDavDriveHook(
         const val CLOUD_BOOK_CLASS = "app.zhendong.reamicro.data.storage.CloudBook"
         const val CLOUD_FOLDER_CLASS = "app.zhendong.reamicro.data.storage.CloudFolder"
         const val BOOK_CLASS = "app.zhendong.reamicro.data.db.entity.Book"
+        const val BOOK_ROW_INFO_CLASS = "app.zhendong.reamicro.ui.storage.components.BookRowInfoKt"
+        const val BOOK_ROW_INFO_METHOD = "BookRowInfo"
+        const val TIME_EXT_KT_CLASS = "app.zhendong.reamicro.arch.extensions.TimeExtKt"
+        const val SECOND_TO_HOURS_METHOD = "secondToHours"
         const val DRIVE_CARD_CLASS = "app.zhendong.reamicro.ui.backup.components.DriveCardKt"
         const val YUN115_NET_DISK_CARD_METHOD = "Yun115NetDiskCard"
         const val BOOK_BACKUP_VIEW_MODEL_CLASS = "app.zhendong.reamicro.ui.backup.BookBackupViewModel"
@@ -6699,6 +8905,9 @@ class WebDavDriveHook(
         const val BOOKSHELF_REPOSITORY_CLASS = "app.zhendong.reamicro.repository.BookshelfRepository"
         const val BOOKSHELF_IMPORT_BOOK_METHOD = "importBook"
         const val BOOKSHELF_UPDATE_BOOK_METHOD = "updateBook"
+        const val OPF_CLASS = "org.epub.structure.opf.Opf"
+        const val EPUB_FILE_MANAGER_CLASS = "app.zhendong.reamicro.arch.EpubFileManager"
+        const val OKIO_PATH_CLASS = "okio.Path"
         const val WORKER_MANAGER_CLASS = "app.zhendong.reamicro.arch.WorkerManager"
         const val WORK_TRACKER_CLASS = "app.zhendong.reamicro.arch.WorkTracker"
         const val WORKER_ENQUEUE_DOWNLOAD_METHOD = "enqueueDownload"
@@ -6804,13 +9013,36 @@ class WebDavDriveHook(
         const val OKHTTP_REQUEST_BODY_CLASS = "okhttp3.RequestBody"
         const val OKHTTP_MEDIA_TYPE_CLASS = "okhttp3.MediaType"
         const val NETWORK_SECURITY_POLICY_CLASS = "android.security.NetworkSecurityPolicy"
+        const val ANDROID_OKHTTP_CLEARTEXT_FILTER_CLASS = "com.android.okhttp.HttpHandler\$CleartextURLFilter"
+        const val ANDROID_OKHTTP_PLATFORM_CLASS = "com.android.okhttp.internal.Platform"
+        const val OKHTTP_PLATFORM_CLASS = "okhttp3.internal.platform.Platform"
+        const val OKHTTP_ANDROID_PLATFORM_CLASS = "okhttp3.internal.platform.AndroidPlatform"
+        const val OKHTTP_ANDROID10_PLATFORM_CLASS = "okhttp3.internal.platform.Android10Platform"
         const val BACKUP_TYPE_WEBDAV = 8
         const val BACKUP_TYPE_LOCAL_LIBRARY = 9
+        const val BACKUP_TYPE_ONLINE_COMPLETION = 10
+        const val ONLINE_COMPLETION_RENDER_TYPE_BASE = 10000
+        const val ONLINE_COMPLETION_RENDER_TYPE_BUCKETS = 100000
         const val BACKUP_TYPE_BAIDU = 1
         const val BACKUP_TYPE_YUN115 = 2
         const val BACKUP_TYPE_ALIYUN = 4
+        const val ONLINE_COMPLETION_SOURCE_PREFIX = "reamicro-online-source://"
+        const val ONLINE_COMPLETION_BOOK_PREFIX = "reamicro-online-book://"
+        const val ONLINE_COMPLETION_NOTIFICATION_CHANNEL = "reamicro_online_completion_download"
+        const val MODULE_PACKAGE_NAME = "com.reamicro.fix"
+        const val ONLINE_COMPLETION_NOTIFICATION_ACTION = "com.reamicro.fix.ONLINE_COMPLETION_NOTIFICATION"
+        const val ONLINE_COMPLETION_NOTIFICATION_RECEIVER_CLASS =
+            "com.reamicro.fix.notification.OnlineCompletionNotificationReceiver"
+        const val ONLINE_COMPLETION_NOTIFICATION_SERVICE_CLASS =
+            "com.reamicro.fix.notification.OnlineCompletionNotificationService"
+        const val ONLINE_COMPLETION_NOTIFICATION_EXTRA_ID = "id"
+        const val ONLINE_COMPLETION_NOTIFICATION_EXTRA_TITLE = "title"
+        const val ONLINE_COMPLETION_NOTIFICATION_EXTRA_TEXT = "text"
+        const val ONLINE_COMPLETION_NOTIFICATION_EXTRA_PROGRESS = "progress"
+        const val ONLINE_COMPLETION_NOTIFICATION_EXTRA_DONE = "done"
         const val WEBDAV_TITLE = "WebDAV"
         const val LOCAL_LIBRARY_TITLE = "\u672c\u5730\u4e66\u5e93"
+        const val ONLINE_COMPLETION_TITLE = "\u5728\u7ebf\u8865\u5168"
         const val LOCAL_LIBRARY_BROWSE_TEXT = "\u6d4f\u89c8\u6587\u4ef6"
         const val LOCAL_LIBRARY_FOLDER_TITLE = "\u4e66\u5e93\u6587\u4ef6\u5939"
         const val LOCAL_LIBRARY_PICK_FOLDER_TEXT = "\u9009\u62e9\u76ee\u5f55"
@@ -6852,6 +9084,14 @@ class WebDavDriveHook(
         const val LOCAL_LIBRARY_SEARCH_BACKGROUND_BUDGET_MS = 8_000L
         const val LOCAL_LIBRARY_SEARCH_REFRESH_DELAY_MS = 1_600L
         const val LOCAL_LIBRARY_SEARCH_LATE_REFRESH_DELAY_MS = 4_500L
+        const val HOME_SEARCH_RESULT_LIMIT = 10
+        const val ONLINE_COMPLETION_RESULT_LIMIT = 8
+        const val ONLINE_COMPLETION_MAX_CHAPTERS = 500
+        const val ONLINE_COMPLETION_SEARCH_TIMEOUT_MS = 8_000L
+        const val ONLINE_COMPLETION_PARTIAL_IMPORT_THRESHOLD = 200
+        const val ONLINE_COMPLETION_PARTIAL_IMPORT_CHAPTERS = 100
+        const val ONLINE_COMPLETION_CHAPTER_RETRY_LIMIT = 3
+        const val ONLINE_COMPLETION_RETRY_DELAY_MS = 6_000L
         const val CLOUD_STORAGE_SCREEN_REFRESH_DEBOUNCE_MS = 1_000L
         const val STRING_KEY_UPLOAD_TO_115 = "upload_to_115"
         const val HOME_SEARCH_DEBOUNCE_MS = 250L
@@ -6862,6 +9102,7 @@ class WebDavDriveHook(
         val startupCacheCleanupStarted = AtomicBoolean(false)
         val NATIVE_CLOUD_DOWNLOAD_TYPES = setOf(BACKUP_TYPE_BAIDU, BACKUP_TYPE_YUN115, BACKUP_TYPE_ALIYUN)
         val UUID_DIR_REGEX = Regex("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+        val ONLINE_CHAPTER_TITLE_REGEX = Regex("(第\\s*[0-9０-９一二三四五六七八九十百千万〇零两]+\\s*[章节卷回集部篇]|chapter\\s*\\d+)", RegexOption.IGNORE_CASE)
         val BOOK_EXTENSIONS = setOf(".epub", ".mobi", ".azw3", ".txt")
         val WEBDAV_UPLOAD_RETRY_CODES = setOf(405, 409, 412, 423)
         const val WEBDAV_PROPFIND_BODY =

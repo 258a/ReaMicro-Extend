@@ -23,6 +23,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.provider.MediaStore
 import android.provider.OpenableColumns
+import android.text.InputType
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
@@ -32,6 +33,7 @@ import android.webkit.CookieManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
@@ -41,6 +43,8 @@ import com.reamicro.fix.association.provider.AssociationSearchProviderRegistry
 import com.reamicro.fix.association.provider.ExternalSourceLoader
 import com.reamicro.fix.association.provider.YouShuLoginCookies
 import com.reamicro.fix.association.provider.YouShuLoginState
+import com.reamicro.fix.online.OnlineSourceEntry
+import com.reamicro.fix.online.OnlineSourceStore
 import com.reamicro.fix.settings.ModuleSettings
 import com.reamicro.fix.settings.XposedModuleSettings
 import de.robv.android.xposed.XC_MethodHook
@@ -75,9 +79,14 @@ class ReaMicroSettingsHook(
     @Volatile private var injectedRouteStack: List<InjectedRoute> = emptyList()
     @Volatile private var injectedRouteUiState: Any? = null
     @Volatile private var fontLibraryVersionUiState: Any? = null
+    @Volatile private var onlineSourceVersionUiState: Any? = null
     @Volatile private var pendingDeleteFontUiState: Any? = null
     @Volatile private var lastFontImportToken: String = ""
     @Volatile private var lastFontImportAtMs: Long = 0L
+    @Volatile private var lastOnlineSourceImportToken: String = ""
+    @Volatile private var lastOnlineSourceImportAtMs: Long = 0L
+    @Volatile private var pendingDeleteOnlineSourceId: String = ""
+    @Volatile private var pendingDeleteOnlineSourceAtMs: Long = 0L
     private val previewFontFamilyCache = HashMap<String, Any>()
     private val failedPreviewFontFamilyLogKeys = HashSet<String>()
     private val fontFilesCacheLock = Any()
@@ -247,6 +256,16 @@ class ReaMicroSettingsHook(
     private fun insertModuleSettingsItem(lazyListScope: Any) {
         injectingModuleItem.set(true)
         runCatching {
+            if (settings.snapshot().moduleEnabled) {
+                addLazyItem(lazyListScope, ONLINE_COMPLETION_SETTINGS_ITEM_KEY) { composer ->
+                    renderSettingsEntry(
+                        title = ONLINE_COMPLETION_TITLE,
+                        callbackName = "OpenOnlineCompletionSettings",
+                        route = InjectedRoute.OnlineCompletionSettings,
+                        composer = composer,
+                    )
+                }
+            }
             if (settings.snapshot().canUseFontSettings) {
                 addLazyItem(lazyListScope, FONT_SETTINGS_ITEM_KEY) { composer ->
                     renderSettingsEntry(
@@ -424,6 +443,7 @@ class ReaMicroSettingsHook(
             when (val currentRoute = routeStateValue(routeState) ?: route) {
                 InjectedRoute.ModuleSettings -> renderHostModuleSettingsContent(innerPaddings, innerComposer)
                 InjectedRoute.AccountSwitch -> renderAccountSwitchContent(innerPaddings, innerComposer)
+                InjectedRoute.OnlineCompletionSettings -> renderOnlineCompletionSettingsContent(innerPaddings, innerComposer)
                 InjectedRoute.FontSettings -> renderFontSettingsContent(innerPaddings, innerComposer)
                 is InjectedRoute.FontPicker -> renderFontPickerContent(currentRoute.target, innerPaddings, innerComposer)
                 InjectedRoute.FontLibrary -> renderFontLibraryContent(innerPaddings, innerComposer)
@@ -1821,6 +1841,389 @@ class ReaMicroSettingsHook(
         renderHostLazyColumn(innerPaddings, listContent, composer)
     }
 
+    private fun renderOnlineCompletionSettingsContent(innerPaddings: Any, composer: Any) {
+        val listContent = functionProxy("OnlineCompletionList", FUNCTION1_CLASS) { args ->
+            val lazyListScope = args?.getOrNull(0) ?: return@functionProxy targetUnit()
+            onlineSourceVersionValue()
+            val sources = listOnlineSources()
+            val rows = buildList {
+                add(
+                    ActionRow(
+                        key = "online_source_add",
+                        title = "添加在线源",
+                        subtitle = "点击读取剪贴板链接，长按选择源文件",
+                        onClick = ::importOnlineSourceFromClipboard,
+                        onLongClick = ::openOnlineSourceDocumentPicker,
+                    ),
+                )
+                if (sources.isEmpty()) {
+                    add(
+                        ActionRow(
+                            key = "online_source_empty",
+                            title = "暂无在线源",
+                            subtitle = "在线源与关联搜索源分开管理",
+                        ),
+                    )
+                } else {
+                    sources.forEach { source ->
+                        add(
+                            ActionRow(
+                                key = "online_source_${source.id}",
+                                title = source.name,
+                                subtitle = onlineSourceSubtitle(source),
+                                onClick = { confirmOrRemoveOnlineSource(source) },
+                                onLongClick = { armOnlineSourceRemoval(source) },
+                                trailingContent = { itemComposer ->
+                                    renderOnlineSourceSwitch(source, itemComposer)
+                                },
+                            ),
+                        )
+                    }
+                }
+            }
+            addLazyItem(lazyListScope, ONLINE_COMPLETION_CONTENT_ITEM_KEY) { itemComposer ->
+                renderHostActionCard(rows, itemComposer)
+            }
+            targetUnit()
+        }
+        renderHostLazyColumn(innerPaddings, listContent, composer)
+    }
+
+    private fun onlineSourceSubtitle(source: OnlineSourceEntry): String {
+        val login = when {
+            source.webLoginUrl.isNotBlank() -> "可登录"
+            source.hasLoginConfig -> "有登录配置，可跳过"
+            else -> "无需登录"
+        }
+        val rate = source.concurrentRate.takeIf { it.isNotBlank() }?.let { "频控 $it" }
+        val origin = source.sourceUrl.ifBlank { source.origin }.ifBlank { source.fileName }
+        return listOfNotNull(login, rate, origin.takeIf { it.isNotBlank() }).joinToString(" · ")
+    }
+
+    private fun listOnlineSources(): List<OnlineSourceEntry> =
+        OnlineSourceStore.list(activityProvider()?.applicationContext)
+
+    private fun armOnlineSourceRemoval(source: OnlineSourceEntry) {
+        pendingDeleteOnlineSourceId = source.id
+        pendingDeleteOnlineSourceAtMs = SystemClock.elapsedRealtime()
+        showToast("再次点击移除此源：${source.name}")
+    }
+
+    private fun confirmOrRemoveOnlineSource(source: OnlineSourceEntry) {
+        val now = SystemClock.elapsedRealtime()
+        if (
+            pendingDeleteOnlineSourceId == source.id &&
+            now - pendingDeleteOnlineSourceAtMs <= ONLINE_SOURCE_REMOVE_CONFIRM_WINDOW_MS
+        ) {
+            settings.setOnlineSourceEnabled(source.id, false)
+            val removed = OnlineSourceStore.remove(activityProvider()?.applicationContext, source.id)
+            pendingDeleteOnlineSourceId = ""
+            pendingDeleteOnlineSourceAtMs = 0L
+            if (removed) {
+                bumpOnlineSourceVersion()
+                showToast("已移除在线源：${source.name}")
+            } else {
+                showToast("在线源移除失败：${source.name}")
+            }
+        } else {
+            armOnlineSourceRemoval(source)
+        }
+    }
+
+    private fun renderOnlineSourceSwitch(source: OnlineSourceEntry, composer: Any) {
+        val targetChecked = settings.isOnlineSourceEnabled(source.id)
+        val state = rememberBooleanState(composer, targetChecked)
+        fun updateChecked(value: Boolean) {
+            state.javaClass.methods.firstOrNull { it.name == "setValue" && it.parameterTypes.size == 1 }
+                ?.invoke(state, value)
+        }
+        val rememberedChecked = state.method0("getValue") as? Boolean ?: targetChecked
+        val checked = if (rememberedChecked != targetChecked) {
+            updateChecked(targetChecked)
+            targetChecked
+        } else {
+            rememberedChecked
+        }
+        val onCheckedChange = functionProxy("OnlineSourceSwitch${source.id}", FUNCTION1_CLASS) { args ->
+            val enabled = args?.getOrNull(0) as? Boolean ?: return@functionProxy targetUnit()
+            val applied = setOnlineSourceEnabled(source, enabled, ::updateChecked)
+            updateChecked(applied)
+            targetUnit()
+        }
+        method(SWITCH_KT_CLASS, SWITCH_METHOD, 10).invoke(
+            null,
+            checked,
+            onCheckedChange,
+            switchModifier(),
+            null,
+            false,
+            switchColors(composer),
+            null,
+            composer,
+            0,
+            88,
+        )
+    }
+
+    private fun setOnlineSourceEnabled(
+        source: OnlineSourceEntry,
+        enabled: Boolean,
+        updateChecked: (Boolean) -> Unit,
+    ): Boolean {
+        if (!enabled) {
+            settings.setOnlineSourceEnabled(source.id, false)
+            return false
+        }
+        if (!source.hasLoginConfig) {
+            settings.setOnlineSourceEnabled(source.id, true)
+            if (source.hasLoginConfig) {
+                showToast("${source.name} 暂未执行登录，已跳过并启用")
+            }
+            return true
+        }
+        settings.setOnlineSourceEnabled(source.id, false)
+        openOnlineSourceLoginDialog(source) { confirmed ->
+            if (confirmed) {
+                settings.setOnlineSourceEnabled(source.id, true)
+                updateChecked(true)
+                showToast("已启用在线源：${source.name}")
+            } else {
+                settings.setOnlineSourceEnabled(source.id, false)
+                updateChecked(false)
+            }
+        }
+        return false
+    }
+
+    private fun importOnlineSourceFromClipboard() {
+        val activity = activityProvider() ?: return
+        val url = readClipboardText(activity).trim()
+        if (url.isBlank()) {
+            showToast("剪贴板中没有在线源链接")
+            return
+        }
+        importOnlineSourceAsync(activity, "clipboard:$url") {
+            OnlineSourceStore.importFromUrl(activity.applicationContext, url)
+        }
+    }
+
+    private fun openOnlineSourceDocumentPicker() {
+        val activity = activityProvider() ?: return
+        runCatching {
+            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "*/*"
+                putExtra(
+                    Intent.EXTRA_MIME_TYPES,
+                    arrayOf(
+                        "application/json",
+                        "text/plain",
+                        "application/octet-stream",
+                    ),
+                )
+                putExtra(Intent.EXTRA_ALLOW_MULTIPLE, false)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            activity.startActivityForResult(intent, ONLINE_SOURCE_DOCUMENT_REQUEST_CODE)
+        }.onFailure {
+            Toast.makeText(activity, "无法打开在线源选择器", Toast.LENGTH_SHORT).show()
+            XposedBridge.log("$LOG_PREFIX failed to open online source picker: ${it.stackTraceToString()}")
+        }
+    }
+
+    private fun importOnlineSourceDocumentResult(activity: Activity, intent: Intent) {
+        val clipData = intent.clipData
+        if (clipData != null && clipData.itemCount != 1) {
+            showToast("一次最多导入一个在线源")
+            return
+        }
+        val uri = clipData?.getItemAt(0)?.uri ?: intent.data
+        if (uri == null) {
+            showToast("未选择在线源文件")
+            return
+        }
+        importOnlineSourceAsync(activity, "uri:$uri") {
+            val bytes = activity.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                ?: error("无法读取在线源文件")
+            val displayName = queryDisplayName(activity, uri)
+                ?: uri.lastPathSegment?.substringAfterLast('/')
+                ?: "online_source.json"
+            OnlineSourceStore.importBytes(activity.applicationContext, bytes, displayName, uri.toString())
+        }
+    }
+
+    private fun importOnlineSourceAsync(
+        activity: Activity,
+        token: String,
+        importer: () -> OnlineSourceEntry,
+    ) {
+        val now = System.currentTimeMillis()
+        if (token == lastOnlineSourceImportToken && now - lastOnlineSourceImportAtMs < ONLINE_SOURCE_IMPORT_DEDUPE_WINDOW_MS) {
+            return
+        }
+        lastOnlineSourceImportToken = token
+        lastOnlineSourceImportAtMs = now
+        Thread {
+            runCatching { importer() }
+                .onSuccess { source ->
+                    activity.runOnUiThread {
+                        bumpOnlineSourceVersion()
+                        showToast("已添加在线源：${source.name}")
+                    }
+                }
+                .onFailure {
+                    XposedBridge.log("$LOG_PREFIX online source import failed: ${it.stackTraceToString()}")
+                    showToast(it.message ?: "导入在线源失败")
+                }
+        }.apply {
+            name = "ReaMicroOnlineSourceImport"
+            isDaemon = true
+            start()
+        }
+    }
+
+    private fun openOnlineSourceLoginDialog(source: OnlineSourceEntry, onResult: (Boolean) -> Unit) {
+        val activity = activityProvider()
+        if (activity == null) {
+            onResult(false)
+            return
+        }
+        val loginUrl = source.webLoginUrl
+        if (loginUrl.isBlank()) {
+            openOnlineSourceCredentialDialog(activity, source, onResult)
+            return
+            showToast("${source.name} 没有可打开的登录地址，已跳过登录")
+            onResult(true)
+            return
+        }
+        activity.runOnUiThread {
+            runCatching {
+                CookieManager.getInstance().setAcceptCookie(true)
+                var resolved = false
+                val webView = WebView(activity).apply {
+                    isFocusable = true
+                    isFocusableInTouchMode = true
+                    settings.javaScriptEnabled = true
+                    settings.domStorageEnabled = true
+                    CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+                    webViewClient = object : WebViewClient() {
+                        override fun onPageFinished(view: WebView?, url: String?) {
+                            CookieManager.getInstance().flush()
+                        }
+                    }
+                    loadUrl(loginUrl)
+                }
+                fun resolve(value: Boolean) {
+                    if (resolved) return
+                    resolved = true
+                    CookieManager.getInstance().flush()
+                    onResult(value)
+                }
+                val dialog = AlertDialog.Builder(activity)
+                    .setTitle("${source.name} 登录")
+                    .setView(webView)
+                    .setPositiveButton("完成", null)
+                    .setNegativeButton("跳过启用", null)
+                    .setNeutralButton("取消", null)
+                    .create()
+                dialog.setOnShowListener {
+                    dialog.window?.clearFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM)
+                    dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+                    webView.requestFocus()
+                    dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                        resolve(true)
+                        dialog.dismiss()
+                    }
+                    dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener {
+                        resolve(true)
+                        dialog.dismiss()
+                    }
+                    dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
+                        resolve(false)
+                        dialog.dismiss()
+                    }
+                }
+                dialog.setOnDismissListener {
+                    if (!resolved) resolve(false)
+                    runCatching { webView.destroy() }
+                }
+                dialog.show()
+                dialog.window?.clearFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM)
+                dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+            }.onFailure {
+            XposedBridge.log("$LOG_PREFIX failed to open online source login: ${it.stackTraceToString()}")
+            onResult(false)
+        }
+    }
+    }
+
+
+    private fun openOnlineSourceCredentialDialog(
+        activity: Activity,
+        source: OnlineSourceEntry,
+        onResult: (Boolean) -> Unit,
+    ) {
+        activity.runOnUiThread {
+            runCatching {
+                val container = LinearLayout(activity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(48, 24, 48, 0)
+                }
+                val userInput = EditText(activity).apply {
+                    hint = "账号"
+                    inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_NORMAL
+                    setSingleLine(true)
+                }
+                val passwordInput = EditText(activity).apply {
+                    hint = "密码"
+                    inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                    setSingleLine(true)
+                }
+                container.addView(userInput)
+                container.addView(passwordInput)
+                var resolved = false
+                fun resolve(value: Boolean) {
+                    if (resolved) return
+                    resolved = true
+                    onResult(value)
+                }
+                val dialog = AlertDialog.Builder(activity)
+                    .setTitle("${source.name} 登录")
+                    .setMessage("该源没有可打开的登录地址，请输入账号密码，或选择跳过启用。")
+                    .setView(container)
+                    .setPositiveButton("完成", null)
+                    .setNegativeButton("跳过启用", null)
+                    .setNeutralButton("取消", null)
+                    .create()
+                dialog.setOnShowListener {
+                    dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+                    dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                        activity.getSharedPreferences(ModuleSettings.PREFS_NAME, Context.MODE_PRIVATE)
+                            .edit()
+                            .putString("online_login_user_${source.id}", userInput.text?.toString().orEmpty())
+                            .putString("online_login_password_${source.id}", passwordInput.text?.toString().orEmpty())
+                            .apply()
+                        resolve(true)
+                        dialog.dismiss()
+                    }
+                    dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener {
+                        resolve(true)
+                        dialog.dismiss()
+                    }
+                    dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
+                        resolve(false)
+                        dialog.dismiss()
+                    }
+                }
+                dialog.setOnCancelListener { resolve(false) }
+                dialog.show()
+            }.onFailure {
+                XposedBridge.log("$LOG_PREFIX failed to open online source credential dialog: ${it.stackTraceToString()}")
+                onResult(false)
+            }
+        }
+    }
+
     private fun setRotationEnabled(
         enabled: Boolean,
         currentState: RotationUiState,
@@ -2308,6 +2711,10 @@ class ReaMicroSettingsHook(
                     if (resultCode != Activity.RESULT_OK) return
                     val activity = param.thisObject as? Activity ?: return
                     val intent = param.args?.getOrNull(2) as? Intent ?: return
+                    if (requestCode == ONLINE_SOURCE_DOCUMENT_REQUEST_CODE) {
+                        importOnlineSourceDocumentResult(activity, intent)
+                        return
+                    }
                     val uri = intent.data ?: return
                     when (requestCode) {
                         FONT_DOCUMENT_REQUEST_CODE -> copyFontUriToLibrary(activity, uri)
@@ -2491,12 +2898,19 @@ class ReaMicroSettingsHook(
                 targetUnit()
             }
         }
-        val trailing = row.trailing?.takeIf { it.isNotBlank() }?.let { trailingText ->
-            composableLambda(row.key.hashCode() xor ACTION_TRAILING_KEY_MASK, FUNCTION2_CLASS) { args ->
+        val trailingText = row.trailing?.takeIf { it.isNotBlank() }
+        val trailing = when {
+            row.trailingContent != null -> composableLambda(row.key.hashCode() xor ACTION_TRAILING_KEY_MASK, FUNCTION2_CLASS) { args ->
+                val innerComposer = args?.getOrNull(0) ?: return@composableLambda targetUnit()
+                row.trailingContent.invoke(innerComposer)
+                targetUnit()
+            }
+            trailingText != null -> composableLambda(row.key.hashCode() xor ACTION_TRAILING_KEY_MASK, FUNCTION2_CLASS) { args ->
                 val innerComposer = args?.getOrNull(0) ?: return@composableLambda targetUnit()
                 renderHostTrailingText(trailingText, innerComposer)
                 targetUnit()
             }
+            else -> null
         }
         val baseModifier = rowModifier(true, if (supporting == null) 56 else 68)
         val modifier = when {
@@ -2987,6 +3401,22 @@ class ReaMicroSettingsHook(
         }
     }
 
+    private fun onlineSourceVersionState(): Any {
+        onlineSourceVersionUiState?.let { return it }
+        return mutableState(0).also { onlineSourceVersionUiState = it }
+    }
+
+    private fun onlineSourceVersionValue(): Int =
+        (onlineSourceVersionState().method0("getValue") as? Number)?.toInt() ?: 0
+
+    private fun bumpOnlineSourceVersion() {
+        val state = onlineSourceVersionState()
+        val value = (state.method0("getValue") as? Number)?.toInt() ?: 0
+        state.javaClass.methods
+            .firstOrNull { it.name == "setValue" && it.parameterTypes.size == 1 }
+            ?.invoke(state, value + 1)
+    }
+
     private fun accountListVersionState(): Any {
         accountListVersionUiState?.let { return it }
         return mutableState(0).also { accountListVersionUiState = it }
@@ -3307,6 +3737,7 @@ class ReaMicroSettingsHook(
         val title: String,
         val subtitle: String? = null,
         val trailing: String? = null,
+        val trailingContent: ((Any) -> Unit)? = null,
         val titleFontSelection: String? = null,
         val onClick: (() -> Unit)? = null,
         val onLongClick: (() -> Unit)? = null,
@@ -3343,6 +3774,7 @@ class ReaMicroSettingsHook(
     private sealed class InjectedRoute(val title: String) {
         object ModuleSettings : InjectedRoute(MODULE_ENTRY_TITLE)
         object AccountSwitch : InjectedRoute(ACCOUNT_SWITCH_TITLE)
+        object OnlineCompletionSettings : InjectedRoute(ONLINE_COMPLETION_TITLE)
         object FontSettings : InjectedRoute(FONT_SETTINGS_TITLE)
         data class FontPicker(val target: FontPickerTarget) : InjectedRoute(target.title)
         object FontLibrary : InjectedRoute(FONT_LIBRARY_TITLE)
@@ -3545,12 +3977,15 @@ class ReaMicroSettingsHook(
         const val FONT_SETTINGS_CONTENT_ITEM_KEY = 0x524D4662
         const val FONT_PICKER_CONTENT_ITEM_KEY = 0x524D4663
         const val FONT_LIBRARY_CONTENT_ITEM_KEY = 0x524D4664
+        const val ONLINE_COMPLETION_SETTINGS_ITEM_KEY = 0x524D4665
         const val ACCOUNT_COMPLETION_SWITCHES_ITEM_KEY = 0x524D4666
         const val ACCOUNT_EXPORT_ACTION_ITEM_KEY = 0x524D4667
         const val ACCOUNT_IMPORT_ACTION_ITEM_KEY = 0x524D4668
         const val ACCOUNT_SWITCH_ACTION_ITEM_KEY = 0x524D4669
+        const val ONLINE_COMPLETION_CONTENT_ITEM_KEY = 0x524D466A
         const val ACCOUNT_CREDENTIAL_DOCUMENT_REQUEST_CODE = 0x524D47
         const val ACCOUNT_DATA_DOCUMENT_REQUEST_CODE = 0x524D48
+        const val ONLINE_SOURCE_DOCUMENT_REQUEST_CODE = 0x524D49
         const val ACCOUNT_RESTART_DELAY_MS = 1_400L
         const val ACCOUNT_RESTART_KILL_DELAY_MS = 250L
         const val ACCOUNT_RESTART_COMMAND_DELAY_SECONDS = "0.8"
@@ -3561,12 +3996,15 @@ class ReaMicroSettingsHook(
         const val TEXT_WITH_FONT_FAMILY_MASK = 130938
         const val FAMILY_SYSTEM = "system"
         const val FAMILY_SOURCE_HAN_SERIF = "serif"
+        const val ONLINE_COMPLETION_TITLE = "在线补全"
         const val HOST_ABOUT_TITLE = "关于阅微"
         const val MODULE_ENTRY_TITLE = "补全计划"
         const val FONT_SETTINGS_TITLE = "字体设置"
         const val FONT_LIBRARY_TITLE = "字体库"
         const val FONT_DOCUMENT_REQUEST_CODE = 0x524D46
         const val FONT_IMPORT_DEDUPE_WINDOW_MS = 2_500L
+        const val ONLINE_SOURCE_IMPORT_DEDUPE_WINDOW_MS = 2_500L
+        const val ONLINE_SOURCE_REMOVE_CONFIRM_WINDOW_MS = 3_000L
         const val FONT_FILES_CACHE_WINDOW_MS = 500L
         const val YOUSHU_LOGIN_URL = "https://m.youshu.me/login.php"
         const val YOUSHU_FAST_LOGIN_VERIFY_ATTEMPTS = 1
