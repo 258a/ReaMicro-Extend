@@ -174,7 +174,6 @@ class WebDavDriveHook(
     private val onlineCompletionPublisherCleanupIds = ConcurrentHashMap.newKeySet<String>()
     private val onlineCompletionNotificationIds = AtomicInteger(4300)
     private val onlineCompletionNotificationBlockedLogged = AtomicBoolean(false)
-    private val onlineCompletionModuleServiceUnavailable = AtomicBoolean(false)
     private val onlineCompletionModuleActivityStarted = ConcurrentHashMap.newKeySet<Int>()
     @Volatile private var lastHomeSearchViewModelRef: WeakReference<Any>? = null
     @Volatile private var lastHomeSearchQuery: String = ""
@@ -6964,7 +6963,8 @@ class WebDavDriveHook(
     ): Boolean {
         val moduleAlreadyStarted = onlineCompletionModuleActivityStarted.contains(id)
         val broadcastSent = sendOnlineCompletionNotificationBroadcast(context, id, title, text, progress, done)
-        val activitySent = if (!moduleAlreadyStarted && !done) {
+        val shouldStartActivity = !moduleAlreadyStarted || done || !broadcastSent
+        val activitySent = if (shouldStartActivity) {
             if (startOnlineCompletionNotificationActivity(context, id, title, text, progress, done)) {
                 onlineCompletionModuleActivityStarted.add(id)
                 true
@@ -6974,36 +6974,6 @@ class WebDavDriveHook(
         } else {
             false
         }
-        val shouldTryService = done || moduleAlreadyStarted || (!broadcastSent && !activitySent)
-        val serviceSent = if (!shouldTryService || onlineCompletionModuleServiceUnavailable.get()) {
-            false
-        } else {
-            runCatching {
-                val intent = onlineCompletionNotificationIntent(id, title, text, progress, done).apply {
-                    setClassName(MODULE_PACKAGE_NAME, ONLINE_COMPLETION_NOTIFICATION_SERVICE_CLASS)
-                }
-                val component = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !done && !moduleAlreadyStarted) {
-                    context.startForegroundService(intent)
-                } else {
-                    context.startService(intent)
-                }
-                if (component == null) {
-                    onlineCompletionModuleServiceUnavailable.set(true)
-                    logWebDav("online completion module foreground notification unresolved; fallback to receiver")
-                    false
-                } else {
-                    true
-                }
-            }.getOrElse {
-                logWebDav("online completion module foreground notification failed: ${it.message ?: it.javaClass.name}")
-                false
-            }
-        }
-        if (serviceSent) {
-            onlineCompletionModuleActivityStarted.add(id)
-            if (done) onlineCompletionModuleActivityStarted.remove(id)
-            return true
-        }
         if (broadcastSent) {
             if (done) onlineCompletionModuleActivityStarted.remove(id)
             return true
@@ -7012,11 +6982,8 @@ class WebDavDriveHook(
             if (done) onlineCompletionModuleActivityStarted.remove(id)
             return true
         }
-        val activityRetrySent = moduleAlreadyStarted &&
-            startOnlineCompletionNotificationActivity(context, id, title, text, progress, done)
-        if (activityRetrySent) onlineCompletionModuleActivityStarted.add(id)
         if (done) onlineCompletionModuleActivityStarted.remove(id)
-        return activityRetrySent
+        return false
     }
 
     private fun startOnlineCompletionNotificationActivity(
@@ -10365,8 +10332,6 @@ img{max-width:100%;max-height:100%;height:auto;}
             "com.reamicro.fix.notification.OnlineCompletionNotificationActivity"
         const val ONLINE_COMPLETION_NOTIFICATION_RECEIVER_CLASS =
             "com.reamicro.fix.notification.OnlineCompletionNotificationReceiver"
-        const val ONLINE_COMPLETION_NOTIFICATION_SERVICE_CLASS =
-            "com.reamicro.fix.notification.OnlineCompletionNotificationService"
         const val ONLINE_COMPLETION_NOTIFICATION_EXTRA_ID = "id"
         const val ONLINE_COMPLETION_NOTIFICATION_EXTRA_TITLE = "title"
         const val ONLINE_COMPLETION_NOTIFICATION_EXTRA_TEXT = "text"

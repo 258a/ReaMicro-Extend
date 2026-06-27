@@ -19,43 +19,34 @@ class OnlineCompletionNotificationService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action != ACTION_ONLINE_COMPLETION_NOTIFICATION) return START_NOT_STICKY
-        if (
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) {
-            Log.i(LOG_TAG, "module notification permission denied")
-            stopSelf(startId)
-            return START_NOT_STICKY
-        }
-        val id = intent.getIntExtra(EXTRA_ID, 0).takeIf { it > 0 } ?: return START_NOT_STICKY
-        val title = intent.getStringExtra(EXTRA_TITLE).orEmpty().ifBlank { ONLINE_COMPLETION_TITLE }
-        val text = intent.getStringExtra(EXTRA_TEXT).orEmpty()
-        val progress = intent.getIntExtra(EXTRA_PROGRESS, 0).coerceIn(0, 100)
-        val done = intent.getBooleanExtra(EXTRA_DONE, false)
+        val id = intent?.getIntExtra(EXTRA_ID, 0)?.takeIf { it > 0 } ?: FALLBACK_NOTIFICATION_ID
+        val title = intent?.getStringExtra(EXTRA_TITLE).orEmpty().ifBlank { ONLINE_COMPLETION_TITLE }
+        val text = intent?.getStringExtra(EXTRA_TEXT).orEmpty()
+        val progress = intent?.getIntExtra(EXTRA_PROGRESS, 0)?.coerceIn(0, 100) ?: 0
+        val done = intent?.getBooleanExtra(EXTRA_DONE, false) == true
         val notification = buildNotification(title, text, progress, done)
         runCatching {
             val manager = notificationManager()
-            if (!done && foregroundId == 0) {
+            if (foregroundId == 0) {
                 foregroundId = id
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    startForeground(id, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-                } else {
-                    startForeground(id, notification)
-                }
-            } else {
+                startForegroundCompat(id, notification)
+            } else if (hasNotificationPermission()) {
                 manager?.notify(id, notification)
+            }
+            if (intent?.action != ACTION_ONLINE_COMPLETION_NOTIFICATION) {
+                Log.i(LOG_TAG, "module foreground service ignored unexpected action=${intent?.action}")
+                stopForegroundNow(removeNotification = true)
+                stopSelf(startId)
+                return START_NOT_STICKY
+            }
+            if (!hasNotificationPermission()) {
+                Log.i(LOG_TAG, "module notification permission denied")
             }
             Log.i(LOG_TAG, "module service notification posted id=$id progress=$progress done=$done title=$title")
             if (done) {
-                manager?.notify(id, notification)
+                if (hasNotificationPermission()) manager?.notify(id, notification)
                 if (id == foregroundId) {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                        stopForeground(STOP_FOREGROUND_DETACH)
-                    } else {
-                        @Suppress("DEPRECATION")
-                        stopForeground(false)
-                    }
+                    stopForegroundNow(removeNotification = false)
                     foregroundId = 0
                 }
                 manager?.let { cancelOnlineCompletionNotificationIfDone(it, id, true) }
@@ -66,6 +57,33 @@ class OnlineCompletionNotificationService : Service() {
             stopSelf(startId)
         }
         return START_NOT_STICKY
+    }
+
+    private fun hasNotificationPermission(): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+
+    private fun startForegroundCompat(id: Int, notification: Notification) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            runCatching {
+                startForeground(id, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+            }.getOrElse {
+                startForeground(id, notification)
+            }
+        } else {
+            startForeground(id, notification)
+        }
+    }
+
+    private fun stopForegroundNow(removeNotification: Boolean) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(
+                if (removeNotification) STOP_FOREGROUND_REMOVE else STOP_FOREGROUND_DETACH,
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            stopForeground(removeNotification)
+        }
     }
 
     private fun buildNotification(title: String, text: String, progress: Int, done: Boolean): Notification {
@@ -112,5 +130,6 @@ class OnlineCompletionNotificationService : Service() {
         const val EXTRA_DONE = "done"
         const val ONLINE_COMPLETION_TITLE = "\u5728\u7ebf\u8865\u5168"
         const val ONLINE_COMPLETION_NOTIFICATION_CHANNEL = "reamicro_online_completion_download"
+        const val FALLBACK_NOTIFICATION_ID = 4300
     }
 }

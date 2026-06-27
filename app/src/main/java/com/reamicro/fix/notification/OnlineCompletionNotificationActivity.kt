@@ -14,46 +14,58 @@ import android.util.Log
 import com.reamicro.fix.R
 
 class OnlineCompletionNotificationActivity : Activity() {
+    private var pendingNotificationIntent: Intent? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        handleNotificationIntent(intent)
-        finish()
-        overridePendingTransition(0, 0)
+        if (handleNotificationIntent(intent)) finishWithoutAnimation()
     }
 
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
         setIntent(intent)
-        handleNotificationIntent(intent)
-        finish()
-        overridePendingTransition(0, 0)
+        if (handleNotificationIntent(intent)) finishWithoutAnimation()
     }
 
-    private fun handleNotificationIntent(intent: Intent?) {
-        if (intent?.action != ACTION_ONLINE_COMPLETION_NOTIFICATION) return
+    private fun handleNotificationIntent(intent: Intent?): Boolean {
+        if (intent?.action != ACTION_ONLINE_COMPLETION_NOTIFICATION) return true
         Log.i(LOG_TAG, "module notification activity launched")
-        if (!startNotificationService(intent)) {
-            postNotification(this, intent)
+        if (!hasNotificationPermission()) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                pendingNotificationIntent = Intent(intent)
+                requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_POST_NOTIFICATIONS)
+                Log.i(LOG_TAG, "module notification permission requested")
+                return false
+            }
+            Log.i(LOG_TAG, "module notification permission denied")
+            return true
+        }
+        postNotification(this, intent)
+        return true
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_POST_NOTIFICATIONS) {
+            val granted = grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED
+            val intent = pendingNotificationIntent
+            pendingNotificationIntent = null
+            if (granted && intent != null) {
+                postNotification(this, intent)
+            } else {
+                Log.i(LOG_TAG, "module notification permission denied after request")
+            }
+            finishWithoutAnimation()
         }
     }
 
-    private fun startNotificationService(intent: Intent): Boolean {
-        val done = intent.getBooleanExtra(EXTRA_DONE, false)
-        val serviceIntent = Intent(intent).apply {
-            setClass(this@OnlineCompletionNotificationActivity, OnlineCompletionNotificationService::class.java)
-        }
-        return runCatching {
-            val component = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !done) {
-                startForegroundService(serviceIntent)
-            } else {
-                startService(serviceIntent)
-            }
-            Log.i(LOG_TAG, "module notification activity started service component=$component done=$done")
-            component != null
-        }.getOrElse {
-            Log.i(LOG_TAG, "module notification activity service start failed", it)
-            false
-        }
+    private fun hasNotificationPermission(): Boolean {
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
     }
 
     private fun postNotification(context: Context, intent: Intent) {
@@ -99,9 +111,15 @@ class OnlineCompletionNotificationActivity : Activity() {
         Log.i(LOG_TAG, "module activity notification posted fallback id=$id progress=$progress done=$done title=$title")
     }
 
+    private fun finishWithoutAnimation() {
+        finish()
+        overridePendingTransition(0, 0)
+    }
+
     private companion object {
         const val LOG_TAG = "ReaMicroNotify"
         const val ACTION_ONLINE_COMPLETION_NOTIFICATION = "com.reamicro.fix.ONLINE_COMPLETION_NOTIFICATION"
+        const val REQUEST_POST_NOTIFICATIONS = 4301
         const val EXTRA_ID = "id"
         const val EXTRA_TITLE = "title"
         const val EXTRA_TEXT = "text"
