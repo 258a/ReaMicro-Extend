@@ -1,6 +1,5 @@
 ﻿package com.reamicro.fix.hook
 
-import android.Manifest
 import android.app.Activity
 import android.app.Dialog
 import android.app.Notification
@@ -8,7 +7,6 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.net.Uri
 import android.graphics.Canvas
 import android.graphics.Color
@@ -5905,6 +5903,7 @@ class WebDavDriveHook(
         }
         Thread({
             var partialImportThread: Thread? = null
+            val partialImportSucceeded = AtomicBoolean(false)
             runCatching {
                 val localFile = importCacheFile(
                     context.cacheDir,
@@ -5929,6 +5928,7 @@ class WebDavDriveHook(
                                         "${error.message ?: error.javaClass.name}",
                                 )
                             }.getOrDefault(false)
+                            if (partialImported) partialImportSucceeded.set(true)
                             val continueMessage = if (partialImported) {
                                 "已导入前 $count 章，继续下载"
                             } else {
@@ -5944,8 +5944,18 @@ class WebDavDriveHook(
                     progressNotifier.running(90, "等待前 100 章导入完成", force = true)
                     thread.join()
                 }
-                progressNotifier.running(94, "正在导入阅微", force = true)
-                importOnlineCompletionBook(localFile, target)
+                if (partialImportSucceeded.get()) {
+                    progressNotifier.running(94, "正在更新完整章节", force = true)
+                    val replaced = replaceOnlineCompletionImportedBook(localFile, target)
+                    if (!replaced) {
+                        logWebDav("online completion final replace missed existing book; falling back to importBook")
+                        progressNotifier.running(94, "正在导入阅微", force = true)
+                        importOnlineCompletionBook(localFile, target)
+                    }
+                } else {
+                    progressNotifier.running(94, "正在导入阅微", force = true)
+                    importOnlineCompletionBook(localFile, target)
+                }
                 progressNotifier.finish("已导入阅微", target.result.detailUrl, success = true)
                 logWebDav("online completion download imported file=${localFile.absolutePath} size=${localFile.length()}")
                 Handler(Looper.getMainLooper()).post {
@@ -6741,6 +6751,73 @@ class WebDavDriveHook(
         return true
     }
 
+    private fun replaceOnlineCompletionImportedBook(file: File, target: OnlineDownloadTarget): Boolean {
+        val bookshelf = currentBookshelfRepository() ?: error("阅微导入服务暂不可用，请先打开书架后重试")
+        val existing = findOnlineCompletionImportedBook(bookshelf, target) ?: return false
+        val existingDir = bookDirectory(existing).canonicalFile
+        if (!existingDir.isDirectory) return false
+        val unzipDirFile = unzipOnlineCompletionEpub(file)
+        val imported = importOnlineCompletionEpubDirectory(okioPath(unzipDirFile), currentOnlineCompletionBooksDir(bookshelf))
+        val importedDir = okioPathToFile(imported.first).canonicalFile
+        replaceDirectoryContents(existingDir, importedDir)
+        runCatching { unzipDirFile.deleteRecursively() }
+        val latest = findLocalBookByUuid(existing.callLong("getUid"), existing.callString("getUuid")) ?: existing
+        val size = bookDirectorySize(existingDir)
+        val updated = copyBookWithBackupAndPublisher(
+            book = latest,
+            backupType = BACKUP_TYPE_ONLINE_COMPLETION,
+            backupId = onlineImportedBookBackupId(target),
+            backupCode = target.source.id,
+            publisher = "",
+            cover = latest.callString("getCover").ifBlank { target.result.coverUrl },
+            size = size,
+            updated = System.currentTimeMillis(),
+        )
+        updateLocalBook(updated)
+        logWebDav(
+            "online completion final book directory replaced uuid=${updated.callString("getUuid")} " +
+                "dir=${existingDir.absolutePath} size=$size",
+        )
+        return true
+    }
+
+    private fun findOnlineCompletionImportedBook(bookshelf: Any, target: OnlineDownloadTarget): Any? {
+        val sourceUrl = target.result.detailUrl.ifBlank { target.source.sourceUrl }
+        return findLocalBookByUrl(bookshelf, sourceUrl)
+            ?: findLocalBookByUrl(bookshelf, target.result.detailUrl)
+    }
+
+    private fun okioPathToFile(path: Any): File =
+        File(path.toString())
+
+    private fun replaceDirectoryContents(targetDir: File, sourceDir: File) {
+        val target = targetDir.canonicalFile
+        val source = sourceDir.canonicalFile
+        if (target == source) return
+        require(target.isDirectory) { "目标图书目录不存在：${target.absolutePath}" }
+        require(source.isDirectory) { "完整图书目录不存在：${source.absolutePath}" }
+        val parent = target.parentFile ?: error("目标图书目录缺少父目录：${target.absolutePath}")
+        val backup = File(parent, ".${target.name}.replace-${System.currentTimeMillis()}")
+        if (backup.exists()) backup.deleteRecursively()
+        if (!target.renameTo(backup)) {
+            target.listFiles()?.forEach { it.deleteRecursively() }
+            source.copyRecursively(target, overwrite = true)
+            source.deleteRecursively()
+            return
+        }
+        runCatching {
+            if (!source.renameTo(target)) {
+                source.copyRecursively(target, overwrite = true)
+                source.deleteRecursively()
+            }
+            backup.deleteRecursively()
+        }.onFailure { error ->
+            target.deleteRecursively()
+            backup.renameTo(target)
+            throw error
+        }.getOrThrow()
+    }
+
     private fun syncOnlineCompletionImportedBookMetadata(bookshelf: Any, target: OnlineDownloadTarget, sourceUrl: String) {
         runCatching {
             val imported = findLocalBookByUrl(bookshelf, sourceUrl)
@@ -6964,7 +7041,7 @@ class WebDavDriveHook(
         done: Boolean,
     ): Boolean {
         val broadcastSent = sendOnlineCompletionNotificationBroadcast(context, id, title, text, progress, done)
-        val shouldStartActivity = shouldStartOnlineCompletionNotificationActivity(context, id, done, broadcastSent)
+        val shouldStartActivity = shouldStartOnlineCompletionNotificationActivity(id, done, broadcastSent)
         val activitySent = if (shouldStartActivity) {
             startOnlineCompletionNotificationActivity(context, id, title, text, progress, done)
         } else {
@@ -6981,32 +7058,18 @@ class WebDavDriveHook(
     }
 
     private fun shouldStartOnlineCompletionNotificationActivity(
-        context: Context,
         id: Int,
         done: Boolean,
         broadcastSent: Boolean,
     ): Boolean {
         if (done) return !broadcastSent
-        if (isOnlineCompletionModuleNotificationReady(context) && broadcastSent) return false
         val now = System.currentTimeMillis()
         val last = onlineCompletionModuleActivityPromptAt[id] ?: 0L
-        if (now - last < ONLINE_COMPLETION_MODULE_ACTIVITY_RETRY_MS) return false
+        if (last > 0L && broadcastSent) return false
+        if (last > 0L && now - last < ONLINE_COMPLETION_MODULE_ACTIVITY_RETRY_MS) return false
         onlineCompletionModuleActivityPromptAt[id] = now
         return true
     }
-
-    private fun isOnlineCompletionModuleNotificationReady(context: Context): Boolean =
-        runCatching {
-            val moduleContext = context.createPackageContext(MODULE_PACKAGE_NAME, 0)
-            val permissionGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
-                moduleContext.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
-            if (!permissionGranted) return@runCatching false
-            val manager = moduleContext.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
-            manager?.areNotificationsEnabled() != false
-        }.getOrElse {
-            logWebDav("online completion module notification readiness check failed: ${it.message ?: it.javaClass.name}")
-            false
-        }
 
     private fun startOnlineCompletionNotificationActivity(
         context: Context,
