@@ -6671,7 +6671,7 @@ class WebDavDriveHook(
                 "META-INF/container.xml",
                 """<?xml version="1.0" encoding="UTF-8"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>""",
             )
-            val coverExt = cover?.url?.substringBefore('?')?.substringAfterLast('.', "jpg")?.takeIf { it.length in 3..5 } ?: "jpg"
+            val coverExt = onlineCoverExt(cover)
             cover?.let {
                 writeBytesZipEntry(zip, "OEBPS/Images/cover.$coverExt", it.bytes)
                 writeTextZipEntry(zip, "OEBPS/Text/cover.xhtml", onlineCoverXhtml(target, coverExt))
@@ -7350,6 +7350,58 @@ img{max-width:100%;max-height:100%;height:auto;}
         uuid.removePrefix(ONLINE_COMPLETION_UUID_PREFIX)
             .substringBeforeLast('-', "")
             .ifBlank { "unknown" }
+
+    private fun onlineCoverExt(cover: OnlineBinaryPayload?): String =
+        cover?.let {
+            onlineCoverExtFromMime(it.mimeType)
+                ?: onlineCoverExtFromBytes(it.bytes)
+                ?: onlineCoverExtFromUrl(it.url)
+        } ?: "jpg"
+
+    private fun onlineCoverExtFromMime(mimeType: String): String? =
+        when (mimeType.substringBefore(';').trim().lowercase(Locale.ROOT)) {
+            "image/jpeg", "image/jpg" -> "jpg"
+            "image/png" -> "png"
+            "image/webp" -> "webp"
+            "image/gif" -> "gif"
+            else -> null
+        }
+
+    private fun onlineCoverExtFromBytes(bytes: ByteArray): String? =
+        when {
+            bytes.size >= 3 &&
+                bytes[0] == 0xFF.toByte() &&
+                bytes[1] == 0xD8.toByte() &&
+                bytes[2] == 0xFF.toByte() -> "jpg"
+            bytes.size >= 8 &&
+                bytes[0] == 0x89.toByte() &&
+                bytes[1] == 0x50.toByte() &&
+                bytes[2] == 0x4E.toByte() &&
+                bytes[3] == 0x47.toByte() -> "png"
+            bytes.size >= 6 &&
+                bytes[0] == 0x47.toByte() &&
+                bytes[1] == 0x49.toByte() &&
+                bytes[2] == 0x46.toByte() -> "gif"
+            bytes.size >= 12 &&
+                bytes[0] == 0x52.toByte() &&
+                bytes[1] == 0x49.toByte() &&
+                bytes[2] == 0x46.toByte() &&
+                bytes[3] == 0x46.toByte() &&
+                bytes[8] == 0x57.toByte() &&
+                bytes[9] == 0x45.toByte() &&
+                bytes[10] == 0x42.toByte() &&
+                bytes[11] == 0x50.toByte() -> "webp"
+            else -> null
+        }
+
+    private fun onlineCoverExtFromUrl(url: String): String =
+        url.substringBefore('?')
+            .substringBefore('#')
+            .substringAfterLast('.', "")
+            .lowercase(Locale.ROOT)
+            .takeIf { it in setOf("jpg", "jpeg", "png", "webp", "gif") }
+            ?.let { if (it == "jpeg") "jpg" else it }
+            ?: "jpg"
 
     private fun coverMimeType(ext: String): String =
         when (ext.lowercase(Locale.ROOT)) {
