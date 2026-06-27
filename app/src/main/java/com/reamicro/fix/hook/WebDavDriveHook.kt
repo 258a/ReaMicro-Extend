@@ -11,6 +11,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.net.Uri
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
@@ -38,6 +39,7 @@ import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -4587,7 +4589,27 @@ class WebDavDriveHook(
             val detail = onlineRuleValue(node, rule.optString("bookUrl", ""), baseUrl)
             val cover = onlineRuleValue(node, rule.optString("coverUrl", ""), baseUrl)
             val intro = onlineRuleValue(node, rule.optString("intro", ""), baseUrl).cleanOnlineText()
-            val chapterCount = onlineJsonInt(node, "$.chapter_count", "chapter_count", "$.total_chapters", "total_chapters")
+            val kind = onlineRuleValue(node, rule.optString("kind", ""), baseUrl).cleanOnlineText()
+            val wordCount = onlineRuleValue(node, rule.optString("wordCount", ""), baseUrl)
+                .ifBlank { onlineRuleValue(node, rule.optString("word_count", ""), baseUrl) }
+                .ifBlank { onlineJsonString(node, "word_number") }
+                .ifBlank { onlineJsonString(node, "word_count") }
+                .cleanOnlineText()
+            val updateTime = onlineRuleValue(node, rule.optString("updateTime", ""), baseUrl)
+                .ifBlank { onlineJsonString(node, "updated_at") }
+                .ifBlank { onlineJsonString(node, "last_chapter_update_time") }
+                .ifBlank { onlineJsonString(node, "last_chapter_first_pass_time") }
+                .ifBlank { onlineJsonString(node, "firstPassTime") }
+                .cleanOnlineText()
+            val chapterCount = onlineJsonInt(
+                node,
+                "$.chapter_count",
+                "chapter_count",
+                "$.total_chapters",
+                "total_chapters",
+                "chapterCount",
+                "chapter_count_total",
+            )
             OnlineBookSearchResult(
                 sourceName = source.name,
                 name = name,
@@ -4596,6 +4618,9 @@ class WebDavDriveHook(
                 detailUrl = resolveOnlineUrl(baseUrl, detail),
                 intro = intro,
                 chapterCount = chapterCount,
+                status = onlineCompletionStatusText(kind, node),
+                wordCount = formatOnlineWordCount(wordCount),
+                updateTime = formatOnlineUpdateTime(updateTime),
             )
         }.distinctBy { "${it.name}|${it.author}|${it.detailUrl}" }
             .take(ONLINE_COMPLETION_RESULT_LIMIT)
@@ -4613,6 +4638,9 @@ class WebDavDriveHook(
         val cover = firstJsonString(json, "coverUrl", "cover", "img", "image", "bookCover")
         val intro = firstJsonString(json, "intro", "desc", "description", "bookDesc").cleanOnlineText()
         val chapterCount = onlineJsonInt(json, "$.chapter_count", "chapter_count", "$.total_chapters", "total_chapters")
+        val kind = firstJsonString(json, "kind", "category", "tags")
+        val wordCount = firstJsonString(json, "wordCount", "word_count", "word_number", "words")
+        val updateTime = firstJsonString(json, "updateTime", "updated_at", "last_chapter_update_time", "last_chapter_first_pass_time")
         return OnlineBookSearchResult(
             sourceName = source.name,
             name = name,
@@ -4621,6 +4649,9 @@ class WebDavDriveHook(
             detailUrl = resolveOnlineUrl(baseUrl, detail),
             intro = intro,
             chapterCount = chapterCount,
+            status = onlineCompletionStatusText(kind, json),
+            wordCount = formatOnlineWordCount(wordCount),
+            updateTime = formatOnlineUpdateTime(updateTime),
         )
     }
 
@@ -4664,6 +4695,84 @@ class WebDavDriveHook(
             .map { json.optString(it, "").trim() }
             .firstOrNull { it.isNotBlank() && it != "null" }
             .orEmpty()
+
+    private fun onlineCompletionSearchMetaLine(result: OnlineBookSearchResult): String =
+        listOfNotNull(
+            result.status.ifBlank { null },
+            result.wordCount.ifBlank { null },
+            result.chapterCount.takeIf { it > 0 }?.let { "${it}章" },
+            result.updateTime.ifBlank { null },
+        ).joinToString(" / ").ifBlank { result.sourceName.ifBlank { ONLINE_COMPLETION_TITLE } }
+
+    private fun onlineCompletionStatusText(kind: String, node: Any?): String {
+        val text = kind.cleanOnlineText()
+        val statusSource = text.ifBlank {
+            sequenceOf(
+                "status",
+                "bookStatus",
+                "book_status",
+                "creation_status",
+                "tomato_book_status",
+                "is_finish",
+                "complete",
+                "finished",
+            ).map { onlineJsonString(node, it) }
+                .firstOrNull { it.isNotBlank() }
+                .orEmpty()
+        }
+        val normalized = statusSource.lowercase(Locale.ROOT)
+        return when {
+            statusSource.contains("连载") || normalized in setOf("1", "serial", "ongoing", "false") -> "连载"
+            statusSource.contains("完结") || statusSource.contains("已完") ||
+                normalized in setOf("0", "2", "3", "4", "finish", "finished", "complete", "completed", "true") -> "完结"
+            statusSource.contains("断更") -> "断更"
+            else -> ""
+        }
+    }
+
+    private fun formatOnlineWordCount(raw: String): String {
+        val text = raw.cleanOnlineText()
+        if (text.isBlank()) return ""
+        if (text.contains("字")) return text
+        val number = text.replace(",", "").trim().toLongOrNull() ?: return text
+        return if (number >= 10_000L) {
+            val value = number / 10_000.0
+            val formatted = if (number % 10_000L == 0L) {
+                (number / 10_000L).toString()
+            } else {
+                String.format(Locale.ROOT, "%.1f", value).trimEnd('0').trimEnd('.')
+            }
+            "${formatted}万字"
+        } else {
+            "${number}字"
+        }
+    }
+
+    private fun formatOnlineUpdateTime(raw: String): String {
+        val text = raw.cleanOnlineText()
+        if (text.isBlank()) return ""
+        val numeric = text.toLongOrNull()
+        if (numeric != null && numeric > 0L) {
+            val millis = if (numeric < 10_000_000_000L) numeric * 1000L else numeric
+            return SimpleDateFormat("yyyy MM dd", Locale.getDefault()).format(java.util.Date(millis))
+        }
+        val normalized = text.replace('T', ' ').replace(Regex("""\.\d+Z?$"""), "").trim()
+        val parsed = listOf(
+            "yyyy-MM-dd HH:mm:ss",
+            "yyyy-MM-dd HH:mm",
+            "yyyy-MM-dd",
+            "yyyy/MM/dd HH:mm:ss",
+            "yyyy/MM/dd HH:mm",
+            "yyyy/MM/dd",
+        ).asSequence().mapNotNull { pattern ->
+            runCatching { SimpleDateFormat(pattern, Locale.getDefault()).parse(normalized) }.getOrNull()
+        }.firstOrNull()
+        return if (parsed != null) {
+            SimpleDateFormat("yyyy MM dd", Locale.getDefault()).format(parsed)
+        } else {
+            normalized.take(10).replace('-', ' ').replace('/', ' ')
+        }
+    }
 
     private fun onlineRuleValue(node: Any?, rawRule: String, baseUrl: String, query: String? = null): String {
         var rule = rawRule.trim()
@@ -5150,6 +5259,10 @@ class WebDavDriveHook(
                 functionProxy("WebDavHomeSearchItem", FUNCTION3_CLASS) { args ->
                     val item = args?.getOrNull(0) ?: return@functionProxy targetUnit()
                     val composer = args.getOrNull(1) ?: return@functionProxy targetUnit()
+                    if (isOnlineCompletionRenderType(type)) {
+                        renderOnlineCompletionHomeSearchSection(title, results, composer)
+                        return@functionProxy targetUnit()
+                    }
                     val render = {
                         method(HOME_SEARCH_BAR_CLASS, HOME_CLOUD_RESULT_LIST_METHOD, 6).invoke(
                             null,
@@ -5181,13 +5294,6 @@ class WebDavDriveHook(
                         } finally {
                             popLocalLibraryIcon()
                         }
-                    } else if (isOnlineCompletionRenderType(type)) {
-                        pushOnlineCompletionCloudTitle(onlineCompletionTitleForType(type, title))
-                        try {
-                            withWebDavIcon { render() }
-                        } finally {
-                            popOnlineCompletionCloudTitle()
-                        }
                     } else {
                         withWebDavIcon { render() }
                     }
@@ -5205,6 +5311,152 @@ class WebDavDriveHook(
         }.onFailure {
             XposedBridge.log("$LOG_PREFIX failed to render WebDAV home search section: ${it.stackTraceToString()}")
         }
+    }
+
+    private fun renderOnlineCompletionHomeSearchSection(title: String, results: List<*>, composer: Any) {
+        val factory = functionProxy("OnlineCompletionHomeSearchAndroidView", FUNCTION1_CLASS) { args ->
+            val context = args?.getOrNull(0) as? Context
+                ?: activityProvider()
+                ?: error("No context for online completion search rows")
+            createOnlineCompletionSearchRowsView(context, title, results)
+        }
+        runCatching {
+            cls(ANDROID_VIEW_KT_CLASS).declaredMethods.first {
+                it.name == ANDROID_VIEW_METHOD && it.parameterTypes.size == 6
+            }.apply { isAccessible = true }.invoke(
+                null,
+                factory,
+                fillMaxWidthModifier(),
+                null,
+                composer,
+                0,
+                4,
+            )
+        }.onFailure {
+            XposedBridge.log("$LOG_PREFIX failed to render online completion search rows: ${it.stackTraceToString()}")
+        }
+    }
+
+    private fun createOnlineCompletionSearchRowsView(context: Context, title: String, results: List<*>): View {
+        val primary = context.resolveThemeColor(android.R.attr.textColorPrimary, Color.rgb(34, 34, 34))
+        val secondary = context.resolveThemeColor(android.R.attr.textColorSecondary, Color.rgb(102, 102, 102))
+        val tertiary = Color.rgb(132, 132, 132)
+        val container = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(context.dp(18), context.dp(8), context.dp(18), context.dp(4))
+        }
+        container.addView(TextView(context).apply {
+            text = title.ifBlank { ONLINE_COMPLETION_TITLE }
+            setTextColor(secondary)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            setPadding(0, 0, 0, context.dp(8))
+        })
+        val rendered = results.mapNotNull { rawBook ->
+            val book = rawBook ?: return@mapNotNull null
+            val path = cloudPathOf(book)
+            onlineCompletionSearchTargets[path]?.let { target -> book to target }
+        }
+        if (rendered.isEmpty()) {
+            container.addView(TextView(context).apply {
+                text = "暂无可下载结果"
+                setTextColor(tertiary)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                setPadding(0, context.dp(6), 0, context.dp(12))
+            })
+            return container
+        }
+        rendered.forEach { (book, target) ->
+            container.addView(
+                createOnlineCompletionSearchRowView(
+                    context = context,
+                    book = book,
+                    target = target,
+                    primary = primary,
+                    secondary = secondary,
+                    tertiary = tertiary,
+                ),
+            )
+        }
+        return container
+    }
+
+    private fun createOnlineCompletionSearchRowView(
+        context: Context,
+        book: Any,
+        target: OnlineDownloadTarget,
+        primary: Int,
+        secondary: Int,
+        tertiary: Int,
+    ): View {
+        val row = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            minimumHeight = context.dp(84)
+            setPadding(0, context.dp(6), 0, context.dp(8))
+            setOnClickListener { handleOnlineCompletionSearchTap(book) }
+        }
+        val cover = ImageView(context).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            background = roundedDrawable(Color.rgb(232, 232, 232), context.dp(4).toFloat())
+        }
+        row.addView(cover, LinearLayout.LayoutParams(context.dp(46), context.dp(62)).apply {
+            rightMargin = context.dp(12)
+        })
+        loadOnlineCompletionSearchCover(cover, target.result.coverUrl)
+
+        val texts = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        texts.addView(TextView(context).apply {
+            text = target.result.name.ifBlank { "未命名" }
+            setTextColor(primary)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        })
+        texts.addView(TextView(context).apply {
+            text = target.result.author.ifBlank { "未知作者" }
+            setTextColor(secondary)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            setPadding(0, context.dp(3), 0, 0)
+        })
+        texts.addView(TextView(context).apply {
+            text = onlineCompletionSearchMetaLine(target.result)
+            setTextColor(tertiary)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            setPadding(0, context.dp(3), 0, 0)
+        })
+        row.addView(texts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        return row
+    }
+
+    private fun loadOnlineCompletionSearchCover(imageView: ImageView, coverUrl: String) {
+        val url = coverUrl.trim()
+        if (url.isBlank()) return
+        Thread({
+            runCatching {
+                val connection = URL(url).openConnection().apply {
+                    connectTimeout = 4_000
+                    readTimeout = 6_000
+                }
+                connection.getInputStream().use { input -> BitmapFactory.decodeStream(input) }
+            }.onSuccess { bitmap ->
+                if (bitmap != null) {
+                    Handler(Looper.getMainLooper()).post {
+                        imageView.setImageBitmap(bitmap)
+                    }
+                }
+            }.onFailure {
+                logWebDav("online completion cover preview failed url=${url.take(120)} error=${it.message.orEmpty()}")
+            }
+        }, "ReaMicroOnlineSearchCover").start()
     }
 
     private fun newCloudFolder(entry: WebDavEntry): Any =
@@ -10091,6 +10343,9 @@ img{max-width:100%;max-height:100%;height:auto;}
         val detailUrl: String,
         val intro: String,
         val chapterCount: Int = 0,
+        val status: String = "",
+        val wordCount: String = "",
+        val updateTime: String = "",
     )
 
     private data class OnlineDownloadTarget(
