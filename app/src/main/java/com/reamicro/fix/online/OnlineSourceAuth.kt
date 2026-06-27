@@ -26,6 +26,14 @@ object OnlineSourceAuth {
         return if (cookie.isBlank()) emptyMap() else mapOf("Cookie" to cookie)
     }
 
+    fun hasSavedLogin(context: Context?, source: OnlineSourceEntry): Boolean {
+        val prefs = prefs(context) ?: return false
+        val cookie = prefs.getString(KEY_COOKIE_PREFIX + source.id, "").orEmpty()
+        val username = prefs.getString(KEY_USER_PREFIX + source.id, "").orEmpty()
+        val password = prefs.getString(KEY_PASSWORD_PREFIX + source.id, "").orEmpty()
+        return cookie.isNotBlank() || (username.isNotBlank() && password.isNotBlank())
+    }
+
     fun loginWithSavedCredentials(context: Context?, source: OnlineSourceEntry): OnlineSourceAuthResult {
         val prefs = prefs(context) ?: return OnlineSourceAuthResult(false, "缺少设置存储")
         val username = prefs.getString(KEY_USER_PREFIX + source.id, "").orEmpty()

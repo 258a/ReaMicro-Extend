@@ -1891,16 +1891,25 @@ class ReaMicroSettingsHook(
     }
 
     private fun onlineSourceSubtitle(source: OnlineSourceEntry): String {
-        val login = when {
-            source.webLoginUrl.isNotBlank() -> "网页登录"
-            source.hasLoginConfig -> "有登录配置，可跳过"
-            else -> "无需登录"
+        val tags = mutableListOf<String>()
+        when {
+            OnlineSourceAuth.hasSavedLogin(activityProvider()?.applicationContext, source) -> tags += "已登录"
+            source.webLoginUrl.isNotBlank() || OnlineSourceAuth.supportsCredentialLogin(source) -> {
+                tags += "可登录"
+                tags += "可跳过"
+            }
+            source.hasLoginConfig -> {
+                tags += "有登录配置"
+                tags += "可跳过"
+            }
+            else -> tags += "免登录"
         }
         val rate = source.concurrentRate
             .compactOnlineSourceLine()
             .takeIf { it.isNotBlank() && it != "0" }
-            ?.let { "频控：$it" }
-        return listOfNotNull(login, rate).joinToString(" · ")
+            ?.let { "频控 $it" }
+        rate?.let { tags += it }
+        return tags.joinToString(" · ")
     }
 
     private fun String.compactOnlineSourceLine(): String =
@@ -1992,6 +2001,7 @@ class ReaMicroSettingsHook(
             if (confirmed) {
                 settings.setOnlineSourceEnabled(source.id, true)
                 updateChecked(true)
+                bumpOnlineSourceVersion()
                 showToast("已启用在线源：${source.name}")
             } else {
                 settings.setOnlineSourceEnabled(source.id, false)
