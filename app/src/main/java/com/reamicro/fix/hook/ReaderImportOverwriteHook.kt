@@ -27,6 +27,52 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 
+object OnlineCompletionImportSignal {
+    private data class Mark(
+        val uuid: String,
+        val title: String,
+        val uri: String,
+        val createdAtMs: Long,
+    )
+
+    private val marks = ConcurrentHashMap<String, Mark>()
+
+    fun remember(uuid: String, title: String, uri: String) {
+        cleanup()
+        val mark = Mark(
+            uuid = uuid.trim(),
+            title = title.normalizedSignalTitle(),
+            uri = uri.trim(),
+            createdAtMs = System.currentTimeMillis(),
+        )
+        listOf(mark.uuid, mark.uri, mark.title)
+            .filter { it.isNotBlank() }
+            .forEach { marks[it] = mark }
+    }
+
+    fun forget(uuid: String, title: String, uri: String) {
+        listOf(uuid.trim(), uri.trim(), title.normalizedSignalTitle())
+            .filter { it.isNotBlank() }
+            .forEach { marks.remove(it) }
+    }
+
+    fun matches(uuid: String, title: String, uri: String): Boolean {
+        cleanup()
+        return listOf(uuid.trim(), uri.trim(), title.normalizedSignalTitle())
+            .any { it.isNotBlank() && marks.containsKey(it) }
+    }
+
+    private fun cleanup() {
+        val now = System.currentTimeMillis()
+        marks.entries.removeAll { (_, mark) -> now - mark.createdAtMs > MARK_TTL_MS }
+    }
+
+    private fun String.normalizedSignalTitle(): String =
+        trim().replace(Regex("\\s+"), " ")
+
+    private const val MARK_TTL_MS = 30 * 60_000L
+}
+
 class ReaderImportOverwriteHook(
     private val classLoader: ClassLoader,
     private val activityProvider: () -> Activity?,
@@ -56,6 +102,7 @@ class ReaderImportOverwriteHook(
                     val title = resolveImportTitle(opf, param.args?.getOrNull(0)) ?: "未命名"
                     val uuid = resolveImportUuid(opf).orEmpty()
                     if (uuid.isBlank() && uriOverride.isBlank() && title.isBlank()) return
+                    val signaledOnlineImport = OnlineCompletionImportSignal.matches(uuid, title, uriOverride)
 
                     consumePreImportDecision(uuid, title)?.let { preDecision ->
                         applyPreImportDecision(param, opf, uuid, preDecision)
@@ -67,10 +114,10 @@ class ReaderImportOverwriteHook(
                         "$LOG_PREFIX overwrite check intercepted: title=$title, uuid=$uuid, uri=$uriOverride, conflict=$conflict",
                     )
 
-                    val decision = if (isOnlineCompletionImport(uuid, uriOverride, conflict)) {
+                    val decision = if (signaledOnlineImport || isOnlineCompletionImport(uuid, uriOverride, conflict)) {
                         XposedBridge.log(
                             "$LOG_PREFIX online completion overwrite forced silently: title=$title, " +
-                                "uuid=$uuid uri=$uriOverride oldBook=${conflict.oldUuid}",
+                                "uuid=$uuid uri=$uriOverride signaled=$signaledOnlineImport oldBook=${conflict.oldUuid}",
                         )
                         OverwriteDecision.OVERWRITE
                     } else {
@@ -168,15 +215,16 @@ class ReaderImportOverwriteHook(
                     val opf = obtainOpf(unzipDir) ?: return
                     val title = resolveImportTitle(opf, null) ?: return
                     val uuid = resolveImportUuid(opf).orEmpty()
+                    val signaledOnlineImport = OnlineCompletionImportSignal.matches(uuid, title, "")
                     val conflict = findImportConflict(repository, uuid, "", title) ?: return
                     val existingBook = conflict.oldBook
                     XposedBridge.log(
                         "$LOG_PREFIX pre-import conflict intercepted: title=$title, uuid=$uuid, conflict=$conflict",
                     )
-                    val decision = if (isOnlineCompletionImport(uuid, "", conflict)) {
+                    val decision = if (signaledOnlineImport || isOnlineCompletionImport(uuid, "", conflict)) {
                         XposedBridge.log(
                             "$LOG_PREFIX online completion pre-import overwrite forced silently: " +
-                                "title=$title, uuid=$uuid oldBook=${conflict.oldUuid}",
+                                "title=$title, uuid=$uuid signaled=$signaledOnlineImport oldBook=${conflict.oldUuid}",
                         )
                         OverwriteDecision.OVERWRITE
                     } else {

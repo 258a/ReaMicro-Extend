@@ -80,6 +80,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.locks.ReentrantLock
 import java.util.zip.CRC32
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
@@ -172,6 +173,7 @@ class WebDavDriveHook(
     private val onlineCompletionRunningDownloads = ConcurrentHashMap<String, Boolean>()
     private val onlineCompletionRunningUpdates = ConcurrentHashMap<String, Boolean>()
     private val onlineCompletionPublisherCleanupIds = ConcurrentHashMap.newKeySet<String>()
+    private val onlineCompletionImportLock = ReentrantLock(true)
     private val onlineCompletionNotificationIds = AtomicInteger(4300)
     private val onlineCompletionNotificationBlockedLogged = AtomicBoolean(false)
     private val onlineCompletionModuleActivityPromptAt = ConcurrentHashMap<Int, Long>()
@@ -5915,7 +5917,6 @@ class WebDavDriveHook(
         }
         Thread({
             var partialImportThread: Thread? = null
-            val partialImportSucceeded = AtomicBoolean(false)
             runCatching {
                 val localFile = importCacheFile(
                     context.cacheDir,
@@ -5933,14 +5934,22 @@ class WebDavDriveHook(
                         progressNotifier.running(48, "正在导入前 $count 章", force = true)
                         partialImportThread = Thread({
                             val partialImported = runCatching {
-                                importOnlineCompletionBook(partialFile, target)
+                                importOnlineCompletionBook(
+                                    file = partialFile,
+                                    target = target,
+                                    onWaiting = {
+                                        progressNotifier.running(48, "等待导入队列：前 $count 章", force = true)
+                                    },
+                                    onStarted = {
+                                        progressNotifier.running(48, "正在导入前 $count 章", force = true)
+                                    },
+                                )
                             }.onFailure { error ->
                                 logWebDav(
                                     "online completion partial import failed but download continues: " +
                                         "${error.message ?: error.javaClass.name}",
                                 )
                             }.getOrDefault(false)
-                            if (partialImported) partialImportSucceeded.set(true)
                             val continueMessage = if (partialImported) {
                                 "已导入前 $count 章，继续下载"
                             } else {
@@ -5956,18 +5965,17 @@ class WebDavDriveHook(
                     progressNotifier.running(90, "等待前 100 章导入完成", force = true)
                     thread.join()
                 }
-                if (partialImportSucceeded.get()) {
-                    progressNotifier.running(94, "正在更新完整章节", force = true)
-                    val replaced = replaceOnlineCompletionImportedBook(localFile, target)
-                    if (!replaced) {
-                        logWebDav("online completion final replace missed existing book; falling back to importBook")
-                        progressNotifier.running(94, "正在导入阅微", force = true)
-                        importOnlineCompletionBook(localFile, target)
-                    }
-                } else {
-                    progressNotifier.running(94, "正在导入阅微", force = true)
-                    importOnlineCompletionBook(localFile, target)
-                }
+                progressNotifier.running(94, "正在导入完整章节", force = true)
+                importOnlineCompletionBook(
+                    file = localFile,
+                    target = target,
+                    onWaiting = {
+                        progressNotifier.running(94, "等待导入队列", force = true)
+                    },
+                    onStarted = {
+                        progressNotifier.running(94, "正在导入完整章节", force = true)
+                    },
+                )
                 progressNotifier.finish("已导入阅微", target.result.detailUrl, success = true)
                 logWebDav("online completion download imported file=${localFile.absolutePath} size=${localFile.length()}")
                 Handler(Looper.getMainLooper()).post {
@@ -6721,134 +6729,80 @@ class WebDavDriveHook(
         }
     }
 
-    private fun importOnlineCompletionBook(file: File, target: OnlineDownloadTarget): Boolean {
-        val bookshelf = currentBookshelfRepository() ?: error("阅微导入服务暂不可用，请先打开书架后重试")
-        val unzipDirFile = unzipOnlineCompletionEpub(file)
-        val unzipDir = okioPath(unzipDirFile)
-        val booksDir = currentOnlineCompletionBooksDir(bookshelf)
-        val imported = importOnlineCompletionEpubDirectory(unzipDir, booksDir)
-        val bookDir = imported.first
-        val opf = imported.second
-        val platformFile = platformFile(file)
-        rememberPendingWebDavImport(
-            platformFile = platformFile,
-            localFile = file,
-            sourceUrl = target.result.detailUrl.ifBlank { target.source.sourceUrl },
-            sourceSize = file.length(),
-        )
-        logWebDav(
-            "online completion epub imported dir=$bookDir " +
-                "title=${callStringPath(opf, "metadata", "title", "value")} " +
-                "uuid=${callStringPath(opf, "metadata", "uuid", "value")}",
-        )
-        val importMethod = (bookshelf.javaClass.methods.asSequence() + bookshelf.javaClass.declaredMethods.asSequence())
-            .first { it.name == "importBook" && it.parameterTypes.size == 6 }
-            .apply { isAccessible = true }
-        val result = invokeSuspendBlocking(
-            importMethod,
-            bookshelf,
-            platformFile,
-            bookDir,
-            opf,
-            target.result.detailUrl.ifBlank { target.source.sourceUrl },
-            java.lang.Long.valueOf(file.length()),
-        )
-        syncOnlineCompletionImportedBookMetadata(
-            bookshelf = bookshelf,
-            target = target,
-            sourceUrl = target.result.detailUrl.ifBlank { target.source.sourceUrl },
-        )
-        logWebDav("online completion importBook result=$result file=${file.absolutePath} size=${file.length()}")
-        if (result != true) {
-            logWebDav(
-                "online completion importBook returned non-true after epub directory import; " +
-                    "treating as non-fatal result=$result file=${file.absolutePath}",
-            )
+    private fun importOnlineCompletionBook(
+        file: File,
+        target: OnlineDownloadTarget,
+        onWaiting: (() -> Unit)? = null,
+        onStarted: (() -> Unit)? = null,
+    ): Boolean {
+        var locked = onlineCompletionImportLock.tryLock()
+        if (!locked) {
+            logWebDav("online completion import queued book=${target.result.name} file=${file.name}")
+            onWaiting?.invoke()
+            onlineCompletionImportLock.lock()
+            locked = true
         }
-        return true
+        return try {
+            onStarted?.invoke()
+            importOnlineCompletionBookLocked(file, target)
+        } finally {
+            if (locked) onlineCompletionImportLock.unlock()
+        }
     }
 
-    private fun replaceOnlineCompletionImportedBook(file: File, target: OnlineDownloadTarget): Boolean {
+    private fun importOnlineCompletionBookLocked(file: File, target: OnlineDownloadTarget): Boolean {
         val bookshelf = currentBookshelfRepository() ?: error("阅微导入服务暂不可用，请先打开书架后重试")
-        val existing = findOnlineCompletionImportedBook(bookshelf, target) ?: return false
-        val existingDir = bookDirectory(existing).canonicalFile
-        if (!existingDir.isDirectory) return false
-        val unzipDirFile = unzipOnlineCompletionEpub(file)
-        val imported = importOnlineCompletionEpubDirectory(okioPath(unzipDirFile), currentOnlineCompletionBooksDir(bookshelf))
-        val importedDir = okioPathToFile(imported.first).canonicalFile
-        replaceDirectoryContents(existingDir, importedDir)
-        runCatching { unzipDirFile.deleteRecursively() }
-        val latest = findLocalBookByUuid(existing.callLong("getUid"), existing.callString("getUuid")) ?: existing
-        val size = bookDirectorySize(existingDir)
-        val updated = copyBookWithBackupAndPublisher(
-            book = latest,
-            backupType = BACKUP_TYPE_ONLINE_COMPLETION,
-            backupId = onlineImportedBookBackupId(target),
-            backupCode = target.source.id,
-            publisher = "",
-            cover = latest.callString("getCover").ifBlank { target.result.coverUrl },
-            size = size,
-            updated = System.currentTimeMillis(),
-        )
-        updateLocalBook(updated)
-        logWebDav(
-            "online completion final book directory replaced uuid=${updated.callString("getUuid")} " +
-                "dir=${existingDir.absolutePath} size=$size",
-        )
-        return true
-    }
-
-    private fun findOnlineCompletionImportedBook(bookshelf: Any, target: OnlineDownloadTarget): Any? {
         val sourceUrl = target.result.detailUrl.ifBlank { target.source.sourceUrl }
-        return findLocalBookByUrl(bookshelf, sourceUrl)
-            ?: findLocalBookByUrl(bookshelf, target.result.detailUrl)
-            ?: findLocalBookByUuid(currentBookshelfUid(bookshelf), onlineBookUuid(target))
-    }
-
-    private fun currentBookshelfUid(bookshelf: Any): Long {
-        val userStorage = fieldValue(bookshelf, "userStorage")
-            ?: bookshelf.javaClass.methods.firstOrNull { it.name == "getUserStorage" && it.parameterTypes.isEmpty() }
-                ?.apply { isAccessible = true }
-                ?.invoke(bookshelf)
-            ?: return 0L
-        return (fieldValue(userStorage, "uid") as? Number)?.toLong()
-            ?: userStorage.javaClass.methods.firstOrNull { it.name == "getUid" && it.parameterTypes.isEmpty() }
-                ?.apply { isAccessible = true }
-                ?.invoke(userStorage)
-                ?.let { it as? Number }
-                ?.toLong()
-            ?: 0L
-    }
-
-    private fun okioPathToFile(path: Any): File =
-        File(path.toString())
-
-    private fun replaceDirectoryContents(targetDir: File, sourceDir: File) {
-        val target = targetDir.canonicalFile
-        val source = sourceDir.canonicalFile
-        if (target == source) return
-        require(target.isDirectory) { "目标图书目录不存在：${target.absolutePath}" }
-        require(source.isDirectory) { "完整图书目录不存在：${source.absolutePath}" }
-        val parent = target.parentFile ?: error("目标图书目录缺少父目录：${target.absolutePath}")
-        val backup = File(parent, ".${target.name}.replace-${System.currentTimeMillis()}")
-        if (backup.exists()) backup.deleteRecursively()
-        if (!target.renameTo(backup)) {
-            target.listFiles()?.forEach { it.deleteRecursively() }
-            source.copyRecursively(target, overwrite = true)
-            source.deleteRecursively()
-            return
-        }
-        runCatching {
-            if (!source.renameTo(target)) {
-                source.copyRecursively(target, overwrite = true)
-                source.deleteRecursively()
+        val importUuid = onlineBookUuid(target)
+        val importTitle = target.result.name
+        OnlineCompletionImportSignal.remember(importUuid, importTitle, sourceUrl)
+        return try {
+            val unzipDirFile = unzipOnlineCompletionEpub(file)
+            val unzipDir = okioPath(unzipDirFile)
+            val booksDir = currentOnlineCompletionBooksDir(bookshelf)
+            val imported = importOnlineCompletionEpubDirectory(unzipDir, booksDir)
+            val bookDir = imported.first
+            val opf = imported.second
+            val platformFile = platformFile(file)
+            rememberPendingWebDavImport(
+                platformFile = platformFile,
+                localFile = file,
+                sourceUrl = sourceUrl,
+                sourceSize = file.length(),
+            )
+            logWebDav(
+                "online completion epub imported dir=$bookDir " +
+                    "title=${callStringPath(opf, "metadata", "title", "value")} " +
+                    "uuid=${callStringPath(opf, "metadata", "uuid", "value")}",
+            )
+            val importMethod = (bookshelf.javaClass.methods.asSequence() + bookshelf.javaClass.declaredMethods.asSequence())
+                .first { it.name == "importBook" && it.parameterTypes.size == 6 }
+                .apply { isAccessible = true }
+            val result = invokeSuspendBlocking(
+                importMethod,
+                bookshelf,
+                platformFile,
+                bookDir,
+                opf,
+                sourceUrl,
+                java.lang.Long.valueOf(file.length()),
+            )
+            syncOnlineCompletionImportedBookMetadata(
+                bookshelf = bookshelf,
+                target = target,
+                sourceUrl = sourceUrl,
+            )
+            logWebDav("online completion importBook result=$result file=${file.absolutePath} size=${file.length()}")
+            if (result != true) {
+                logWebDav(
+                    "online completion importBook returned non-true after epub directory import; " +
+                        "treating as non-fatal result=$result file=${file.absolutePath}",
+                )
             }
-            backup.deleteRecursively()
-        }.onFailure { error ->
-            target.deleteRecursively()
-            backup.renameTo(target)
-            throw error
-        }.getOrThrow()
+            true
+        } finally {
+            OnlineCompletionImportSignal.forget(importUuid, importTitle, sourceUrl)
+        }
     }
 
     private fun syncOnlineCompletionImportedBookMetadata(bookshelf: Any, target: OnlineDownloadTarget, sourceUrl: String) {
