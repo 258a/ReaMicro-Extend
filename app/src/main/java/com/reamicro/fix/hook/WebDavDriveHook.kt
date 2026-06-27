@@ -5230,11 +5230,23 @@ class WebDavDriveHook(
                             setTrackedWorkState(tracker, workId, "Running", 48, null, null, "${target.result.name}：导入前 $count 章")
                         }
                         updateOnlineCompletionNotification(context, notificationId, target.result.name, "正在导入前 $count 章", 48, false)
-                        importOnlineCompletionBook(partialFile, target)
+                        val partialImported = runCatching {
+                            importOnlineCompletionBook(partialFile, target)
+                        }.onFailure { error ->
+                            logWebDav(
+                                "online completion partial import failed but download continues: " +
+                                    "${error.message ?: error.javaClass.name}",
+                            )
+                        }.getOrDefault(false)
+                        val continueMessage = if (partialImported) {
+                            "已导入前 $count 章，继续下载"
+                        } else {
+                            "前 $count 章已写入，继续下载"
+                        }
                         if (tracker != null && workId != null) {
                             setTrackedWorkState(tracker, workId, "Running", 50, null, null, "${target.result.name}：继续下载")
                         }
-                        updateOnlineCompletionNotification(context, notificationId, target.result.name, "已导入前 $count 章，继续下载", 50, false)
+                        updateOnlineCompletionNotification(context, notificationId, target.result.name, continueMessage, 50, false)
                     },
                 )
                 if (tracker != null && workId != null) {
@@ -5788,7 +5800,7 @@ class WebDavDriveHook(
         }
     }
 
-    private fun importOnlineCompletionBook(file: File, target: OnlineDownloadTarget) {
+    private fun importOnlineCompletionBook(file: File, target: OnlineDownloadTarget): Boolean {
         val bookshelf = currentBookshelfRepository() ?: error("阅微导入服务暂不可用，请先打开书架后重试")
         val unzipDirFile = unzipOnlineCompletionEpub(file)
         val unzipDir = okioPath(unzipDirFile)
@@ -5822,8 +5834,12 @@ class WebDavDriveHook(
         )
         logWebDav("online completion importBook result=$result file=${file.absolutePath} size=${file.length()}")
         if (result != true) {
-            error("阅微导入返回失败：$result")
+            logWebDav(
+                "online completion importBook returned non-true after epub directory import; " +
+                    "treating as non-fatal result=$result file=${file.absolutePath}",
+            )
         }
+        return result == true
     }
 
     private fun currentOnlineCompletionBooksDir(bookshelf: Any): Any {
