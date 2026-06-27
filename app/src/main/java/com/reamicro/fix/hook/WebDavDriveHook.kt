@@ -1,5 +1,6 @@
 ﻿package com.reamicro.fix.hook
 
+import android.Manifest
 import android.app.Activity
 import android.app.Dialog
 import android.app.Notification
@@ -7,6 +8,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.graphics.Canvas
 import android.graphics.Color
@@ -174,7 +176,7 @@ class WebDavDriveHook(
     private val onlineCompletionPublisherCleanupIds = ConcurrentHashMap.newKeySet<String>()
     private val onlineCompletionNotificationIds = AtomicInteger(4300)
     private val onlineCompletionNotificationBlockedLogged = AtomicBoolean(false)
-    private val onlineCompletionModuleActivityStarted = ConcurrentHashMap.newKeySet<Int>()
+    private val onlineCompletionModuleActivityPromptAt = ConcurrentHashMap<Int, Long>()
     @Volatile private var lastHomeSearchViewModelRef: WeakReference<Any>? = null
     @Volatile private var lastHomeSearchQuery: String = ""
     @Volatile private var lastHomeSearchWebDavResults: List<Any> = emptyList()
@@ -6961,30 +6963,50 @@ class WebDavDriveHook(
         progress: Int,
         done: Boolean,
     ): Boolean {
-        val moduleAlreadyStarted = onlineCompletionModuleActivityStarted.contains(id)
         val broadcastSent = sendOnlineCompletionNotificationBroadcast(context, id, title, text, progress, done)
-        val shouldStartActivity = !moduleAlreadyStarted || done || !broadcastSent
+        val shouldStartActivity = shouldStartOnlineCompletionNotificationActivity(context, id, done, broadcastSent)
         val activitySent = if (shouldStartActivity) {
-            if (startOnlineCompletionNotificationActivity(context, id, title, text, progress, done)) {
-                onlineCompletionModuleActivityStarted.add(id)
-                true
-            } else {
-                false
-            }
+            startOnlineCompletionNotificationActivity(context, id, title, text, progress, done)
         } else {
             false
         }
+        if (done) onlineCompletionModuleActivityPromptAt.remove(id)
         if (broadcastSent) {
-            if (done) onlineCompletionModuleActivityStarted.remove(id)
             return true
         }
         if (activitySent) {
-            if (done) onlineCompletionModuleActivityStarted.remove(id)
             return true
         }
-        if (done) onlineCompletionModuleActivityStarted.remove(id)
         return false
     }
+
+    private fun shouldStartOnlineCompletionNotificationActivity(
+        context: Context,
+        id: Int,
+        done: Boolean,
+        broadcastSent: Boolean,
+    ): Boolean {
+        if (done) return !broadcastSent
+        if (isOnlineCompletionModuleNotificationReady(context) && broadcastSent) return false
+        val now = System.currentTimeMillis()
+        val last = onlineCompletionModuleActivityPromptAt[id] ?: 0L
+        if (now - last < ONLINE_COMPLETION_MODULE_ACTIVITY_RETRY_MS) return false
+        onlineCompletionModuleActivityPromptAt[id] = now
+        return true
+    }
+
+    private fun isOnlineCompletionModuleNotificationReady(context: Context): Boolean =
+        runCatching {
+            val moduleContext = context.createPackageContext(MODULE_PACKAGE_NAME, 0)
+            val permissionGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+                moduleContext.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+            if (!permissionGranted) return@runCatching false
+            val manager = moduleContext.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            manager?.areNotificationsEnabled() != false
+        }.getOrElse {
+            logWebDav("online completion module notification readiness check failed: ${it.message ?: it.javaClass.name}")
+            false
+        }
 
     private fun startOnlineCompletionNotificationActivity(
         context: Context,
@@ -7180,8 +7202,7 @@ $paragraphs
             if (targetIndex == target.length) break
         }
         if (targetIndex != target.length || removeEnd < 0) return null
-        return line.substring(removeEnd)
-            .trimStart { it.isWhitespace() || it in "　:：、，,。.!！?？-—_；;]" }
+        return line.substring(removeEnd).trimChapterHeadingSeparator()
     }
 
     private fun chapterHeadingHtml(title: String): String =
@@ -7192,21 +7213,24 @@ $paragraphs
         if (clean.isBlank()) return listOf("")
         ONLINE_CHAPTER_HEADING_SPLIT_REGEX.matchEntire(clean)?.let { match ->
             val prefix = match.groupValues[1].trim()
-            val suffix = match.groupValues[2].trim()
+            val suffix = match.groupValues[2].trimChapterHeadingSeparator()
             if (prefix.isNotBlank() && suffix.isNotBlank()) return listOf(prefix, suffix)
         }
         ONLINE_SPECIAL_HEADING_SPLIT_REGEX.matchEntire(clean)?.let { match ->
             val prefix = match.groupValues[1].trim()
-            val suffix = match.groupValues[2].trim()
+            val suffix = match.groupValues[2].trimChapterHeadingSeparator()
             if (prefix.isNotBlank() && suffix.isNotBlank()) return listOf(prefix, suffix)
         }
         return listOf(clean)
     }
 
+    private fun String.trimChapterHeadingSeparator(): String =
+        trim().trimStart { it.isWhitespace() || it in "　:：/／、，,。.!！?？-—_；;]" }
+
     private fun String.normalizedChapterTitleKey(): String =
         trim()
             .lowercase(Locale.ROOT)
-            .replace(Regex("[\\s　:：、，,。.!！?？《》\"'“”‘’\\-—_]+"), "")
+            .replace(Regex("[\\s　:：/／、，,。.!！?？；;《》\"'“”‘’\\-—_]+"), "")
 
     private fun onlineTocNcx(target: OnlineDownloadTarget, chapters: List<OnlineDownloadedChapter>): String {
         var playOrder = 1
@@ -10390,6 +10414,7 @@ img{max-width:100%;max-height:100%;height:auto;}
         const val ONLINE_COMPLETION_CHAPTER_RETRY_LIMIT = 3
         const val ONLINE_COMPLETION_RETRY_DELAY_MS = 6_000L
         const val ONLINE_COMPLETION_NOTIFICATION_MIN_INTERVAL_MS = 1_000L
+        const val ONLINE_COMPLETION_MODULE_ACTIVITY_RETRY_MS = 15_000L
         const val CLOUD_STORAGE_SCREEN_REFRESH_DEBOUNCE_MS = 1_000L
         const val STRING_KEY_UPLOAD_TO_115 = "upload_to_115"
         const val HOME_SEARCH_DEBOUNCE_MS = 250L
@@ -10403,9 +10428,9 @@ img{max-width:100%;max-height:100%;height:auto;}
         val ONLINE_CHAPTER_TITLE_REGEX = Regex("(第\\s*[0-9０-９一二三四五六七八九十百千万〇零两]+\\s*[章节卷回集部篇]|chapter\\s*\\d+)", RegexOption.IGNORE_CASE)
         val ONLINE_VOLUME_TITLE_REGEX = Regex("(第\\s*[0-9０-９一二三四五六七八九十百千万〇零两]+\\s*卷|正文|番外|后日谈|外传|分卷|volume\\s*\\d+|part\\s*\\d+)", RegexOption.IGNORE_CASE)
         val ONLINE_CHAPTER_HEADING_SPLIT_REGEX =
-            Regex("^(第\\s*[0-9０-９一二三四五六七八九十百千万〇零两]+\\s*[章节卷回集部篇])\\s*(.+)$")
+            Regex("^(第\\s*[0-9０-９一二三四五六七八九十百千万〇零两]+\\s*[章节卷回集部篇])\\s*[:：/／、，,。.!！?？\\-—_；;]*\\s*(.+)$")
         val ONLINE_SPECIAL_HEADING_SPLIT_REGEX =
-            Regex("^(番外|后日谈|后记|序章|楔子|终章)\\s*[:：、.\\-—]?\\s*(.+)$")
+            Regex("^(番外|后日谈|后记|序章|楔子|终章)\\s*[:：/／、，,。.!！?？\\-—_；;]*\\s*(.+)$")
         val ONLINE_COMPLETION_CHAPTER_FILE_REGEX = Regex("""chapter_(\d+)\.xhtml""", RegexOption.IGNORE_CASE)
         const val ONLINE_CHAPTER_TITLE_SCAN_LINES = 8
         val BOOK_EXTENSIONS = setOf(".epub", ".mobi", ".azw3", ".txt")
