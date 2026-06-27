@@ -5,8 +5,11 @@ import android.app.Dialog
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.net.Uri
 import android.graphics.Canvas
 import android.graphics.Color
@@ -169,12 +172,14 @@ class WebDavDriveHook(
     private val localLibraryHomeSearchSeq = AtomicLong(0L)
     private val onlineCompletionHomeSearchSeq = AtomicLong(0L)
     private val onlineCompletionSearchTargets = ConcurrentHashMap<String, OnlineDownloadTarget>()
-    private val onlineCompletionRunningDownloads = ConcurrentHashMap<String, Boolean>()
+    private val onlineCompletionRunningDownloads = ConcurrentHashMap<String, OnlineCompletionDownloadTask>()
+    private val onlineCompletionRunningDownloadsByNotificationId = ConcurrentHashMap<Int, OnlineCompletionDownloadTask>()
     private val onlineCompletionRunningUpdates = ConcurrentHashMap<String, Boolean>()
     private val onlineCompletionPublisherCleanupIds = ConcurrentHashMap.newKeySet<String>()
     private val onlineCompletionImportLock = ReentrantLock(true)
     private val onlineCompletionNotificationIds = AtomicInteger(4300)
     private val onlineCompletionNotificationBlockedLogged = AtomicBoolean(false)
+    private val onlineCompletionCancelReceiverRegistered = AtomicBoolean(false)
     private val onlineCompletionModuleActivityPromptAt = ConcurrentHashMap<Int, Long>()
     @Volatile private var lastHomeSearchWebDavResults: List<Any> = emptyList()
     @Volatile private var lastHomeSearchLocalResults: List<Any> = emptyList()
@@ -242,6 +247,7 @@ class WebDavDriveHook(
     }
 
     fun cleanupStartupCacheIfNeeded(context: Context) {
+        ensureOnlineCompletionCancelReceiver(context)
         if (!settingsProvider().canRunStartupCacheCleanup) return
         if (!startupCacheCleanupStarted.compareAndSet(false, true)) return
         Handler(Looper.getMainLooper()).postDelayed({
@@ -253,11 +259,13 @@ class WebDavDriveHook(
                         File(cacheDir, "reamicro-webdav"),
                         File(cacheDir, "reamicro-local-library"),
                         File(cacheDir, "reamicro-webdav-backup"),
+                        File(cacheDir, ONLINE_COMPLETION_CACHE_ROOT),
                     ) + staleTopLevelImportCacheDirs(cacheDir)
                     var deletedFiles = 0
                     var deletedBytes = 0L
                     targets.forEach { target ->
                         if (!target.exists()) return@forEach
+                        if (isActiveOnlineCompletionCacheDir(target)) return@forEach
                         val stat = CacheDeleteStat()
                         deleteCachePath(target, stat)
                         deletedFiles += stat.files
@@ -269,6 +277,44 @@ class WebDavDriveHook(
                 }
             }, "ReaMicroCacheCleanup").start()
         }, STARTUP_CACHE_CLEANUP_DELAY_MS)
+    }
+
+    private fun ensureOnlineCompletionCancelReceiver(context: Context) {
+        if (!onlineCompletionCancelReceiverRegistered.compareAndSet(false, true)) return
+        runCatching {
+            val appContext = context.applicationContext ?: context
+            val receiver = object : BroadcastReceiver() {
+                override fun onReceive(receiverContext: Context, intent: Intent) {
+                    if (intent.action != ONLINE_COMPLETION_CANCEL_ACTION) return
+                    val id = intent.getIntExtra(ONLINE_COMPLETION_NOTIFICATION_EXTRA_ID, 0)
+                    val key = intent.getStringExtra(ONLINE_COMPLETION_NOTIFICATION_EXTRA_KEY).orEmpty()
+                    requestOnlineCompletionDownloadCancel(receiverContext, id, key)
+                }
+            }
+            val filter = IntentFilter(ONLINE_COMPLETION_CANCEL_ACTION)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                appContext.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
+            } else {
+                @Suppress("DEPRECATION")
+                appContext.registerReceiver(receiver, filter)
+            }
+            logWebDav("online completion cancel receiver registered package=${appContext.packageName}")
+        }.onFailure {
+            onlineCompletionCancelReceiverRegistered.set(false)
+            XposedBridge.log("$LOG_PREFIX online completion cancel receiver failed: ${it.stackTraceToString()}")
+        }
+    }
+
+    private fun isActiveOnlineCompletionCacheDir(target: File): Boolean {
+        val activeDirs = onlineCompletionRunningDownloads.values
+            .map { it.cacheDir.absoluteFile }
+            .toList()
+        if (activeDirs.isEmpty()) return false
+        val canonicalTarget = runCatching { target.canonicalFile }.getOrDefault(target.absoluteFile)
+        return activeDirs.any { active ->
+            val canonicalActive = runCatching { active.canonicalFile }.getOrDefault(active.absoluteFile)
+            canonicalActive == canonicalTarget || isChildPath(canonicalActive, canonicalTarget)
+        }
     }
 
     private fun canShowWebDavEntry(): Boolean =
@@ -2663,6 +2709,36 @@ class WebDavDriveHook(
         }
     }
 
+    private fun throwIfOnlineCompletionDownloadCancelled(task: OnlineCompletionDownloadTask) {
+        if (task.cancelRequested || Thread.currentThread().isInterrupted) {
+            throw OnlineCompletionDownloadCancelledException()
+        }
+    }
+
+    private fun requestOnlineCompletionDownloadCancel(context: Context, notificationId: Int, key: String) {
+        val task = onlineCompletionRunningDownloadsByNotificationId[notificationId]
+            ?: key.takeIf { it.isNotBlank() }?.let { onlineCompletionRunningDownloads[it] }
+        if (task == null) {
+            cancelOnlineCompletionHostNotification(context, notificationId)
+            logWebDav("online completion cancel ignored missing task id=$notificationId key=$key")
+            return
+        }
+        task.cancelRequested = true
+        task.thread?.interrupt()
+        cancelOnlineCompletionTrackedWork(task)
+        cleanupOnlineCompletionDownloadTask(task)
+        onlineCompletionRunningDownloads.remove(task.key, task)
+        onlineCompletionRunningDownloadsByNotificationId.remove(task.notificationId, task)
+        cancelOnlineCompletionNotification(context, task.notificationId, task.key)
+        logWebDav("online completion cancel requested id=${task.notificationId} book=${task.name}")
+    }
+
+    private fun cancelOnlineCompletionTrackedWork(task: OnlineCompletionDownloadTask) {
+        val tracker = task.tracker ?: return
+        val workId = task.workId ?: return
+        cancelTrackedWork(tracker, workId)
+    }
+
     private fun cancelTrackedWork(tracker: Any, id: String) {
         runCatching {
             tracker.javaClass.methods.first {
@@ -2682,6 +2758,19 @@ class WebDavDriveHook(
         }
     }
 
+    private fun cleanupOnlineCompletionDownloadTask(task: OnlineCompletionDownloadTask) {
+        runCatching {
+            val stat = CacheDeleteStat()
+            deleteCachePath(task.cacheDir, stat)
+            logWebDav(
+                "online completion cache cleanup id=${task.notificationId} " +
+                    "files=${stat.files} bytes=${stat.bytes} dir=${task.cacheDir.absolutePath}",
+            )
+        }.onFailure {
+            logWebDav("online completion cache cleanup failed id=${task.notificationId}: ${it.message}")
+        }
+    }
+
     private fun deleteCachePath(file: File, stat: CacheDeleteStat) {
         if (!file.exists()) return
         if (file.isDirectory) {
@@ -2691,6 +2780,11 @@ class WebDavDriveHook(
             stat.bytes += file.length().coerceAtLeast(0L)
         }
         file.delete()
+    }
+
+    private fun isChildPath(child: File, parent: File): Boolean {
+        val parentPath = parent.path.trimEnd(File.separatorChar) + File.separator
+        return child.path.startsWith(parentPath)
     }
 
     private fun webDavDownloadKey(path: String, name: String): String =
@@ -5629,6 +5723,8 @@ class WebDavDriveHook(
         val progressNotifier = OnlineCompletionProgressNotifier(
             context = context,
             notificationId = notificationId,
+            notificationKey = "update:$key",
+            cancellable = false,
             bookName = title,
             tracker = tracker,
             workId = workId,
@@ -5787,6 +5883,7 @@ class WebDavDriveHook(
         )
         val newSize = bookDirectorySize(bookDir)
         val latest = findLocalBookByUuid(book.callLong("getUid"), book.callString("getUuid")) ?: book
+        refreshOnlineCompletionCatalogTables(latest, bookDir)
         val updated = copyBookWithBackupAndPublisher(
             book = latest,
             backupType = BACKUP_TYPE_ONLINE_COMPLETION,
@@ -5803,6 +5900,76 @@ class WebDavDriveHook(
                 "added=$successCount failed=${failed.size} total=${remoteChapters.size} size=$newSize",
         )
         return OnlineChapterUpdateResult(successCount, failed.size)
+    }
+
+    private fun refreshOnlineCompletionCatalogTables(book: Any, bookDir: File) {
+        val bookId = book.callLong("getId")
+        if (bookId <= 0L) {
+            logWebDav("online completion catalog refresh skipped: invalid bookId title=${book.callString("getTitle")}")
+            return
+        }
+        val bookshelf = currentBookshelfRepository() ?: error("阅微书架服务暂不可用，无法刷新目录")
+        val itemRefDao = fieldValue(bookshelf, "bookItemRefDao") ?: error("阅微目录条目 DAO 不可用")
+        val chapterDao = fieldValue(bookshelf, "bookChapterDao") ?: error("阅微章节 DAO 不可用")
+        val managerClass = cls(EPUB_FILE_MANAGER_CLASS)
+        val manager = runCatching {
+            managerClass.getDeclaredField("INSTANCE").apply { isAccessible = true }.get(null)
+        }.getOrNull() ?: error("阅微 EpubFileManager INSTANCE 未找到")
+        val bookPath = okioPath(bookDir.canonicalFile)
+        val opf = obtainOnlineCompletionOpf(bookPath)
+        val itemRefs = (managerClass.methods.asSequence() + managerClass.declaredMethods.asSequence())
+            .first {
+                it.name == "getItemRefs" &&
+                    it.parameterTypes.size == 3 &&
+                    it.parameterTypes[0] == java.lang.Long.TYPE
+            }
+            .apply { isAccessible = true }
+            .invoke(manager, java.lang.Long.valueOf(bookId), opf, bookPath) as? List<*>
+            ?: emptyList<Any>()
+        if (itemRefs.isEmpty()) {
+            error("阅微目录条目解析为空，已阻止刷新目录表")
+        }
+        val chapters = (managerClass.methods.asSequence() + managerClass.declaredMethods.asSequence())
+            .first {
+                it.name == "getChapters" &&
+                    it.parameterTypes.size == 3 &&
+                    List::class.java.isAssignableFrom(it.parameterTypes[0])
+            }
+            .apply { isAccessible = true }
+            .invoke(manager, itemRefs, opf, bookPath) as? List<*>
+            ?: emptyList<Any>()
+        if (chapters.isEmpty()) {
+            error("阅微章节目录解析为空，已阻止刷新目录表")
+        }
+        replaceOnlineCompletionDaoRows(itemRefDao, bookId, itemRefs, "BookItemRef")
+        replaceOnlineCompletionDaoRows(chapterDao, bookId, chapters, "BookChapter")
+        logWebDav(
+            "online completion catalog tables refreshed bookId=$bookId " +
+                "itemRefs=${itemRefs.size} chapters=${chapters.size}",
+        )
+    }
+
+    private fun replaceOnlineCompletionDaoRows(dao: Any, bookId: Long, rows: List<*>, label: String) {
+        val deleteMethod = (dao.javaClass.methods.asSequence() + dao.javaClass.declaredMethods.asSequence())
+            .first {
+                it.name == "deleteByBookId" &&
+                    it.parameterTypes.size == 2 &&
+                    it.parameterTypes[0] == java.lang.Long.TYPE
+            }
+            .apply { isAccessible = true }
+        val upsertMethod = (dao.javaClass.methods.asSequence() + dao.javaClass.declaredMethods.asSequence())
+            .first {
+                it.name == "upsert" &&
+                    it.parameterTypes.size == 2 &&
+                    it.parameterTypes[0].isArray
+            }
+            .apply { isAccessible = true }
+        val componentType = upsertMethod.parameterTypes[0].componentType
+        val array = java.lang.reflect.Array.newInstance(componentType, rows.size)
+        rows.forEachIndexed { index, row -> java.lang.reflect.Array.set(array, index, row) }
+        invokeSuspendBlocking(deleteMethod, dao, java.lang.Long.valueOf(bookId))
+        invokeSuspendBlocking(upsertMethod, dao, array)
+        logWebDav("online completion $label rows replaced bookId=$bookId count=${rows.size}")
     }
 
     private fun onlineSourceIdFromEncodedValue(value: String): String {
@@ -5856,22 +6023,43 @@ class WebDavDriveHook(
             showToast("无法启动在线补全下载：缺少 Context")
             return
         }
+        ensureOnlineCompletionCancelReceiver(context)
         val key = "${target.source.id}|${target.result.detailUrl}|${target.result.name}"
-        if (onlineCompletionRunningDownloads.putIfAbsent(key, true) == true) {
+        if (onlineCompletionRunningDownloads.containsKey(key)) {
             showToast("正在下载：${target.result.name}")
             return
         }
         val notificationId = onlineCompletionNotificationIds.incrementAndGet()
+        val tracker = currentWorkTracker()
+        val workId = tracker?.let { createOnlineCompletionTrackedTask(it, target.result.name) }
+        val cacheDir = File(
+            context.cacheDir ?: File("/data/local/tmp"),
+            "$ONLINE_COMPLETION_CACHE_ROOT/${System.currentTimeMillis()}_${UUID.randomUUID()}",
+        )
+        val task = OnlineCompletionDownloadTask(
+            notificationId = notificationId,
+            key = key,
+            name = target.result.name,
+            cacheDir = cacheDir,
+            tracker = tracker,
+            workId = workId,
+        )
+        if (onlineCompletionRunningDownloads.putIfAbsent(key, task) != null) {
+            cancelOnlineCompletionTrackedWork(task)
+            showToast("正在下载：${target.result.name}")
+            return
+        }
+        onlineCompletionRunningDownloadsByNotificationId[notificationId] = task
         showToast("已开始下载：${target.result.name}")
         logWebDav(
             "online completion download start source=${target.source.name} " +
                 "book=${target.result.name} detail=${target.result.detailUrl}",
         )
-        val tracker = currentWorkTracker()
-        val workId = tracker?.let { createOnlineCompletionTrackedTask(it, target.result.name) }
         val progressNotifier = OnlineCompletionProgressNotifier(
             context = context,
             notificationId = notificationId,
+            notificationKey = key,
+            cancellable = true,
             bookName = target.result.name,
             tracker = tracker,
             workId = workId,
@@ -5880,36 +6068,43 @@ class WebDavDriveHook(
         if (!notificationReady) {
             showToast("阅微通知权限未开启，下载继续在后台进行")
         }
-        Thread({
+        val thread = Thread({
             var partialImportThread: Thread? = null
             runCatching {
-                val localFile = importCacheFile(
-                    context.cacheDir,
-                    "reamicro-online-completion",
-                    "${safeOnlineFileName(target.result.name)}.epub",
-                )
-                localFile.parentFile?.mkdirs()
+                throwIfOnlineCompletionDownloadCancelled(task)
+                val localFile = File(task.cacheDir, "${safeOnlineFileName(target.result.name)}.epub")
+                task.cacheDir.mkdirs()
                 downloadOnlineCompletionBook(
                     target = target,
                     outputFile = localFile,
+                    task = task,
                     onProgress = { progress, message ->
+                        throwIfOnlineCompletionDownloadCancelled(task)
                         progressNotifier.running(progress, message)
                     },
                     onPartialReady = { partialFile, count ->
+                        throwIfOnlineCompletionDownloadCancelled(task)
                         progressNotifier.running(48, "正在导入前 $count 章", force = true)
                         partialImportThread = Thread({
+                            if (task.cancelRequested) return@Thread
                             val partialImported = runCatching {
+                                throwIfOnlineCompletionDownloadCancelled(task)
                                 importOnlineCompletionBook(
                                     file = partialFile,
                                     target = target,
                                     onWaiting = {
+                                        throwIfOnlineCompletionDownloadCancelled(task)
                                         progressNotifier.running(48, "等待导入队列：前 $count 章", force = true)
                                     },
                                     onStarted = {
+                                        throwIfOnlineCompletionDownloadCancelled(task)
                                         progressNotifier.running(48, "正在导入前 $count 章", force = true)
                                     },
                                 )
                             }.onFailure { error ->
+                                if (error is OnlineCompletionDownloadCancelledException || task.cancelRequested) {
+                                    return@Thread
+                                }
                                 logWebDav(
                                     "online completion partial import failed but download continues: " +
                                         "${error.message ?: error.javaClass.name}",
@@ -5926,41 +6121,60 @@ class WebDavDriveHook(
                         }
                     },
                 )
+                throwIfOnlineCompletionDownloadCancelled(task)
                 partialImportThread?.takeIf { it.isAlive }?.let { thread ->
                     progressNotifier.running(90, "等待前 100 章导入完成", force = true)
                     thread.join()
                 }
+                throwIfOnlineCompletionDownloadCancelled(task)
                 progressNotifier.running(94, "正在导入完整章节", force = true)
                 importOnlineCompletionBook(
                     file = localFile,
                     target = target,
                     onWaiting = {
+                        throwIfOnlineCompletionDownloadCancelled(task)
                         progressNotifier.running(94, "等待导入队列", force = true)
                     },
                     onStarted = {
+                        throwIfOnlineCompletionDownloadCancelled(task)
                         progressNotifier.running(94, "正在导入完整章节", force = true)
                     },
                 )
+                throwIfOnlineCompletionDownloadCancelled(task)
                 progressNotifier.finish("已导入阅微", target.result.detailUrl, success = true)
                 logWebDav("online completion download imported file=${localFile.absolutePath} size=${localFile.length()}")
                 Handler(Looper.getMainLooper()).post {
                     Toast.makeText(context, "已导入：${target.result.name}", Toast.LENGTH_SHORT).show()
                 }
+                cleanupOnlineCompletionDownloadTask(task)
             }.onFailure {
-                XposedBridge.log("$LOG_PREFIX online completion download failed: ${it.stackTraceToString()}")
-                progressNotifier.finish(it.message ?: "下载失败", null, success = false)
-                Handler(Looper.getMainLooper()).post {
-                    Toast.makeText(context, "在线补全下载失败：${it.message ?: target.result.name}", Toast.LENGTH_SHORT).show()
+                if (it is OnlineCompletionDownloadCancelledException || task.cancelRequested) {
+                    cancelOnlineCompletionTrackedWork(task)
+                    cleanupOnlineCompletionDownloadTask(task)
+                    cancelOnlineCompletionNotification(context, task.notificationId, task.key)
+                    logWebDav("online completion download cancelled book=${target.result.name}")
+                } else {
+                    XposedBridge.log("$LOG_PREFIX online completion download failed: ${it.stackTraceToString()}")
+                    cleanupOnlineCompletionDownloadTask(task)
+                    progressNotifier.finish(it.message ?: "下载失败", null, success = false)
+                    Handler(Looper.getMainLooper()).post {
+                        Toast.makeText(context, "在线补全下载失败：${it.message ?: target.result.name}", Toast.LENGTH_SHORT).show()
+                    }
                 }
             }.also {
-                onlineCompletionRunningDownloads.remove(key)
+                onlineCompletionRunningDownloads.remove(key, task)
+                onlineCompletionRunningDownloadsByNotificationId.remove(notificationId, task)
             }
-        }, "ReaMicroOnlineCompletionDownload").start()
+        }, "ReaMicroOnlineCompletionDownload")
+        task.thread = thread
+        thread.start()
     }
 
     private inner class OnlineCompletionProgressNotifier(
         private val context: Context,
         private val notificationId: Int,
+        private val notificationKey: String,
+        private val cancellable: Boolean,
         private val bookName: String,
         private val tracker: Any?,
         private val workId: String?,
@@ -5995,7 +6209,16 @@ class WebDavDriveHook(
                 "online completion progress notify id=$notificationId progress=$progress " +
                     "force=$force progressChanged=$progressChanged phaseChanged=$phaseChanged text=$compactMessage",
             )
-            return updateOnlineCompletionNotification(context, notificationId, bookName, compactMessage, progress, false)
+            return updateOnlineCompletionNotification(
+                context,
+                notificationId,
+                notificationKey,
+                cancellable,
+                bookName,
+                compactMessage,
+                progress,
+                false,
+            )
         }
 
         @Synchronized
@@ -6011,7 +6234,7 @@ class WebDavDriveHook(
                     bookName,
                 )
             }
-            updateOnlineCompletionNotification(context, notificationId, bookName, message, 100, true)
+            updateOnlineCompletionNotification(context, notificationId, notificationKey, cancellable, bookName, message, 100, true)
         }
     }
 
@@ -6037,10 +6260,13 @@ class WebDavDriveHook(
     private fun downloadOnlineCompletionBook(
         target: OnlineDownloadTarget,
         outputFile: File,
+        task: OnlineCompletionDownloadTask,
         onProgress: (Int, String) -> Unit,
         onPartialReady: (File, Int) -> Unit,
     ) {
+        throwIfOnlineCompletionDownloadCancelled(task)
         val tocSnapshot = loadOnlineCompletionToc(target, onProgress)
+        throwIfOnlineCompletionDownloadCancelled(task)
         val detail = tocSnapshot.detail
         val chapters = tocSnapshot.chapters
         logWebDav(
@@ -6054,7 +6280,9 @@ class WebDavDriveHook(
         val failureMessages = mutableMapOf<Int, String>()
         val cover = target.result.coverUrl.takeIf { it.isNotBlank() }?.let { coverUrl ->
             runCatching {
+                throwIfOnlineCompletionDownloadCancelled(task)
                 OnlineConcurrentRateLimiter.withLimitBlocking(target.source) {
+                    throwIfOnlineCompletionDownloadCancelled(task)
                     downloadOnlineBytes(target.source, coverUrl)
                 }
             }.onSuccess { payload ->
@@ -6074,6 +6302,7 @@ class WebDavDriveHook(
         fun downloadedCount(): Int = downloaded.count { it != null }
 
         fun maybeImportFirstBatch(progress: Int) {
+            throwIfOnlineCompletionDownloadCancelled(task)
             if (!shouldImportFirstBatch || firstBatchImported) return
             val firstBatch = downloaded.take(ONLINE_COMPLETION_PARTIAL_IMPORT_CHAPTERS)
             if (firstBatch.size < ONLINE_COMPLETION_PARTIAL_IMPORT_CHAPTERS || firstBatch.any { it == null }) return
@@ -6083,20 +6312,24 @@ class WebDavDriveHook(
                 "${outputFile.nameWithoutExtension}_first_${ONLINE_COMPLETION_PARTIAL_IMPORT_CHAPTERS}.epub",
             )
             onProgress(progress, "生成前 ${ONLINE_COMPLETION_PARTIAL_IMPORT_CHAPTERS} 章 EPUB")
+            throwIfOnlineCompletionDownloadCancelled(task)
             writeOnlineCompletionEpub(partialFile, target, firstBatch.filterNotNull(), cover)
             logWebDav("online completion partial epub ready path=${partialFile.absolutePath} chapters=${firstBatch.size}")
             onPartialReady(partialFile, ONLINE_COMPLETION_PARTIAL_IMPORT_CHAPTERS)
         }
 
         fun attemptChapter(index: Int, immediateRetry: Boolean): Boolean {
+            throwIfOnlineCompletionDownloadCancelled(task)
             val chapter = chapters[index]
             val maxAttemptsThisRound = if (immediateRetry) 2 else 1
             var roundAttempts = 0
             while (attempts[index] < ONLINE_COMPLETION_CHAPTER_RETRY_LIMIT && roundAttempts < maxAttemptsThisRound) {
+                throwIfOnlineCompletionDownloadCancelled(task)
                 attempts[index]++
                 roundAttempts++
                 val attempt = attempts[index]
                 runCatching {
+                    throwIfOnlineCompletionDownloadCancelled(task)
                     downloadOnlineChapter(target, detail.url, detail.body, chapter, index)
                 }.onSuccess { chapterContent ->
                     downloaded[index] = chapterContent
@@ -6124,6 +6357,7 @@ class WebDavDriveHook(
         }
 
         chapters.forEachIndexed { index, chapter ->
+            throwIfOnlineCompletionDownloadCancelled(task)
             val progress = 5 + ((index + 1) * 78 / chapters.size.coerceAtLeast(1))
             onProgress(progress, "下载章节 ${index + 1}/${chapters.size}")
             attemptChapter(index, immediateRetry = true)
@@ -6138,6 +6372,7 @@ class WebDavDriveHook(
             )
             Thread.sleep(ONLINE_COMPLETION_RETRY_DELAY_MS)
             retryCandidates.forEachIndexed { retryIndex, chapterIndex ->
+                throwIfOnlineCompletionDownloadCancelled(task)
                 val progress = 84 + ((retryIndex + 1) * 4 / retryCandidates.size.coerceAtLeast(1))
                 onProgress(progress, "重试章节 ${chapterIndex + 1}/${chapters.size}")
                 attemptChapter(chapterIndex, immediateRetry = false)
@@ -6163,6 +6398,7 @@ class WebDavDriveHook(
             )
         }
         onProgress(88, "生成 EPUB")
+        throwIfOnlineCompletionDownloadCancelled(task)
         writeOnlineCompletionEpub(outputFile, target, finalChapters, cover)
         logWebDav(
             "online completion epub ready path=${outputFile.absolutePath} " +
@@ -6930,15 +7166,69 @@ class WebDavDriveHook(
             .recoverCatching { getField(name) }
             .getOrNull()
 
+    private fun onlineCompletionCancelPendingIntent(context: Context, id: Int, key: String): PendingIntent {
+        val intent = Intent(ONLINE_COMPLETION_CANCEL_ACTION).apply {
+            setPackage(context.packageName)
+            addFlags(Intent.FLAG_RECEIVER_FOREGROUND)
+            putExtra(ONLINE_COMPLETION_NOTIFICATION_EXTRA_ID, id)
+            putExtra(ONLINE_COMPLETION_NOTIFICATION_EXTRA_KEY, key)
+        }
+        val flags = PendingIntent.FLAG_UPDATE_CURRENT or
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0
+        return PendingIntent.getBroadcast(context, id, intent, flags)
+    }
+
+    private fun cancelOnlineCompletionNotification(context: Context, id: Int, key: String) {
+        cancelOnlineCompletionHostNotification(context, id)
+        sendOnlineCompletionCancelBroadcastToModule(context, id, key)
+    }
+
+    private fun cancelOnlineCompletionHostNotification(context: Context, id: Int) {
+        if (id <= 0) return
+        runCatching {
+            val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
+            manager.cancel(id)
+        }.onFailure {
+            logWebDav("online completion host notification cancel failed id=$id: ${it.message}")
+        }
+    }
+
+    private fun sendOnlineCompletionCancelBroadcastToModule(context: Context, id: Int, key: String): Boolean =
+        runCatching {
+            val intent = Intent(ONLINE_COMPLETION_CANCEL_ACTION).apply {
+                setClassName(MODULE_PACKAGE_NAME, ONLINE_COMPLETION_NOTIFICATION_RECEIVER_CLASS)
+                addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
+                addFlags(Intent.FLAG_RECEIVER_FOREGROUND)
+                putExtra(ONLINE_COMPLETION_NOTIFICATION_EXTRA_ID, id)
+                putExtra(ONLINE_COMPLETION_NOTIFICATION_EXTRA_KEY, key)
+            }
+            context.sendBroadcast(intent)
+            true
+        }.getOrElse {
+            logWebDav("online completion module notification cancel failed id=$id: ${it.message}")
+            false
+        }
+
     private fun updateOnlineCompletionNotification(
         context: Context,
         id: Int,
+        key: String,
+        cancellable: Boolean,
         title: String,
         text: String,
         progress: Int,
         done: Boolean,
     ): Boolean {
-        val moduleRelaySent = sendOnlineCompletionNotificationViaModule(context, id, title, text, progress, done)
+        val moduleRelaySent = sendOnlineCompletionNotificationViaModule(
+            context,
+            id,
+            key,
+            cancellable,
+            title,
+            text,
+            progress,
+            done,
+        )
         return runCatching {
             val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return false
             if (!manager.areNotificationsEnabled()) {
@@ -6974,6 +7264,13 @@ class WebDavDriveHook(
                 .setOngoing(!done)
                 .setAutoCancel(done)
                 .setProgress(100, progress.coerceIn(0, 100), false)
+            if (!done && cancellable) {
+                builder.addAction(
+                    android.R.drawable.ic_menu_close_clear_cancel,
+                    "\u53d6\u6d88",
+                    onlineCompletionCancelPendingIntent(context, id, key),
+                )
+            }
             manager.notify(id, builder.build())
             cancelOnlineCompletionNotificationIfDone(manager, id, done)
             logWebDav("online completion host notification posted id=$id moduleRelaySent=$moduleRelaySent")
@@ -6987,15 +7284,17 @@ class WebDavDriveHook(
     private fun sendOnlineCompletionNotificationViaModule(
         context: Context,
         id: Int,
+        key: String,
+        cancellable: Boolean,
         title: String,
         text: String,
         progress: Int,
         done: Boolean,
     ): Boolean {
-        val broadcastSent = sendOnlineCompletionNotificationBroadcast(context, id, title, text, progress, done)
+        val broadcastSent = sendOnlineCompletionNotificationBroadcast(context, id, key, cancellable, title, text, progress, done)
         val shouldStartActivity = shouldStartOnlineCompletionNotificationActivity(id, done, broadcastSent)
         val activitySent = if (shouldStartActivity) {
-            startOnlineCompletionNotificationActivity(context, id, title, text, progress, done)
+            startOnlineCompletionNotificationActivity(context, id, key, cancellable, title, text, progress, done)
         } else {
             false
         }
@@ -7026,13 +7325,15 @@ class WebDavDriveHook(
     private fun startOnlineCompletionNotificationActivity(
         context: Context,
         id: Int,
+        key: String,
+        cancellable: Boolean,
         title: String,
         text: String,
         progress: Int,
         done: Boolean,
     ): Boolean =
         runCatching {
-            val intent = onlineCompletionNotificationIntent(id, title, text, progress, done).apply {
+            val intent = onlineCompletionNotificationIntent(id, key, cancellable, title, text, progress, done).apply {
                 setClassName(MODULE_PACKAGE_NAME, ONLINE_COMPLETION_NOTIFICATION_ACTIVITY_CLASS)
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION)
@@ -7055,13 +7356,15 @@ class WebDavDriveHook(
     private fun sendOnlineCompletionNotificationBroadcast(
         context: Context,
         id: Int,
+        key: String,
+        cancellable: Boolean,
         title: String,
         text: String,
         progress: Int,
         done: Boolean,
     ): Boolean =
         runCatching {
-            val intent = onlineCompletionNotificationIntent(id, title, text, progress, done).apply {
+            val intent = onlineCompletionNotificationIntent(id, key, cancellable, title, text, progress, done).apply {
                 setClassName(MODULE_PACKAGE_NAME, ONLINE_COMPLETION_NOTIFICATION_RECEIVER_CLASS)
             }
             context.sendBroadcast(intent)
@@ -7077,6 +7380,8 @@ class WebDavDriveHook(
 
     private fun onlineCompletionNotificationIntent(
         id: Int,
+        key: String,
+        cancellable: Boolean,
         title: String,
         text: String,
         progress: Int,
@@ -7086,6 +7391,8 @@ class WebDavDriveHook(
                 addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
                 addFlags(Intent.FLAG_RECEIVER_FOREGROUND)
                 putExtra(ONLINE_COMPLETION_NOTIFICATION_EXTRA_ID, id)
+                putExtra(ONLINE_COMPLETION_NOTIFICATION_EXTRA_KEY, key)
+                putExtra(ONLINE_COMPLETION_NOTIFICATION_EXTRA_CANCELLABLE, cancellable)
                 putExtra(ONLINE_COMPLETION_NOTIFICATION_EXTRA_TITLE, title)
                 putExtra(ONLINE_COMPLETION_NOTIFICATION_EXTRA_TEXT, text)
                 putExtra(ONLINE_COMPLETION_NOTIFICATION_EXTRA_PROGRESS, progress.coerceIn(0, 100))
@@ -9767,6 +10074,18 @@ img{max-width:100%;max-height:100%;height:auto;}
         @Volatile var cancelRequested: Boolean = false
     }
 
+    private class OnlineCompletionDownloadTask(
+        val notificationId: Int,
+        val key: String,
+        val name: String,
+        val cacheDir: File,
+        val tracker: Any?,
+        val workId: String?,
+    ) {
+        @Volatile var cancelRequested: Boolean = false
+        @Volatile var thread: Thread? = null
+    }
+
     private class CacheDeleteStat(
         var files: Int = 0,
         var bytes: Long = 0L,
@@ -9778,6 +10097,7 @@ img{max-width:100%;max-height:100%;height:auto;}
     ) : IllegalStateException(message)
 
     private class CloudDownloadCancelledException : CancellationException("download cancelled")
+    private class OnlineCompletionDownloadCancelledException : CancellationException("online completion download cancelled")
 
     private class WebDavBackButton(context: Context) : View(context) {
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -10365,14 +10685,18 @@ img{max-width:100%;max-height:100%;height:auto;}
         const val ONLINE_COMPLETION_SOURCE_PREFIX = "reamicro-online-source://"
         const val ONLINE_COMPLETION_BOOK_PREFIX = "reamicro-online-book://"
         const val ONLINE_COMPLETION_UUID_PREFIX = "reamicro-online-"
+        const val ONLINE_COMPLETION_CACHE_ROOT = "reamicro-online-completion"
         const val ONLINE_COMPLETION_NOTIFICATION_CHANNEL = "reamicro_online_completion_download"
         const val MODULE_PACKAGE_NAME = "com.reamicro.fix"
         const val ONLINE_COMPLETION_NOTIFICATION_ACTION = "com.reamicro.fix.ONLINE_COMPLETION_NOTIFICATION"
+        const val ONLINE_COMPLETION_CANCEL_ACTION = "com.reamicro.fix.ONLINE_COMPLETION_CANCEL"
         const val ONLINE_COMPLETION_NOTIFICATION_ACTIVITY_CLASS =
             "com.reamicro.fix.notification.OnlineCompletionNotificationActivity"
         const val ONLINE_COMPLETION_NOTIFICATION_RECEIVER_CLASS =
             "com.reamicro.fix.notification.OnlineCompletionNotificationReceiver"
         const val ONLINE_COMPLETION_NOTIFICATION_EXTRA_ID = "id"
+        const val ONLINE_COMPLETION_NOTIFICATION_EXTRA_KEY = "key"
+        const val ONLINE_COMPLETION_NOTIFICATION_EXTRA_CANCELLABLE = "cancellable"
         const val ONLINE_COMPLETION_NOTIFICATION_EXTRA_TITLE = "title"
         const val ONLINE_COMPLETION_NOTIFICATION_EXTRA_TEXT = "text"
         const val ONLINE_COMPLETION_NOTIFICATION_EXTRA_PROGRESS = "progress"

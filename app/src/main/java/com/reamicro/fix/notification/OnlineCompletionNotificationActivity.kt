@@ -5,6 +5,7 @@ import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -79,6 +80,8 @@ class OnlineCompletionNotificationActivity : Activity() {
         val id = intent.getIntExtra(EXTRA_ID, 0).takeIf { it > 0 } ?: return
         val title = intent.getStringExtra(EXTRA_TITLE).orEmpty().ifBlank { ONLINE_COMPLETION_TITLE }
         val text = intent.getStringExtra(EXTRA_TEXT).orEmpty()
+        val key = intent.getStringExtra(EXTRA_KEY).orEmpty()
+        val cancellable = intent.getBooleanExtra(EXTRA_CANCELLABLE, false)
         val progress = intent.getIntExtra(EXTRA_PROGRESS, 0).coerceIn(0, 100)
         val done = intent.getBooleanExtra(EXTRA_DONE, false)
         val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
@@ -106,9 +109,27 @@ class OnlineCompletionNotificationActivity : Activity() {
             .setOngoing(!done)
             .setAutoCancel(done)
             .setProgress(100, progress, false)
+        if (!done && cancellable) {
+            builder.addAction(
+                android.R.drawable.ic_menu_close_clear_cancel,
+                "\u53d6\u6d88",
+                cancelPendingIntent(context, id, key),
+            )
+        }
         manager.notify(id, builder.build())
         cancelOnlineCompletionNotificationIfDone(manager, id, done)
         Log.i(LOG_TAG, "module activity notification posted fallback id=$id progress=$progress done=$done title=$title")
+    }
+
+    private fun cancelPendingIntent(context: Context, id: Int, key: String): PendingIntent {
+        val intent = Intent(ACTION_ONLINE_COMPLETION_CANCEL).apply {
+            setClass(context, OnlineCompletionNotificationReceiver::class.java)
+            putExtra(EXTRA_ID, id)
+            putExtra(EXTRA_KEY, key)
+        }
+        val flags = PendingIntent.FLAG_UPDATE_CURRENT or
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0
+        return PendingIntent.getBroadcast(context, id, intent, flags)
     }
 
     private fun finishWithoutAnimation() {
@@ -119,8 +140,11 @@ class OnlineCompletionNotificationActivity : Activity() {
     private companion object {
         const val LOG_TAG = "ReaMicroNotify"
         const val ACTION_ONLINE_COMPLETION_NOTIFICATION = "com.reamicro.fix.ONLINE_COMPLETION_NOTIFICATION"
+        const val ACTION_ONLINE_COMPLETION_CANCEL = "com.reamicro.fix.ONLINE_COMPLETION_CANCEL"
         const val REQUEST_POST_NOTIFICATIONS = 4301
         const val EXTRA_ID = "id"
+        const val EXTRA_KEY = "key"
+        const val EXTRA_CANCELLABLE = "cancellable"
         const val EXTRA_TITLE = "title"
         const val EXTRA_TEXT = "text"
         const val EXTRA_PROGRESS = "progress"

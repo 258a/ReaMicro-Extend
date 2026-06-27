@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -22,9 +23,11 @@ class OnlineCompletionNotificationService : Service() {
         val id = intent?.getIntExtra(EXTRA_ID, 0)?.takeIf { it > 0 } ?: FALLBACK_NOTIFICATION_ID
         val title = intent?.getStringExtra(EXTRA_TITLE).orEmpty().ifBlank { ONLINE_COMPLETION_TITLE }
         val text = intent?.getStringExtra(EXTRA_TEXT).orEmpty()
+        val key = intent?.getStringExtra(EXTRA_KEY).orEmpty()
+        val cancellable = intent?.getBooleanExtra(EXTRA_CANCELLABLE, false) == true
         val progress = intent?.getIntExtra(EXTRA_PROGRESS, 0)?.coerceIn(0, 100) ?: 0
         val done = intent?.getBooleanExtra(EXTRA_DONE, false) == true
-        val notification = buildNotification(title, text, progress, done)
+        val notification = buildNotification(id, key, cancellable, title, text, progress, done)
         runCatching {
             val manager = notificationManager()
             if (foregroundId == 0) {
@@ -86,7 +89,15 @@ class OnlineCompletionNotificationService : Service() {
         }
     }
 
-    private fun buildNotification(title: String, text: String, progress: Int, done: Boolean): Notification {
+    private fun buildNotification(
+        id: Int,
+        key: String,
+        cancellable: Boolean,
+        title: String,
+        text: String,
+        progress: Int,
+        done: Boolean,
+    ): Notification {
         ensureChannel()
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             Notification.Builder(this, ONLINE_COMPLETION_NOTIFICATION_CHANNEL)
@@ -94,7 +105,7 @@ class OnlineCompletionNotificationService : Service() {
             @Suppress("DEPRECATION")
             Notification.Builder(this)
         }
-        return builder
+        builder
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentTitle(onlineCompletionDownloadTitle(progress, text))
             .setContentText(onlineCompletionDownloadText(title, text))
@@ -103,7 +114,25 @@ class OnlineCompletionNotificationService : Service() {
             .setOngoing(!done)
             .setAutoCancel(done)
             .setProgress(100, progress, false)
-            .build()
+        if (!done && cancellable) {
+            builder.addAction(
+                android.R.drawable.ic_menu_close_clear_cancel,
+                "\u53d6\u6d88",
+                cancelPendingIntent(id, key),
+            )
+        }
+        return builder.build()
+    }
+
+    private fun cancelPendingIntent(id: Int, key: String): PendingIntent {
+        val intent = Intent(ACTION_ONLINE_COMPLETION_CANCEL).apply {
+            setClass(this@OnlineCompletionNotificationService, OnlineCompletionNotificationReceiver::class.java)
+            putExtra(EXTRA_ID, id)
+            putExtra(EXTRA_KEY, key)
+        }
+        val flags = PendingIntent.FLAG_UPDATE_CURRENT or
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) PendingIntent.FLAG_IMMUTABLE else 0
+        return PendingIntent.getBroadcast(this, id, intent, flags)
     }
 
     private fun ensureChannel() {
@@ -123,7 +152,10 @@ class OnlineCompletionNotificationService : Service() {
     private companion object {
         const val LOG_TAG = "ReaMicroNotify"
         const val ACTION_ONLINE_COMPLETION_NOTIFICATION = "com.reamicro.fix.ONLINE_COMPLETION_NOTIFICATION"
+        const val ACTION_ONLINE_COMPLETION_CANCEL = "com.reamicro.fix.ONLINE_COMPLETION_CANCEL"
         const val EXTRA_ID = "id"
+        const val EXTRA_KEY = "key"
+        const val EXTRA_CANCELLABLE = "cancellable"
         const val EXTRA_TITLE = "title"
         const val EXTRA_TEXT = "text"
         const val EXTRA_PROGRESS = "progress"
