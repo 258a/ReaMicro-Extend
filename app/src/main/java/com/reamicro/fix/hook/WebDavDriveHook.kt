@@ -168,7 +168,6 @@ class WebDavDriveHook(
     private val webDavHomeSearchSeq = AtomicLong(0L)
     private val localLibraryHomeSearchSeq = AtomicLong(0L)
     private val onlineCompletionHomeSearchSeq = AtomicLong(0L)
-    private val onlineCompletionExpandedSources = ConcurrentHashMap<String, Boolean>()
     private val onlineCompletionSearchTargets = ConcurrentHashMap<String, OnlineDownloadTarget>()
     private val onlineCompletionRunningDownloads = ConcurrentHashMap<String, Boolean>()
     private val onlineCompletionRunningUpdates = ConcurrentHashMap<String, Boolean>()
@@ -177,8 +176,6 @@ class WebDavDriveHook(
     private val onlineCompletionNotificationIds = AtomicInteger(4300)
     private val onlineCompletionNotificationBlockedLogged = AtomicBoolean(false)
     private val onlineCompletionModuleActivityPromptAt = ConcurrentHashMap<Int, Long>()
-    @Volatile private var lastHomeSearchViewModelRef: WeakReference<Any>? = null
-    @Volatile private var lastHomeSearchQuery: String = ""
     @Volatile private var lastHomeSearchWebDavResults: List<Any> = emptyList()
     @Volatile private var lastHomeSearchLocalResults: List<Any> = emptyList()
     private val cloudStorageScreenRefreshAt = ConcurrentHashMap<String, Long>()
@@ -1943,7 +1940,7 @@ class WebDavDriveHook(
                             }
                             if (webDavHomeSearchSeq.get() != seq) return@runCatching
                             if (localLibraryHomeSearchSeq.get() != localSeq) return@runCatching
-                            rememberHomeSearchSnapshot(param.thisObject, query, webDavResults, localResults)
+                            rememberHomeSearchSnapshot(webDavResults, localResults)
                             Handler(Looper.getMainLooper()).post {
                                 if (
                                     webDavHomeSearchSeq.get() == seq &&
@@ -2079,7 +2076,7 @@ class WebDavDriveHook(
                             webDavHomeSearchSeq.get() == webDavSeq &&
                             localLibraryHomeSearchSeq.get() == localSeq
                         ) {
-                            rememberHomeSearchSnapshot(viewModel, query, webDavResults, refreshedLocalResults)
+                            rememberHomeSearchSnapshot(webDavResults, refreshedLocalResults)
                             updateHomeWebDavSearchResults(viewModel, webDavResults, refreshedLocalResults, null)
                         }
                     }
@@ -2091,34 +2088,11 @@ class WebDavDriveHook(
     }
 
     private fun rememberHomeSearchSnapshot(
-        viewModel: Any?,
-        query: String,
         webDavResults: List<Any>,
         localResults: List<Any>,
     ) {
-        if (viewModel != null) lastHomeSearchViewModelRef = WeakReference(viewModel)
-        lastHomeSearchQuery = query
         lastHomeSearchWebDavResults = webDavResults
         lastHomeSearchLocalResults = localResults
-    }
-
-    private fun refreshOnlineCompletionSearch(query: String = lastHomeSearchQuery) {
-        val viewModel = lastHomeSearchViewModelRef?.get() ?: return
-        if (query.isBlank()) return
-        val seq = onlineCompletionHomeSearchSeq.incrementAndGet()
-        Thread({
-            runCatching {
-                val onlineResults = searchOnlineCompletionSources(query)
-                if (onlineCompletionHomeSearchSeq.get() != seq) return@runCatching
-                Handler(Looper.getMainLooper()).post {
-                    if (onlineCompletionHomeSearchSeq.get() == seq) {
-                        updateHomeOnlineCompletionSearchResults(viewModel, onlineResults)
-                    }
-                }
-            }.onFailure {
-                XposedBridge.log("$LOG_PREFIX online completion refresh failed: ${it.stackTraceToString()}")
-            }
-        }, "ReaMicroOnlineCompletionRefresh").start()
     }
 
     private fun hookWebDavCloudDownload() {
@@ -5341,18 +5315,19 @@ class WebDavDriveHook(
     private fun newOnlineCompletionSourceCloudBook(group: OnlineSearchGroup): Any {
         val encodedQuery = URLEncoder.encode(group.query, "UTF-8")
         val path = "$ONLINE_COMPLETION_SOURCE_PREFIX${group.source.id}?q=$encodedQuery"
-        val expanded = onlineCompletionExpandedSources[group.source.id] == true
         val best = group.results.firstOrNull()
+        if (best != null) {
+            onlineCompletionSearchTargets[path] = OnlineDownloadTarget(group.source, group.query, best)
+        }
         val status = when {
             group.error.isNotBlank() -> group.error
             best == null -> "无结果"
-            expanded -> "已展开 ${group.results.size} 条结果"
             else -> best.name
         }
         val subtitle = listOfNotNull(
             best?.author?.takeIf { it.isNotBlank() }?.let { "作者 $it" },
             group.source.name.takeIf { it.isNotBlank() },
-            if (best != null && !expanded && group.results.size > 1) "${group.results.size} 条结果，点按展开" else null,
+            if (best != null && group.results.size > 1) "${group.results.size} 条结果" else null,
             if (best == null) group.source.sourceUrl.takeIf { it.isNotBlank() } else null,
         ).joinToString(" · ")
         return newOnlineCompletionCloudBook(
@@ -5402,14 +5377,9 @@ class WebDavDriveHook(
 
     private fun onlineCompletionGroupVisibleCloudBooks(group: OnlineSearchGroup): List<Any> {
         if (group.results.isEmpty()) return listOf(newOnlineCompletionSourceCloudBook(group))
-        if (group.results.size == 1) {
-            return listOf(newOnlineCompletionResultCloudBook(group.source, group.query, group.results.first(), 0))
-        }
-        val expanded = onlineCompletionExpandedSources[group.source.id] == true
-        if (!expanded) return listOf(newOnlineCompletionSourceCloudBook(group))
         return group.results.take(ONLINE_COMPLETION_RESULT_LIMIT).mapIndexed { index, result ->
             newOnlineCompletionResultCloudBook(group.source, group.query, result, index)
-        } + newOnlineCompletionSourceCloudBook(group)
+        }
     }
 
     private fun newOnlineCompletionResultCloudBook(
@@ -5855,15 +5825,15 @@ class WebDavDriveHook(
         logWebDav("online completion tap path=$path")
         return when {
             path.startsWith(ONLINE_COMPLETION_SOURCE_PREFIX) -> {
-                val sourceId = path.removePrefix(ONLINE_COMPLETION_SOURCE_PREFIX).substringBefore('?')
-                val nextExpanded = !(onlineCompletionExpandedSources[sourceId] == true)
-                onlineCompletionExpandedSources[sourceId] = nextExpanded
+                onlineCompletionSearchTargets[path]?.let { target ->
+                    startOnlineCompletionDownload(target)
+                    return true
+                }
                 Toast.makeText(
                     currentContext(),
-                    if (nextExpanded) "已展开在线补全结果" else "已折叠在线补全结果",
+                    "该在线补全源暂无可下载结果",
                     Toast.LENGTH_SHORT,
                 ).show()
-                refreshOnlineCompletionSearch(queryFromOnlineCompletionPath(path))
                 true
             }
             path.startsWith(ONLINE_COMPLETION_BOOK_PREFIX) -> {
@@ -5878,11 +5848,6 @@ class WebDavDriveHook(
             }
             else -> false
         }
-    }
-
-    private fun queryFromOnlineCompletionPath(path: String): String {
-        val raw = path.substringAfter("?q=", "")
-        return runCatching { URLDecoder.decode(raw, "UTF-8") }.getOrDefault(raw)
     }
 
     private fun startOnlineCompletionDownload(target: OnlineDownloadTarget) {
