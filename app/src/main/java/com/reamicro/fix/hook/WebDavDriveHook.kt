@@ -6089,7 +6089,7 @@ class WebDavDriveHook(
                             if (task.cancelRequested) return@Thread
                             val partialImported = runCatching {
                                 throwIfOnlineCompletionDownloadCancelled(task)
-                                importOnlineCompletionBook(
+                                val importResult = importOnlineCompletionBook(
                                     file = partialFile,
                                     target = target,
                                     onWaiting = {
@@ -6101,6 +6101,11 @@ class WebDavDriveHook(
                                         progressNotifier.running(48, "正在导入前 $count 章", force = true)
                                     },
                                 )
+                                importResult.bookDir?.let { importedDir ->
+                                    task.importedBookDir = importedDir
+                                    flushOnlineCompletionDownloadedChapters(task)
+                                }
+                                importResult.imported
                             }.onFailure { error ->
                                 if (error is OnlineCompletionDownloadCancelledException || task.cancelRequested) {
                                     return@Thread
@@ -6127,22 +6132,34 @@ class WebDavDriveHook(
                     thread.join()
                 }
                 throwIfOnlineCompletionDownloadCancelled(task)
-                progressNotifier.running(94, "正在导入完整章节", force = true)
-                importOnlineCompletionBook(
-                    file = localFile,
-                    target = target,
-                    onWaiting = {
-                        throwIfOnlineCompletionDownloadCancelled(task)
-                        progressNotifier.running(94, "等待导入队列", force = true)
-                    },
-                    onStarted = {
-                        throwIfOnlineCompletionDownloadCancelled(task)
-                        progressNotifier.running(94, "正在导入完整章节", force = true)
-                    },
-                )
+                if (task.importedBookDir != null) {
+                    progressNotifier.running(94, "写入剩余章节", force = true)
+                    flushOnlineCompletionDownloadedChapters(task)
+                    syncOnlineCompletionImportedBookSize(target)
+                    logWebDav(
+                        "online completion final import skipped; chapters written to imported dir=${task.importedBookDir}",
+                    )
+                } else {
+                    progressNotifier.running(94, "正在导入完整章节", force = true)
+                    importOnlineCompletionBook(
+                        file = localFile,
+                        target = target,
+                        onWaiting = {
+                            throwIfOnlineCompletionDownloadCancelled(task)
+                            progressNotifier.running(94, "等待导入队列", force = true)
+                        },
+                        onStarted = {
+                            throwIfOnlineCompletionDownloadCancelled(task)
+                            progressNotifier.running(94, "正在导入完整章节", force = true)
+                        },
+                    )
+                }
                 throwIfOnlineCompletionDownloadCancelled(task)
                 progressNotifier.finish("已导入阅微", target.result.detailUrl, success = true)
-                logWebDav("online completion download imported file=${localFile.absolutePath} size=${localFile.length()}")
+                logWebDav(
+                    "online completion download complete file=${localFile.absolutePath} " +
+                        "size=${localFile.length()} importedDir=${task.importedBookDir}",
+                )
                 Handler(Looper.getMainLooper()).post {
                     Toast.makeText(context, "已导入：${target.result.name}", Toast.LENGTH_SHORT).show()
                 }
@@ -6313,8 +6330,14 @@ class WebDavDriveHook(
             )
             onProgress(progress, "生成前 ${ONLINE_COMPLETION_PARTIAL_IMPORT_CHAPTERS} 章 EPUB")
             throwIfOnlineCompletionDownloadCancelled(task)
-            writeOnlineCompletionEpub(partialFile, target, firstBatch.filterNotNull(), cover)
-            logWebDav("online completion partial epub ready path=${partialFile.absolutePath} chapters=${firstBatch.size}")
+            val partialChapters = chapters.mapIndexed { index, chapter ->
+                downloaded[index] ?: onlineCompletionPendingChapter(chapter, index)
+            }
+            writeOnlineCompletionEpub(partialFile, target, partialChapters, cover)
+            logWebDav(
+                "online completion partial epub ready path=${partialFile.absolutePath} " +
+                    "downloaded=${firstBatch.size} toc=${partialChapters.size}",
+            )
             onPartialReady(partialFile, ONLINE_COMPLETION_PARTIAL_IMPORT_CHAPTERS)
         }
 
@@ -6333,6 +6356,8 @@ class WebDavDriveHook(
                     downloadOnlineChapter(target, detail.url, detail.body, chapter, index)
                 }.onSuccess { chapterContent ->
                     downloaded[index] = chapterContent
+                    task.downloadedChapters[index] = chapterContent
+                    writeOnlineCompletionChapterToImportedBookIfReady(task, index, chapterContent)
                     failed.remove(index)
                     failureMessages.remove(index)
                     if (index == 0 || (index + 1) % 20 == 0 || index == chapters.lastIndex || attempt > 1) {
@@ -6887,6 +6912,80 @@ class WebDavDriveHook(
         )
     }
 
+    private fun onlineCompletionPendingChapter(chapter: OnlineChapter, index: Int): OnlineDownloadedChapter =
+        OnlineDownloadedChapter(
+            title = chapter.title.ifBlank { "第 ${index + 1} 章" },
+            content = "本章正在后台下载中。\n\n退出本书后重新进入，可刷新已经下载完成的正文。",
+            volumeTitle = chapter.volumeTitle,
+            level = chapter.level,
+        )
+
+    private fun writeOnlineCompletionChapterToImportedBookIfReady(
+        task: OnlineCompletionDownloadTask,
+        index: Int,
+        chapter: OnlineDownloadedChapter,
+    ) {
+        val bookDir = task.importedBookDir ?: return
+        task.bookDirWriteLock.lock()
+        try {
+            throwIfOnlineCompletionDownloadCancelled(task)
+            writeOnlineCompletionChapterToBookDir(bookDir, index, chapter)
+        } finally {
+            task.bookDirWriteLock.unlock()
+        }
+    }
+
+    private fun flushOnlineCompletionDownloadedChapters(task: OnlineCompletionDownloadTask) {
+        val bookDir = task.importedBookDir ?: return
+        val chapters = task.downloadedChapters.entries
+            .sortedBy { it.key }
+            .map { it.key to it.value }
+        if (chapters.isEmpty()) return
+        task.bookDirWriteLock.lock()
+        try {
+            throwIfOnlineCompletionDownloadCancelled(task)
+            chapters.forEach { (index, chapter) ->
+                writeOnlineCompletionChapterToBookDir(bookDir, index, chapter)
+            }
+            logWebDav(
+                "online completion flushed downloaded chapters to imported dir=" +
+                    "${bookDir.absolutePath} count=${chapters.size}",
+            )
+        } finally {
+            task.bookDirWriteLock.unlock()
+        }
+    }
+
+    private fun writeOnlineCompletionChapterToBookDir(
+        bookDir: File,
+        index: Int,
+        chapter: OnlineDownloadedChapter,
+    ) {
+        val root = bookDir.canonicalFile
+        val textDir = File(root, "OEBPS/Text").canonicalFile
+        val rootPrefix = root.path.trimEnd(File.separatorChar) + File.separator
+        if (!textDir.path.startsWith(rootPrefix)) {
+            error("EPUB Text directory escapes book dir")
+        }
+        textDir.mkdirs()
+        val file = File(textDir, "chapter_${(index + 1).toString().padStart(4, '0')}.xhtml").canonicalFile
+        if (!file.path.startsWith(rootPrefix)) error("EPUB chapter path escapes book dir")
+        val temp = File(textDir, "${file.name}.tmp-${Thread.currentThread().id}-${System.nanoTime()}").canonicalFile
+        if (!temp.path.startsWith(rootPrefix)) error("EPUB temp chapter path escapes book dir")
+        temp.writeText(chapterXhtml(chapter.title, chapter.content), Charsets.UTF_8)
+        if (file.exists() && !file.delete()) {
+            temp.delete()
+            error("无法替换章节文件：${file.name}")
+        }
+        if (!temp.renameTo(file)) {
+            temp.copyTo(file, overwrite = true)
+            temp.delete()
+        }
+        if (index == 0 || (index + 1) % 20 == 0) {
+            logWebDav("online completion chapter file updated ${index + 1} path=${file.absolutePath}")
+        }
+    }
+
     private fun onlineCompletionExistingCoverExt(bookDir: File): String? =
         File(bookDir, "OEBPS/Images").listFiles()
             ?.firstOrNull { file ->
@@ -6935,7 +7034,7 @@ class WebDavDriveHook(
         target: OnlineDownloadTarget,
         onWaiting: (() -> Unit)? = null,
         onStarted: (() -> Unit)? = null,
-    ): Boolean {
+    ): OnlineCompletionImportResult {
         var locked = onlineCompletionImportLock.tryLock()
         if (!locked) {
             logWebDav("online completion import queued book=${target.result.name} file=${file.name}")
@@ -6951,7 +7050,7 @@ class WebDavDriveHook(
         }
     }
 
-    private fun importOnlineCompletionBookLocked(file: File, target: OnlineDownloadTarget): Boolean {
+    private fun importOnlineCompletionBookLocked(file: File, target: OnlineDownloadTarget): OnlineCompletionImportResult {
         val bookshelf = currentBookshelfRepository() ?: error("阅微导入服务暂不可用，请先打开书架后重试")
         val sourceUrl = target.result.detailUrl.ifBlank { target.source.sourceUrl }
         val importUuid = onlineBookUuid(target)
@@ -7000,7 +7099,10 @@ class WebDavDriveHook(
                         "treating as non-fatal result=$result file=${file.absolutePath}",
                 )
             }
-            true
+            OnlineCompletionImportResult(
+                imported = true,
+                bookDir = runCatching { File(bookDir.toString()).canonicalFile }.getOrNull(),
+            )
         } finally {
             OnlineCompletionImportSignal.forget(importUuid, importTitle, sourceUrl)
         }
@@ -7027,6 +7129,34 @@ class WebDavDriveHook(
             )
         }.onFailure {
             XposedBridge.log("$LOG_PREFIX online completion metadata sync failed: ${it.stackTraceToString()}")
+        }
+    }
+
+    private fun syncOnlineCompletionImportedBookSize(target: OnlineDownloadTarget) {
+        runCatching {
+            val bookshelf = currentBookshelfRepository() ?: return
+            val sourceUrl = target.result.detailUrl.ifBlank { target.source.sourceUrl }
+            val imported = findLocalBookByUrl(bookshelf, sourceUrl)
+                ?: findLocalBookByUrl(bookshelf, target.result.detailUrl)
+                ?: return
+            val bookDir = bookDirectory(imported).canonicalFile
+            val size = bookDirectorySize(bookDir)
+            val updated = copyBookWithBackupAndPublisher(
+                book = imported,
+                backupType = BACKUP_TYPE_ONLINE_COMPLETION,
+                backupId = bookBackupIdOf(imported).ifBlank { onlineImportedBookBackupId(target) },
+                backupCode = imported.callString("getBackupCode").ifBlank { target.source.id },
+                publisher = "",
+                cover = imported.callString("getCover").ifBlank { target.result.coverUrl },
+                size = size,
+                updated = System.currentTimeMillis(),
+            )
+            updateLocalBook(updated)
+            logWebDav(
+                "online completion imported book size synced uuid=${updated.callString("getUuid")} size=$size",
+            )
+        }.onFailure {
+            XposedBridge.log("$LOG_PREFIX online completion size sync failed: ${it.stackTraceToString()}")
         }
     }
 
@@ -9968,6 +10098,11 @@ img{max-width:100%;max-height:100%;height:auto;}
         val failed: Int,
     )
 
+    private data class OnlineCompletionImportResult(
+        val imported: Boolean,
+        val bookDir: File?,
+    )
+
     private data class OnlineChapter(
         val title: String,
         val url: String,
@@ -10084,6 +10219,9 @@ img{max-width:100%;max-height:100%;height:auto;}
     ) {
         @Volatile var cancelRequested: Boolean = false
         @Volatile var thread: Thread? = null
+        @Volatile var importedBookDir: File? = null
+        val downloadedChapters = ConcurrentHashMap<Int, OnlineDownloadedChapter>()
+        val bookDirWriteLock = ReentrantLock()
     }
 
     private class CacheDeleteStat(

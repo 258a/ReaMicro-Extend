@@ -12,13 +12,11 @@ fun onlineCompletionDownloadTitle(progress: Int, status: String): CharSequence =
 
 fun onlineCompletionDownloadText(bookName: String, status: String): CharSequence {
     val displayName = bookName.ifBlank { ONLINE_COMPLETION_FALLBACK_TITLE }
-    val compactStatus = compactNotificationStatus(status)
-    val text = if (compactStatus.isBlank()) displayName else "$displayName - $compactStatus"
-    return SpannableString(text).apply {
+    return SpannableString(displayName).apply {
         setSpan(
             RelativeSizeSpan(0.82f),
             0,
-            displayName.length.coerceAtMost(text.length),
+            displayName.length,
             Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
         )
     }
@@ -26,18 +24,7 @@ fun onlineCompletionDownloadText(bookName: String, status: String): CharSequence
 
 fun onlineCompletionDownloadBigText(bookName: String, status: String, progress: Int): CharSequence {
     val displayName = bookName.ifBlank { ONLINE_COMPLETION_FALLBACK_TITLE }
-    val compactStatus = compactNotificationStatus(status)
-    val percent = progress.coerceIn(0, 100)
-    return buildString {
-        append(displayName)
-        if (compactStatus.isNotBlank()) {
-            append('\n')
-            append(compactStatus)
-        }
-        append('\n')
-        append(percent)
-        append('%')
-    }
+    return displayName
 }
 
 fun cancelOnlineCompletionNotificationIfDone(manager: NotificationManager, id: Int, done: Boolean) {
