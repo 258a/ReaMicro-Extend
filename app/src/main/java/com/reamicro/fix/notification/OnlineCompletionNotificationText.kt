@@ -35,21 +35,22 @@ fun cancelOnlineCompletionNotificationIfDone(manager: NotificationManager, id: I
 private fun onlineCompletionProgressLabel(progress: Int, status: String): String {
     val compactStatus = compactNotificationStatus(status)
     val percent = progress.coerceIn(0, 100)
+    val failedSuffix = failedCountLabel(compactStatus)
     chapterProgressRegex.find(compactStatus)?.let { match ->
         val current = match.groupValues[1].toIntOrNull() ?: 0
         val total = match.groupValues[2].toIntOrNull() ?: 0
         val chapterPercent = chapterPercent(current, total).takeIf { total > 0 } ?: percent
-        return "${match.groupValues[1]}/${match.groupValues[2]} - $chapterPercent%"
+        return "${match.groupValues[1]}/${match.groupValues[2]} - $chapterPercent%$failedSuffix"
     }
     return when {
         compactStatus.contains(STATUS_DONE) -> STATUS_DONE
-        compactStatus.contains(STATUS_FAILED) -> STATUS_FAILED
-        compactStatus.contains(STATUS_IMPORTING) -> "$STATUS_IMPORT - $percent%"
-        compactStatus.contains(STATUS_RETRY) -> "$STATUS_RETRY - $percent%"
-        compactStatus.contains(STATUS_TOC) -> "$STATUS_TOC - $percent%"
-        compactStatus.contains(STATUS_DETAIL) -> "$STATUS_PREPARE - $percent%"
-        compactStatus.contains(STATUS_GENERATE) -> "$STATUS_GENERATE - $percent%"
-        compactStatus.isNotBlank() -> "${compactStatus.take(8)} - $percent%"
+        compactStatus.contains(STATUS_FAILED) -> "$STATUS_FAILED$failedSuffix"
+        compactStatus.contains(STATUS_IMPORTING) -> "$STATUS_IMPORT - $percent%$failedSuffix"
+        compactStatus.contains(STATUS_RETRY) -> "$STATUS_RETRY - $percent%$failedSuffix"
+        compactStatus.contains(STATUS_TOC) -> "$STATUS_TOC - $percent%$failedSuffix"
+        compactStatus.contains(STATUS_DETAIL) -> "$STATUS_PREPARE - $percent%$failedSuffix"
+        compactStatus.contains(STATUS_GENERATE) -> "$STATUS_GENERATE - $percent%$failedSuffix"
+        compactStatus.isNotBlank() -> "${compactStatus.take(8)} - $percent%$failedSuffix"
         percent > 0 -> "$percent%"
         else -> STATUS_PREPARE
     }
@@ -58,7 +59,13 @@ private fun onlineCompletionProgressLabel(progress: Int, status: String): String
 private fun compactNotificationStatus(status: String): String =
     status.replace(Regex("\\s+"), " ").trim()
 
-private val chapterProgressRegex = Regex("(?:\u4e0b\u8f7d|\u91cd\u8bd5)?\u7ae0\u8282\\s*(\\d+)\\s*/\\s*(\\d+)")
+private fun failedCountLabel(status: String): String {
+    val count = failedCountRegex.find(status)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+    return if (count > 0) " · \u5931\u8d25${count}\u7ae0" else ""
+}
+
+private val chapterProgressRegex = Regex("(?:\u4e0b\u8f7d|\u91cd\u8bd5)?(?:\u65b0\u589e)?\u7ae0\u8282\\s*(\\d+)\\s*/\\s*(\\d+)")
+private val failedCountRegex = Regex("\u5931\u8d25\\s*(\\d+)\\s*\u7ae0")
 
 private fun chapterPercent(current: Int, total: Int): Int {
     if (total <= 0) return 0
