@@ -47,6 +47,7 @@ import android.widget.TextView
 import android.widget.Toast
 import android.webkit.JavascriptInterface
 import com.reamicro.fix.R
+import com.reamicro.fix.association.model.AssociationPlatforms
 import com.reamicro.fix.online.OnlineConcurrentRateLimiter
 import com.reamicro.fix.online.OnlineSourceAuth
 import com.reamicro.fix.online.OnlineSourceEntry
@@ -4949,6 +4950,7 @@ class WebDavDriveHook(
                 status = meta.status,
                 wordCount = meta.wordCount,
                 updateTime = meta.updateTime,
+                platformName = meta.platformName,
             )
         }.distinctBy { "${it.name}|${it.author}|${it.detailUrl}" }
             .take(ONLINE_COMPLETION_RESULT_LIMIT)
@@ -4977,6 +4979,7 @@ class WebDavDriveHook(
             status = meta.status,
             wordCount = meta.wordCount,
             updateTime = meta.updateTime,
+            platformName = meta.platformName,
         )
     }
 
@@ -5046,12 +5049,18 @@ class WebDavDriveHook(
             .takeIf { it > 0 }
             ?: chapterCountFallback.coerceAtLeast(0)
         val status = onlineCompletionStatusText(kind, node)
+        val platformName = if (source.isWanFengLiSource()) {
+            onlineCompletionPlatformName(node, kind)
+        } else {
+            ""
+        }
         logOnlineMetadataGaps(source, node, status, wordCount, updateTime, chapterCount)
         return OnlineResultMetadata(
             status = status,
             wordCount = formatOnlineWordCount(wordCount),
             updateTime = formatOnlineUpdateTime(updateTime),
             chapterCount = chapterCount,
+            platformName = platformName,
         )
     }
 
@@ -5093,13 +5102,55 @@ class WebDavDriveHook(
             .firstOrNull { it > 0 }
             ?: 0
 
-    private fun onlineCompletionSearchMetaLine(result: OnlineBookSearchResult): String =
-        listOfNotNull(
+    private fun onlineCompletionSearchMetaLine(result: OnlineBookSearchResult): String {
+        val tail = if (result.sourceName.isWanFengLiSourceName()) {
+            result.platformName.ifBlank { result.updateTime }
+        } else {
+            result.updateTime
+        }
+        return listOfNotNull(
             result.status.ifBlank { null },
             result.wordCount.ifBlank { null },
             result.chapterCount.takeIf { it > 0 }?.let { "${it}章" },
-            result.updateTime.ifBlank { null },
+            tail.ifBlank { null },
         ).joinToString(" / ").ifBlank { result.sourceName.ifBlank { ONLINE_COMPLETION_TITLE } }
+    }
+
+    private fun onlineCompletionPlatformName(node: Any?, kind: String): String {
+        val raw = onlineFirstJsonString(
+            node,
+            listOf(
+                "platform",
+                "sourcePlatform",
+                "source_platform",
+                "displaySourceName",
+                "display_source_name",
+                "sourceName",
+                "source_name",
+                "bookSource",
+                "origin",
+            ),
+        ).ifBlank {
+            kind.cleanOnlineText().split(Regex("\\s+")).firstOrNull().orEmpty()
+        }
+        return raw.normalizedAssociationPlatformName()
+    }
+
+    private fun String.normalizedAssociationPlatformName(): String {
+        val clean = cleanOnlineText()
+            .trim()
+            .trim('/', '／', ',', '，', ';', '；', '|')
+        if (clean.isBlank() || clean == "null") return ""
+        return AssociationPlatforms.normalizeDisplayName(clean).ifBlank { clean }
+    }
+
+    private fun OnlineSourceEntry.isWanFengLiSource(): Boolean =
+        name.isWanFengLiSourceName() || id.isWanFengLiSourceName() || sourceUrl.contains("whispertale", ignoreCase = true)
+
+    private fun String.isWanFengLiSourceName(): Boolean {
+        val normalized = lowercase(Locale.ROOT).replace(Regex("[\\s_.\\-/]+"), "")
+        return contains("晚风里") || normalized.contains("wanfengli") || normalized.contains("whispertale")
+    }
 
     private fun onlineCompletionStatusText(kind: String, node: Any?): String {
         val text = kind.cleanOnlineText()
@@ -7343,6 +7394,7 @@ class WebDavDriveHook(
             status = current.status.ifBlank { meta.status },
             wordCount = current.wordCount.ifBlank { meta.wordCount },
             updateTime = current.updateTime.ifBlank { meta.updateTime },
+            platformName = current.platformName.ifBlank { meta.platformName },
         )
         target.result = enriched
         logWebDav(
@@ -11362,6 +11414,7 @@ img{max-width:100%;max-height:100%;height:auto;}
         val status: String = "",
         val wordCount: String = "",
         val updateTime: String = "",
+        val platformName: String = "",
     )
 
     private data class OnlineResultMetadata(
@@ -11369,6 +11422,7 @@ img{max-width:100%;max-height:100%;height:auto;}
         val wordCount: String = "",
         val updateTime: String = "",
         val chapterCount: Int = 0,
+        val platformName: String = "",
     )
 
     private data class OnlineDownloadTarget(
