@@ -3,6 +3,7 @@ package com.reamicro.fix.hook
 import android.app.Activity
 import android.app.Dialog
 import android.content.Context
+import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
@@ -224,15 +225,16 @@ class BookDetailsAssociationActionHook(
             val dialog = Dialog(activity)
             val dp = activity.resources.displayMetrics.density
             val primary = activity.resolveThemeColor(android.R.attr.colorAccent, Color.rgb(57, 126, 184))
+            val colors = DialogColors(activity, primary)
             val card = LinearLayout(activity).apply {
                 orientation = LinearLayout.VERTICAL
                 setPadding((22 * dp).toInt(), (22 * dp).toInt(), (22 * dp).toInt(), (18 * dp).toInt())
-                background = roundedDrawable(Color.WHITE, 24 * dp)
+                background = roundedDrawable(colors.card, 24 * dp)
             }
             card.addView(TextView(activity).apply {
                 text = if (snapshot.canUseAssociationCoverFix) "\u5173\u8054\u64cd\u4f5c" else "\u662f\u5426\u53d6\u6d88\u5173\u8054"
                 textSize = 19f
-                setTextColor(Color.rgb(32, 36, 40))
+                setTextColor(colors.title)
                 typeface = Typeface.DEFAULT_BOLD
                 includeFontPadding = false
                 layoutParams = LinearLayout.LayoutParams(
@@ -241,22 +243,22 @@ class BookDetailsAssociationActionHook(
                 ).apply { bottomMargin = (16 * dp).toInt() }
             })
             if (snapshot.canUseAssociationCoverFix) {
-                card.addView(actionButton(activity, "\u5c01\u9762\u4fee\u590d", Color.rgb(232, 242, 250), primary) {
+                card.addView(actionButton(activity, "\u5c01\u9762\u4fee\u590d", colors.primarySoft, colors.primaryText) {
                     dialog.dismiss()
                     fixAssociationCover(bookId)
                 })
             }
             if (snapshot.canUseAssociationUnlink) {
-                card.addView(actionButton(activity, "\u53d6\u6d88\u5173\u8054", Color.rgb(244, 236, 239), Color.rgb(145, 54, 78)) {
+                card.addView(actionButton(activity, "\u53d6\u6d88\u5173\u8054", colors.dangerSoft, colors.dangerText) {
                     dialog.dismiss()
                     unlinkAssociation(bookId, reAssociate = false)
                 })
-                card.addView(actionButton(activity, "\u91cd\u65b0\u5173\u8054", primary, Color.WHITE) {
+                card.addView(actionButton(activity, "\u91cd\u65b0\u5173\u8054", colors.primarySolid, colors.primarySolidText) {
                     dialog.dismiss()
                     unlinkAssociation(bookId, reAssociate = true)
                 })
             }
-            card.addView(actionButton(activity, "\u53d6\u6d88\u64cd\u4f5c", Color.rgb(244, 247, 250), Color.rgb(86, 96, 106)) {
+            card.addView(actionButton(activity, "\u53d6\u6d88\u64cd\u4f5c", colors.neutralSoft, colors.neutralText) {
                 dialog.dismiss()
             })
             dialog.setContentView(card)
@@ -760,6 +762,21 @@ class BookDetailsAssociationActionHook(
             cornerRadius = radius
             setColor(color)
         }
+
+    private class DialogColors(context: Context, primary: Int) {
+        private val dark =
+            (context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+        val card: Int = if (dark) Color.rgb(25, 28, 32) else Color.WHITE
+        val title: Int = if (dark) Color.rgb(229, 230, 235) else Color.rgb(32, 36, 40)
+        val primarySoft: Int = if (dark) Color.rgb(32, 51, 65) else Color.rgb(232, 242, 250)
+        val primaryText: Int = if (dark) Color.rgb(184, 215, 234) else primary
+        val primarySolid: Int = if (dark) Color.rgb(64, 112, 140) else primary
+        val primarySolidText: Int = Color.WHITE
+        val neutralSoft: Int = if (dark) Color.rgb(43, 45, 50) else Color.rgb(244, 247, 250)
+        val neutralText: Int = if (dark) Color.rgb(220, 224, 230) else Color.rgb(86, 96, 106)
+        val dangerSoft: Int = if (dark) Color.rgb(64, 33, 38) else Color.rgb(244, 236, 239)
+        val dangerText: Int = if (dark) Color.rgb(255, 180, 200) else Color.rgb(145, 54, 78)
+    }
 
     private fun Context.resolveThemeColor(attr: Int, fallback: Int): Int {
         val typedValue = TypedValue()
