@@ -10761,8 +10761,8 @@ img{max-width:100%;max-height:100%;height:auto;}
             )
         } else {
             intArrayOf(
-                Color.rgb(34, 34, 34),
-                Color.rgb(92, 96, 104),
+                Color.rgb(122, 128, 138),
+                Color.rgb(108, 114, 124),
                 Color.rgb(132, 132, 132),
             )
         }
