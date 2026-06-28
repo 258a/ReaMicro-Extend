@@ -2110,20 +2110,35 @@ class WebDavDriveHook(
                     val seq = webDavHomeSearchSeq.incrementAndGet()
                     val localSeq = localLibraryHomeSearchSeq.incrementAndGet()
                     val onlineSeq = onlineCompletionHomeSearchSeq.incrementAndGet()
+                    rememberHomeSearchSnapshot(emptyList(), emptyList())
+                    updateHomeOnlineCompletionSearchResults(
+                        param.thisObject,
+                        onlineCompletionPendingSearchGroups(query),
+                    )
                     Thread({
                         runCatching {
                             if (query.isNotBlank()) {
                                 Thread.sleep(HOME_SEARCH_DEBOUNCE_MS)
                                 if (onlineCompletionHomeSearchSeq.get() != onlineSeq) return@runCatching
                             }
-                            val onlineResults = if (query.isBlank()) emptyList() else searchOnlineCompletionSources(query)
-                            if (onlineCompletionHomeSearchSeq.get() != onlineSeq) return@runCatching
-                            Handler(Looper.getMainLooper()).post {
-                                if (onlineCompletionHomeSearchSeq.get() == onlineSeq) {
-                                    updateHomeOnlineCompletionSearchResults(param.thisObject, onlineResults)
+                            if (query.isBlank()) {
+                                if (onlineCompletionHomeSearchSeq.get() != onlineSeq) return@runCatching
+                                Handler(Looper.getMainLooper()).post {
+                                    if (onlineCompletionHomeSearchSeq.get() == onlineSeq) {
+                                        updateHomeOnlineCompletionSearchResults(param.thisObject, emptyList())
+                                    }
+                                }
+                                return@runCatching
+                            }
+                            val onlineResults = searchOnlineCompletionSourcesProgressively(query) { snapshot ->
+                                if (onlineCompletionHomeSearchSeq.get() != onlineSeq) return@searchOnlineCompletionSourcesProgressively
+                                Handler(Looper.getMainLooper()).post {
+                                    if (onlineCompletionHomeSearchSeq.get() == onlineSeq) {
+                                        updateHomeOnlineCompletionSearchResults(param.thisObject, snapshot)
+                                    }
                                 }
                             }
-                            logWebDav("home online search query=$query online=${onlineResults.size}")
+                            logWebDav("home online search query=$query sources=${onlineResults.size}")
                         }.onFailure {
                             XposedBridge.log("$LOG_PREFIX online completion home search failed: ${it.stackTraceToString()}")
                         }
@@ -2132,41 +2147,55 @@ class WebDavDriveHook(
                         runCatching {
                             if (query.isNotBlank()) {
                                 Thread.sleep(HOME_SEARCH_DEBOUNCE_MS)
-                                if (
-                                    webDavHomeSearchSeq.get() != seq ||
-                                    localLibraryHomeSearchSeq.get() != localSeq
-                                ) {
-                                    return@runCatching
-                                }
+                                if (webDavHomeSearchSeq.get() != seq) return@runCatching
                             }
                             val webDavResults = if (query.isBlank() || !hasWebDavLogin(currentContext())) {
                                 emptyList()
                             } else {
                                 searchWebDavBooks(query)
                             }
+                            if (webDavHomeSearchSeq.get() != seq) return@runCatching
+                            val localSnapshot = lastHomeSearchLocalResults
+                            rememberHomeSearchSnapshot(webDavResults, localSnapshot)
+                            Handler(Looper.getMainLooper()).post {
+                                if (webDavHomeSearchSeq.get() == seq) {
+                                    updateHomeWebDavSearchResults(param.thisObject, webDavResults, localSnapshot, null)
+                                }
+                            }
+                            scheduleLocalLibrarySearchRefresh(param.thisObject, query, webDavResults, seq, localSeq, LOCAL_LIBRARY_SEARCH_REFRESH_DELAY_MS)
+                            scheduleLocalLibrarySearchRefresh(param.thisObject, query, webDavResults, seq, localSeq, LOCAL_LIBRARY_SEARCH_LATE_REFRESH_DELAY_MS)
+                            logWebDav("home WebDAV search query=$query results=${webDavResults.size}")
+                        }.onFailure {
+                            XposedBridge.log("$LOG_PREFIX WebDAV home search failed: ${it.stackTraceToString()}")
+                        }
+                    }, "ReaMicroWebDavHomeSearch").start()
+                    Thread({
+                        runCatching {
+                            if (query.isNotBlank()) {
+                                Thread.sleep(HOME_SEARCH_DEBOUNCE_MS)
+                                if (localLibraryHomeSearchSeq.get() != localSeq) return@runCatching
+                            }
                             val localResults = if (query.isBlank() || !canShowLocalLibraryEntry()) {
                                 emptyList()
                             } else {
                                 searchLocalLibraryBooks(query)
                             }
-                            if (webDavHomeSearchSeq.get() != seq) return@runCatching
                             if (localLibraryHomeSearchSeq.get() != localSeq) return@runCatching
-                            rememberHomeSearchSnapshot(webDavResults, localResults)
+                            val webDavSnapshot = lastHomeSearchWebDavResults
+                            rememberHomeSearchSnapshot(webDavSnapshot, localResults)
                             Handler(Looper.getMainLooper()).post {
                                 if (
                                     webDavHomeSearchSeq.get() == seq &&
                                     localLibraryHomeSearchSeq.get() == localSeq
                                 ) {
-                                    updateHomeWebDavSearchResults(param.thisObject, webDavResults, localResults, null)
+                                    updateHomeWebDavSearchResults(param.thisObject, webDavSnapshot, localResults, null)
                                 }
                             }
-                            scheduleLocalLibrarySearchRefresh(param.thisObject, query, webDavResults, seq, localSeq, LOCAL_LIBRARY_SEARCH_REFRESH_DELAY_MS)
-                            scheduleLocalLibrarySearchRefresh(param.thisObject, query, webDavResults, seq, localSeq, LOCAL_LIBRARY_SEARCH_LATE_REFRESH_DELAY_MS)
-                            logWebDav("home search query=$query webdav=${webDavResults.size} local=${localResults.size}")
+                            logWebDav("home local search query=$query results=${localResults.size}")
                         }.onFailure {
-                            XposedBridge.log("$LOG_PREFIX WebDAV home search failed: ${it.stackTraceToString()}")
+                            XposedBridge.log("$LOG_PREFIX local library home search failed: ${it.stackTraceToString()}")
                         }
-                    }, "ReaMicroWebDavHomeSearch").start()
+                    }, "ReaMicroLocalLibraryHomeSearch").start()
                 }
             })
             XposedBridge.log("$LOG_PREFIX WebDAV home search hook installed")
@@ -4637,13 +4666,91 @@ class WebDavDriveHook(
         val context = currentContext() ?: return emptyList()
         val needle = query.trim()
         if (needle.isBlank()) return emptyList()
-        val prefs = context.getSharedPreferences(ModuleSettings.PREFS_NAME, Context.MODE_PRIVATE)
-        val sources = OnlineSourceStore.list(context)
-            .filter { source -> prefs.getBoolean(ModuleSettings.onlineSourceKey(source.id), false) }
+        val sources = enabledOnlineCompletionSources(context)
         logWebDav("online completion search query=$needle sources=${sources.size}")
         onlineCompletionSearchTargets.clear()
         val selectedSources = sources.take(HOME_SEARCH_RESULT_LIMIT)
         return searchOnlineCompletionSourcesConcurrent(selectedSources, needle)
+    }
+
+    private fun searchOnlineCompletionSourcesProgressively(
+        query: String,
+        onUpdate: (List<OnlineSearchGroup>) -> Unit,
+    ): List<OnlineSearchGroup> {
+        val context = currentContext() ?: return emptyList()
+        val needle = query.trim()
+        if (needle.isBlank()) return emptyList()
+        val sources = enabledOnlineCompletionSources(context).take(HOME_SEARCH_RESULT_LIMIT)
+        if (sources.isEmpty()) return emptyList()
+        logWebDav("online completion progressive search query=$needle sources=${sources.size}")
+
+        val latch = CountDownLatch(sources.size)
+        val lock = Any()
+        val groups = Array<OnlineSearchGroup?>(sources.size) { index ->
+            OnlineSearchGroup(sources[index], needle, emptyList(), "搜索中")
+        }
+
+        fun snapshot(): List<OnlineSearchGroup> =
+            synchronized(lock) {
+                groups.mapIndexed { index, group ->
+                    group ?: OnlineSearchGroup(sources[index], needle, emptyList(), "搜索中")
+                }
+            }
+
+        fun publish(index: Int, group: OnlineSearchGroup) {
+            val next = synchronized(lock) {
+                groups[index] = group
+                groups.mapIndexed { groupIndex, item ->
+                    item ?: OnlineSearchGroup(sources[groupIndex], needle, emptyList(), "搜索中")
+                }
+            }
+            onUpdate(next)
+        }
+
+        sources.forEachIndexed { index, source ->
+            Thread({
+                try {
+                    val finalGroup = searchOnlineCompletionSource(source, needle) { parsedGroup ->
+                        publish(index, parsedGroup)
+                    }
+                    publish(index, finalGroup)
+                } finally {
+                    latch.countDown()
+                }
+            }, "ReaMicroOnlineSourceSearch-${source.id.takeLast(6)}").start()
+        }
+
+        latch.await(ONLINE_COMPLETION_SEARCH_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        val timedOut = mutableListOf<Int>()
+        synchronized(lock) {
+            groups.forEachIndexed { index, group ->
+                if (group?.error == "搜索中") {
+                    groups[index] = OnlineSearchGroup(sources[index], needle, emptyList(), "搜索超时")
+                    timedOut += index
+                }
+            }
+        }
+        if (timedOut.isNotEmpty()) onUpdate(snapshot())
+        return snapshot()
+    }
+
+    private fun onlineCompletionPendingSearchGroups(query: String): List<OnlineSearchGroup> {
+        val context = currentContext() ?: return emptyList()
+        val needle = query.trim()
+        if (needle.isBlank()) {
+            onlineCompletionSearchTargets.clear()
+            return emptyList()
+        }
+        onlineCompletionSearchTargets.clear()
+        return enabledOnlineCompletionSources(context)
+            .take(HOME_SEARCH_RESULT_LIMIT)
+            .map { source -> OnlineSearchGroup(source, needle, emptyList(), "搜索中") }
+    }
+
+    private fun enabledOnlineCompletionSources(context: Context): List<OnlineSourceEntry> {
+        val prefs = context.getSharedPreferences(ModuleSettings.PREFS_NAME, Context.MODE_PRIVATE)
+        return OnlineSourceStore.list(context)
+            .filter { source -> prefs.getBoolean(ModuleSettings.onlineSourceKey(source.id), false) }
     }
 
     private fun searchOnlineCompletionSourcesConcurrent(
@@ -4668,7 +4775,11 @@ class WebDavDriveHook(
         }
     }
 
-    private fun searchOnlineCompletionSource(source: OnlineSourceEntry, query: String): OnlineSearchGroup {
+    private fun searchOnlineCompletionSource(
+        source: OnlineSourceEntry,
+        query: String,
+        onParsedResults: ((OnlineSearchGroup) -> Unit)? = null,
+    ): OnlineSearchGroup {
         if (source.searchUrl.isBlank()) {
             return OnlineSearchGroup(source, query, emptyList(), "源缺少 searchUrl")
         }
@@ -4681,6 +4792,9 @@ class WebDavDriveHook(
             val parsedResults = parseOnlineSearchResults(source, query, response)
                 .distinctBy { "${it.name}|${it.author}|${it.detailUrl}" }
                 .take(ONLINE_COMPLETION_RESULT_LIMIT)
+            if (parsedResults.isNotEmpty()) {
+                onParsedResults?.invoke(OnlineSearchGroup(source, query, parsedResults, ""))
+            }
             val results = enrichOnlineSearchResultsMetadata(source, parsedResults)
             logWebDav("online completion source ok name=${source.name} results=${results.size} first=${results.firstOrNull()?.name.orEmpty()}")
             OnlineSearchGroup(source, query, results, "")
