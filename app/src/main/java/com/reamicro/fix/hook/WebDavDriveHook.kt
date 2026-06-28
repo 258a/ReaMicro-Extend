@@ -907,16 +907,7 @@ class WebDavDriveHook(
         book: Any,
         target: OnlineDownloadTarget,
     ): View {
-        val dark = context.isNightMode()
-        val primary = context.resolveOpaqueThemeColor(
-            android.R.attr.textColorPrimary,
-            if (dark) Color.rgb(232, 234, 238) else Color.rgb(34, 34, 34),
-        )
-        val secondary = context.resolveOpaqueThemeColor(
-            android.R.attr.textColorSecondary,
-            if (dark) Color.rgb(181, 187, 196) else Color.rgb(102, 102, 102),
-        )
-        val tertiary = if (dark) Color.rgb(146, 153, 164) else Color.rgb(132, 132, 132)
+        val initialColors = onlineCompletionSearchTextColors(context.isNightMode())
         val row = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -937,33 +928,50 @@ class WebDavDriveHook(
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        texts.addView(TextView(context).apply {
+        val titleView = TextView(context).apply {
             text = target.result.name.ifBlank { "未命名" }
-            setTextColor(primary)
+            setTextColor(initialColors[0])
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
             maxLines = 2
             ellipsize = TextUtils.TruncateAt.END
             includeFontPadding = false
-        })
-        texts.addView(TextView(context).apply {
+        }
+        texts.addView(titleView)
+        val authorView = TextView(context).apply {
             text = target.result.author.ifBlank { "未知作者" }
-            setTextColor(secondary)
+            setTextColor(initialColors[1])
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
             includeFontPadding = false
             setPadding(0, context.dp(5), 0, 0)
-        })
-        texts.addView(TextView(context).apply {
+        }
+        texts.addView(authorView)
+        val metaView = TextView(context).apply {
             text = onlineCompletionSearchMetaLine(target.result)
-            setTextColor(tertiary)
+            setTextColor(initialColors[2])
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
             includeFontPadding = false
             setPadding(0, context.dp(5), 0, 0)
-        })
+        }
+        texts.addView(metaView)
         row.addView(texts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        val applyReadableColors = {
+            val colors = onlineCompletionSearchTextColors(row.isOnDarkBackground(context))
+            titleView.setTextColor(colors[0])
+            authorView.setTextColor(colors[1])
+            metaView.setTextColor(colors[2])
+        }
+        row.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+            override fun onViewAttachedToWindow(v: View) {
+                v.post { applyReadableColors() }
+            }
+
+            override fun onViewDetachedFromWindow(v: View) = Unit
+        })
+        row.post { applyReadableColors() }
         return row
     }
 
@@ -10743,6 +10751,44 @@ img{max-width:100%;max-height:100%;height:auto;}
     private fun Context.isNightMode(): Boolean =
         (resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK) ==
             android.content.res.Configuration.UI_MODE_NIGHT_YES
+
+    private fun onlineCompletionSearchTextColors(dark: Boolean): IntArray =
+        if (dark) {
+            intArrayOf(
+                Color.rgb(232, 234, 238),
+                Color.rgb(188, 194, 204),
+                Color.rgb(146, 153, 164),
+            )
+        } else {
+            intArrayOf(
+                Color.rgb(34, 34, 34),
+                Color.rgb(92, 96, 104),
+                Color.rgb(132, 132, 132),
+            )
+        }
+
+    private fun View.isOnDarkBackground(context: Context): Boolean {
+        var current: View? = this
+        while (current != null) {
+            val color = (current.background as? ColorDrawable)
+                ?.color
+                ?.takeIf { Color.alpha(it) > 32 }
+            if (color != null) return color.isDarkColor()
+            current = current.parent as? View
+        }
+        val decorColor = (activityProvider()?.window?.decorView?.background as? ColorDrawable)
+            ?.color
+            ?.takeIf { Color.alpha(it) > 32 }
+        return decorColor?.isDarkColor() ?: context.isNightMode()
+    }
+
+    private fun Int.isDarkColor(): Boolean {
+        val red = Color.red(this) / 255.0
+        val green = Color.green(this) / 255.0
+        val blue = Color.blue(this) / 255.0
+        val luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+        return luminance < 0.45
+    }
 
     private fun pushWebDavIcon() {
         webDavIconDepth.set((webDavIconDepth.get() ?: 0) + 1)
