@@ -10,6 +10,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.graphics.Canvas
@@ -981,6 +982,7 @@ class WebDavDriveHook(
         if (url.isBlank()) return
         Thread({
             runCatching {
+                decodeOnlineDataImage(url)?.let { return@runCatching it }
                 val connection = withOnlineCleartextAllowed(url) {
                     (URL(url).openConnection() as HttpURLConnection).apply {
                         requestMethod = "GET"
@@ -1011,6 +1013,20 @@ class WebDavDriveHook(
                 logWebDav("online completion search cover failed url=${url.take(120)} error=${it.message.orEmpty()}")
             }
         }, "ReaMicroOnlineSearchCover").start()
+    }
+
+    private fun decodeOnlineDataImage(url: String): Bitmap? {
+        if (!url.startsWith("data:image/", ignoreCase = true)) return null
+        val commaIndex = url.indexOf(',')
+        if (commaIndex <= 0 || commaIndex >= url.length - 1) return null
+        val metadata = url.take(commaIndex).lowercase(Locale.ROOT)
+        val payload = url.substring(commaIndex + 1)
+        val bytes = if (metadata.contains(";base64")) {
+            Base64.decode(payload, Base64.DEFAULT)
+        } else {
+            URLDecoder.decode(payload, "UTF-8").toByteArray(Charsets.UTF_8)
+        }
+        return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
     }
 
     private fun hookWebDavRowIcon() {
