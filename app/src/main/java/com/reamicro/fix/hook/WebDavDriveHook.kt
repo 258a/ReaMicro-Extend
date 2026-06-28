@@ -8603,17 +8603,27 @@ $paragraphs
 
     private fun onlineTocNcx(target: OnlineDownloadTarget, chapters: List<OnlineDownloadedChapter>): String {
         var playOrder = 1
-        fun chapterPoint(index: Int, chapter: OnlineDownloadedChapter): String {
+        fun chapterPoint(index: Int, chapter: OnlineDownloadedChapter, indent: String): String {
             val order = index + 1
             val pointOrder = playOrder++
-            return """<navPoint id="chapter$order" playOrder="$pointOrder"><navLabel><text>${chapter.title.xmlEscape()}</text></navLabel><content src="Text/chapter_${order.toString().padStart(4, '0')}.xhtml"/></navPoint>"""
+            val childIndent = "$indent  "
+            val title = chapter.title.xmlEscape()
+            val href = "Text/chapter_${order.toString().padStart(4, '0')}.xhtml"
+            return buildString {
+                appendLine("""${indent}<navPoint id="chapter$order" playOrder="$pointOrder">""")
+                appendLine("${childIndent}<navLabel>")
+                appendLine("${childIndent}  <text>$title</text>")
+                appendLine("${childIndent}</navLabel>")
+                appendLine("""${childIndent}<content src="$href"/>""")
+                appendLine("${indent}</navPoint>")
+            }
         }
         val points = StringBuilder()
         var index = 0
         while (index < chapters.size) {
             val volumeTitle = chapters[index].volumeTitle.trim()
             if (volumeTitle.isBlank()) {
-                points.append(chapterPoint(index, chapters[index]))
+                points.append(chapterPoint(index, chapters[index], "    "))
                 index += 1
                 continue
             }
@@ -8621,19 +8631,28 @@ $paragraphs
             val volumeOrder = playOrder++
             val children = StringBuilder()
             while (index < chapters.size && chapters[index].volumeTitle.trim() == volumeTitle) {
-                children.append(chapterPoint(index, chapters[index]))
+                children.append(chapterPoint(index, chapters[index], "      "))
                 index += 1
             }
             val href = "Text/chapter_${(startIndex + 1).toString().padStart(4, '0')}.xhtml"
-            points.append(
-                """<navPoint id="volume$volumeOrder" playOrder="$volumeOrder"><navLabel><text>${volumeTitle.xmlEscape()}</text></navLabel><content src="$href"/>$children</navPoint>""",
-            )
+            points.appendLine("""    <navPoint id="volume$volumeOrder" playOrder="$volumeOrder">""")
+            points.appendLine("      <navLabel>")
+            points.appendLine("        <text>${volumeTitle.xmlEscape()}</text>")
+            points.appendLine("      </navLabel>")
+            points.appendLine("""      <content src="$href"/>""")
+            points.append(children)
+            points.appendLine("    </navPoint>")
         }
         return """<?xml version="1.0" encoding="UTF-8"?>
 <ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
-<head><meta name="dtb:uid" content="${onlineBookUuid(target).xmlEscape()}"/></head>
-<docTitle><text>${target.result.name.xmlEscape()}</text></docTitle>
-<navMap>$points</navMap>
+  <head>
+    <meta name="dtb:uid" content="${onlineBookUuid(target).xmlEscape()}"/>
+  </head>
+  <docTitle>
+    <text>${target.result.name.xmlEscape()}</text>
+  </docTitle>
+  <navMap>
+$points  </navMap>
 </ncx>"""
     }
 
