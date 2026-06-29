@@ -210,12 +210,41 @@ class ReaderFontCompletionHook(
             textSize = (callMethod(config, "getTextSize") as? Number)?.toFloat() ?: 17f,
             lineHeight = (callMethod(config, "getLineHeight") as? Number)?.toFloat() ?: 1.5f,
             padding = (callMethod(config, "getPadding") as? Number)?.toInt() ?: 20,
+            globalEmbeddedFonts = callMethod(config, "getGlobalEmbeddedFonts") as? Boolean
+                ?: (callMethod(config, "getEmbeddedFonts") as? Boolean ?: true),
+            bookEmbeddedFonts = (callMethod(config, "getBookEmbeddedFonts") as? Number)?.toInt() ?: 0,
             embeddedFonts = callMethod(config, "getEmbeddedFonts") as? Boolean ?: true,
             buildInFonts = callMethod(config, "getBuildInFonts") as? Boolean ?: true,
         )
 
-    private fun newReaderEpubConfig(value: ResolvedTypeSetting): Any =
-        cls(READER_EPUB_CONFIG_CLASS)
+    private fun newReaderEpubConfig(value: ResolvedTypeSetting): Any {
+        val configClass = cls(READER_EPUB_CONFIG_CLASS)
+        runCatching {
+            configClass
+                .getDeclaredConstructor(
+                    String::class.java,
+                    Float::class.javaPrimitiveType,
+                    Float::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType,
+                    Boolean::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType,
+                    Boolean::class.javaPrimitiveType,
+                    Boolean::class.javaPrimitiveType,
+                )
+                .apply { isAccessible = true }
+                .newInstance(
+                    value.family,
+                    value.textSize,
+                    value.lineHeight,
+                    value.padding,
+                    value.globalEmbeddedFonts,
+                    value.bookEmbeddedFonts,
+                    value.embeddedFonts,
+                    value.buildInFonts,
+                )
+        }.getOrNull()?.let { return it }
+
+        return configClass
             .getDeclaredConstructor(
                 String::class.java,
                 Float::class.javaPrimitiveType,
@@ -233,6 +262,7 @@ class ReaderFontCompletionHook(
                 value.embeddedFonts,
                 value.buildInFonts,
             )
+    }
 
     private fun resolveFontFamily(selection: String): Any? {
         if (selection.isBlank()) return null
@@ -450,6 +480,8 @@ class ReaderFontCompletionHook(
         val textSize: Float,
         val lineHeight: Float,
         val padding: Int,
+        val globalEmbeddedFonts: Boolean,
+        val bookEmbeddedFonts: Int,
         val embeddedFonts: Boolean,
         val buildInFonts: Boolean,
     )

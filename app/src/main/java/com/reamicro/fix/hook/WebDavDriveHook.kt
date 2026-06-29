@@ -183,7 +183,6 @@ class WebDavDriveHook(
     private val onlineCompletionRunningDownloads = ConcurrentHashMap<String, OnlineCompletionDownloadTask>()
     private val onlineCompletionRunningDownloadsByNotificationId = ConcurrentHashMap<Int, OnlineCompletionDownloadTask>()
     private val onlineCompletionRunningUpdates = ConcurrentHashMap<String, Boolean>()
-    private val onlineCompletionPublisherCleanupIds = ConcurrentHashMap.newKeySet<String>()
     private val onlineCompletionImportLock = ReentrantLock(true)
     private val onlineCompletionNotificationIds = AtomicInteger(4300)
     private val onlineCompletionNotificationBlockedLogged = AtomicBoolean(false)
@@ -350,7 +349,6 @@ class WebDavDriveHook(
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     val book = param.args?.getOrNull(1) ?: return
                     if (!isOnlineCompletionLocalBook(book)) return
-                    cleanupOnlineCompletionBookPublisherIfNeeded(book)
                     onlineCompletionBookRowInfoDepth.set((onlineCompletionBookRowInfoDepth.get() ?: 0) + 1)
                 }
 
@@ -6378,32 +6376,6 @@ class WebDavDriveHook(
     private fun isOnlineCompletionUuid(uuid: String): Boolean =
         uuid.startsWith(ONLINE_COMPLETION_UUID_PREFIX)
 
-    private fun cleanupOnlineCompletionBookPublisherIfNeeded(book: Any) {
-        val uuid = book.callString("getUuid")
-        if (!isOnlineCompletionUuid(uuid)) return
-        val publisher = book.callString("getPublisher")
-        if (publisher.isBlank()) return
-        if (!onlineCompletionPublisherCleanupIds.add(uuid)) return
-        Thread({
-            runCatching {
-                val latest = findLocalBookByUuid(book.callLong("getUid"), uuid) ?: book
-                if (latest.callString("getPublisher").isBlank()) return@runCatching
-                val updated = copyBookWithBackupAndPublisher(
-                    book = latest,
-                    backupType = BACKUP_TYPE_ONLINE_COMPLETION,
-                    backupId = bookBackupIdOf(latest).ifBlank { onlineImportedBookBackupIdFromBook(latest) },
-                    backupCode = latest.callString("getBackupCode").ifBlank { onlineSourceIdFromUuid(uuid) },
-                    publisher = "",
-                )
-                updateLocalBook(updated)
-                logWebDav("online completion stale publisher cleared uuid=$uuid oldPublisher=$publisher")
-            }.onFailure {
-                onlineCompletionPublisherCleanupIds.remove(uuid)
-                XposedBridge.log("$LOG_PREFIX online completion publisher cleanup failed: ${it.stackTraceToString()}")
-            }
-        }, "ReaMicroOnlinePublisherCleanup").start()
-    }
-
     private fun onlineImportedBookSourceInfo(book: Any): OnlineImportedBookSourceInfo? {
         if (!isOnlineCompletionLocalBook(book)) return null
         val context = currentContext()
@@ -6653,7 +6625,7 @@ class WebDavDriveHook(
                 backupType = BACKUP_TYPE_ONLINE_COMPLETION,
                 backupId = bookBackupIdOf(latest).ifBlank { onlineImportedBookBackupId(target) },
                 backupCode = latest.callString("getBackupCode").ifBlank { target.source.id },
-                publisher = "",
+                publisher = latest.callString("getPublisher"),
                 cover = latest.callString("getCover").ifBlank { target.result.coverUrl },
                 size = bookDirectorySize(bookDir),
                 updated = System.currentTimeMillis(),
@@ -6784,7 +6756,7 @@ class WebDavDriveHook(
             backupType = BACKUP_TYPE_ONLINE_COMPLETION,
             backupId = bookBackupIdOf(latest).ifBlank { onlineImportedBookBackupId(target) },
             backupCode = latest.callString("getBackupCode").ifBlank { target.source.id },
-            publisher = "",
+            publisher = latest.callString("getPublisher"),
             cover = latest.callString("getCover").ifBlank { target.result.coverUrl },
             size = newSize,
             updated = System.currentTimeMillis(),
@@ -8309,7 +8281,7 @@ class WebDavDriveHook(
                 backupType = BACKUP_TYPE_ONLINE_COMPLETION,
                 backupId = onlineImportedBookBackupId(target),
                 backupCode = target.source.id,
-                publisher = "",
+                publisher = imported.callString("getPublisher"),
                 cover = imported.callString("getCover").ifBlank { target.result.coverUrl },
                 size = size,
                 updated = System.currentTimeMillis(),
@@ -8348,7 +8320,7 @@ class WebDavDriveHook(
                 backupType = BACKUP_TYPE_ONLINE_COMPLETION,
                 backupId = bookBackupIdOf(imported).ifBlank { onlineImportedBookBackupId(target) },
                 backupCode = imported.callString("getBackupCode").ifBlank { target.source.id },
-                publisher = "",
+                publisher = imported.callString("getPublisher"),
                 cover = imported.callString("getCover").ifBlank { target.result.coverUrl },
                 size = size,
                 updated = System.currentTimeMillis(),
@@ -8961,31 +8933,50 @@ $points  </navMap>
         coverExt: String,
         hasCover: Boolean,
     ): String {
-        val manifestChapters = chapters.indices.joinToString("") { index ->
+        val manifestChapters = chapters.indices.joinToString("\n") { index ->
             val order = index + 1
-            """<item id="chapter$order" href="Text/chapter_${order.toString().padStart(4, '0')}.xhtml" media-type="application/xhtml+xml"/>"""
+            """    <item id="chapter$order" href="Text/chapter_${order.toString().padStart(4, '0')}.xhtml" media-type="application/xhtml+xml"/>"""
         }
-        val spine = chapters.indices.joinToString("") { index -> """<itemref idref="chapter${index + 1}"/>""" }
+        val spine = chapters.indices.joinToString("\n") { index -> """    <itemref idref="chapter${index + 1}"/>""" }
         val coverManifest = if (hasCover) {
-            """<item id="cover-image" href="Images/cover.$coverExt" media-type="${coverMimeType(coverExt)}" properties="cover-image"/><item id="cover-page" href="Text/cover.xhtml" media-type="application/xhtml+xml"/>"""
+            listOf(
+                """    <item id="cover-image" href="Images/cover.$coverExt" media-type="${coverMimeType(coverExt)}" properties="cover-image"/>""",
+                """    <item id="cover-page" href="Text/cover.xhtml" media-type="application/xhtml+xml"/>""",
+            ).joinToString("\n")
         } else {
             ""
         }
-        val coverMeta = if (hasCover) """<meta name="cover" content="cover-image"/>""" else ""
-        val coverGuide = if (hasCover) """<guide><reference type="cover" title="Cover" href="Text/cover.xhtml"/></guide>""" else ""
-        val onlineMeta = onlineSourceMetadataOpf(target)
+        val manifestItems = listOf(
+            """    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>""",
+            coverManifest,
+            manifestChapters,
+        ).filter { it.isNotBlank() }.joinToString("\n")
+        val coverMeta = if (hasCover) """    <meta name="cover" content="cover-image"/>""" else ""
+        val coverGuide = if (hasCover) {
+            """
+<guide>
+  <reference type="cover" title="Cover" href="Text/cover.xhtml"/>
+</guide>""".trimIndent()
+        } else {
+            ""
+        }
+        val onlineMeta = onlineSourceMetadataOpf(target).prependIndent("    ")
         return """<?xml version="1.0" encoding="UTF-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" unique-identifier="BookId" version="2.0">
-<metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
-<dc:identifier id="BookId">${onlineBookUuid(target).xmlEscape()}</dc:identifier>
-<dc:title>${target.result.name.xmlEscape()}</dc:title>
-<dc:creator>${target.result.author.xmlEscape()}</dc:creator>
-<dc:language>zh-CN</dc:language>
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
+    <dc:identifier id="BookId">${onlineBookUuid(target).xmlEscape()}</dc:identifier>
+    <dc:title>${target.result.name.xmlEscape()}</dc:title>
+    <dc:creator>${target.result.author.xmlEscape()}</dc:creator>
+    <dc:language>zh-CN</dc:language>
 $coverMeta
 $onlineMeta
-</metadata>
-<manifest><item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>$coverManifest$manifestChapters</manifest>
-<spine toc="ncx">$spine</spine>
+  </metadata>
+  <manifest>
+$manifestItems
+  </manifest>
+  <spine toc="ncx">
+$spine
+  </spine>
 $coverGuide
 </package>"""
     }
@@ -9017,17 +9008,6 @@ img{max-width:100%;max-height:100%;height:auto;}
             URLEncoder.encode(target.source.id, "UTF-8") +
             "?name=${URLEncoder.encode(target.source.name, "UTF-8")}" +
             "&detail=${URLEncoder.encode(target.result.detailUrl.ifBlank { target.source.sourceUrl }, "UTF-8")}"
-
-    private fun onlineImportedBookBackupIdFromBook(book: Any): String {
-        val uuid = book.callString("getUuid")
-        val sourceId = onlineSourceIdFromUuid(uuid)
-        val sourceName = book.callString("getPublisher")
-        val detailUrl = book.callString("getUri")
-        return ONLINE_COMPLETION_BOOK_PREFIX +
-            URLEncoder.encode(sourceId, "UTF-8") +
-            "?name=${URLEncoder.encode(sourceName, "UTF-8")}" +
-            "&detail=${URLEncoder.encode(detailUrl, "UTF-8")}"
-    }
 
     private fun onlineSourceIdFromUuid(uuid: String): String =
         uuid.removePrefix(ONLINE_COMPLETION_UUID_PREFIX)
