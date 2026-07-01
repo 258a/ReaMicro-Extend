@@ -2411,22 +2411,39 @@ class ReaMicroSettingsHook(
                 val progress = ProgressBar(activity).apply {
                     visibility = View.GONE
                 }
-                val deleteButton = if (existing == null) {
-                    null
-                } else {
+                fun actionButton(title: String, color: Int): TextView =
                     TextView(activity).apply {
-                        text = "\u5220\u9664"
-                        setTextColor(Color.parseColor("#D64545"))
+                        text = title
+                        setTextColor(color)
                         gravity = Gravity.CENTER
+                        setSingleLine(true)
+                        textSize = 16f
                         setPadding(0, 24, 0, 8)
+                        layoutParams = LinearLayout.LayoutParams(
+                            0,
+                            ViewGroup.LayoutParams.WRAP_CONTENT,
+                            1f,
+                        )
                     }
+                val primaryColor = Color.rgb(45, 135, 120)
+                val finishButton = actionButton("\u5b8c\u6210", primaryColor)
+                val deleteButton = existing?.let { actionButton("\u5220\u9664", Color.parseColor("#D64545")) }
+                val cancelButton = actionButton("\u53d6\u6d88", primaryColor)
+                val testButton = actionButton("\u6d4b\u8bd5", primaryColor)
+                val actionRow = LinearLayout(activity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    addView(finishButton)
+                    if (deleteButton != null) addView(deleteButton)
+                    addView(cancelButton)
+                    addView(testButton)
                 }
                 container.addView(baseUrlInput)
                 container.addView(apiKeyInput)
                 container.addView(modelInput)
                 container.addView(status)
                 container.addView(progress)
-                if (deleteButton != null) container.addView(deleteButton)
+                container.addView(actionRow)
 
                 var testedBaseUrl = existing?.baseUrl.orEmpty()
                 var testedApiKey = existing?.apiKey.orEmpty()
@@ -2436,9 +2453,6 @@ class ReaMicroSettingsHook(
                 val dialog = AlertDialog.Builder(activity)
                     .setTitle("AI \u914d\u7f6e")
                     .setView(container)
-                    .setPositiveButton("\u6d4b\u8bd5", null)
-                    .setNeutralButton("\u5b8c\u6210", null)
-                    .setNegativeButton("\u53d6\u6d88", null)
                     .create()
                 deleteButton?.setOnClickListener {
                     val target = existing ?: return@setOnClickListener
@@ -2467,8 +2481,16 @@ class ReaMicroSettingsHook(
                 }
 
                 fun refreshButtons() {
-                    dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = hasAllValues() && !testing
-                    dialog.getButton(AlertDialog.BUTTON_NEUTRAL)?.isEnabled = hasAllValues() && testPassedForCurrentValues() && !testing
+                    val canTest = hasAllValues() && !testing
+                    val canFinish = hasAllValues() && testPassedForCurrentValues() && !testing
+                    testButton.isEnabled = canTest
+                    testButton.alpha = if (canTest) 1f else 0.38f
+                    finishButton.isEnabled = canFinish
+                    finishButton.alpha = if (canFinish) 1f else 0.38f
+                    deleteButton?.isEnabled = !testing
+                    deleteButton?.alpha = if (testing) 0.38f else 1f
+                    cancelButton.isEnabled = !testing
+                    cancelButton.alpha = if (testing) 0.38f else 1f
                 }
 
                 val watcher = object : TextWatcher {
@@ -2486,7 +2508,7 @@ class ReaMicroSettingsHook(
                 dialog.setOnShowListener {
                     dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
                     refreshButtons()
-                    dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                    testButton.setOnClickListener {
                         val (baseUrl, apiKey, model) = values()
                         if (baseUrl.isBlank() || apiKey.isBlank() || model.isBlank()) {
                             Toast.makeText(activity, "\u8bf7\u5148\u586b\u5b8c\u5168\u90e8\u5b57\u6bb5", Toast.LENGTH_SHORT).show()
@@ -2515,7 +2537,7 @@ class ReaMicroSettingsHook(
                             }
                         }, "ReaMicroAiApiTest").start()
                     }
-                    dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
+                    finishButton.setOnClickListener {
                         val (baseUrl, apiKey, model) = values()
                         if (!testPassedForCurrentValues()) {
                             Toast.makeText(activity, "\u8bf7\u5148\u6d4b\u8bd5\u901a\u8fc7", Toast.LENGTH_SHORT).show()
@@ -2534,6 +2556,9 @@ class ReaMicroSettingsHook(
                                 "\u5df2\u66f4\u65b0 API\uff1a${config.displayName}"
                             },
                         )
+                        dialog.dismiss()
+                    }
+                    cancelButton.setOnClickListener {
                         dialog.dismiss()
                     }
                 }
