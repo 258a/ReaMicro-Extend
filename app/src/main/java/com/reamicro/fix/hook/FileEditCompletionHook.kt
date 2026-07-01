@@ -71,20 +71,24 @@ class FileEditCompletionHook(
             methods.forEach { method ->
                 method.isAccessible = true
                 XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
                         if (injectingRow.get() == true) return
                         if (!settingsProvider().canUseFileEdit) return
-                        // The host has no public slot under title/author, so append the copy-only identifier row after it renders.
                         val lazyItemScope = param.args?.getOrNull(0) ?: return
                         val book = param.args?.getOrNull(1) ?: return
+                        val onEditTitle = param.args?.getOrNull(2) ?: return
+                        val onEditAuthor = param.args?.getOrNull(3) ?: return
                         val composer = param.args?.getOrNull(4) ?: return
                         injectingRow.set(true)
-                        runCatching {
-                            renderBookIdentifierDetailsItem(lazyItemScope, book, composer)
+                        val rendered = runCatching {
+                            renderBookTitleAuthorIdentifierCard(lazyItemScope, book, onEditTitle, onEditAuthor, composer)
+                        }.onSuccess {
+                            param.result = targetUnit()
                         }.onFailure {
                             XposedBridge.log("$LOG_PREFIX book identifier row render failed: ${it.stackTraceToString()}")
                         }
                         injectingRow.set(false)
+                        rendered.getOrNull()
                     }
                 })
             }
@@ -94,65 +98,48 @@ class FileEditCompletionHook(
         }
     }
 
-    private fun renderBookIdentifierDetailsItem(lazyItemScope: Any, book: Any, composer: Any) {
+    private fun renderBookTitleAuthorIdentifierCard(
+        lazyItemScope: Any,
+        book: Any,
+        onEditTitle: Any,
+        onEditAuthor: Any,
+        composer: Any,
+    ) {
         val displayText = bookIdentifierDisplayText(book)
-        if (displayText.isBlank()) return
-        val shape = roundedShape()
-        val cardModifier = clickableModifier(
-            backgroundModifier(
-                borderModifier(
-                    clipModifier(
-                        lazyAnimateItemModifier(lazyItemScope, fillMaxWidthModifier(modifierInstance())),
-                        shape,
-                    ),
-                    0.4f,
-                    colorScheme(composer).longMethod("getSurfaceContainerHighest"),
-                    shape,
-                ),
-                themeBackgroundAuto(composer),
-            ),
-            "CopyBookIdentifier",
-        ) {
-            copyBookIdentifiers(book)
-        }
-        val modifier = paddingModifier(cardModifier, start = 16, top = 15, end = 12, bottom = 15)
-        val content = functionProxy("BookIdentifierRowContent", FUNCTION3_CLASS) { args ->
-            val rowScope = args?.getOrNull(0) ?: return@functionProxy targetUnit()
-            val innerComposer = args.getOrNull(1) ?: return@functionProxy targetUnit()
-            renderDetailsText(
-                text = "\u6807\u8bc6",
-                modifier = null,
-                color = themeOnBackgroundVariant(innerComposer),
+        renderDetailsCard(lazyItemScope, composer, "BookTitleAuthorIdentifierCard") { innerComposer ->
+            renderDetailsActionRow(
+                label = "\u4e66\u540d",
+                value = callString(book, "getTitle"),
                 composer = innerComposer,
+                onClickName = "EditBookTitle",
+                onClick = { invokeFunction0(onEditTitle) },
+                trailing = editImageVector(),
+                valueWeight = true,
             )
-            renderFixedWidthSpacer(width = 12, composer = innerComposer)
-            renderDetailsText(
-                text = displayText,
-                modifier = rowWeightModifier(rowScope, modifierInstance()),
-                color = colorScheme(innerComposer).longMethod("getOnBackground"),
+            renderDetailsDivider(innerComposer)
+            renderDetailsActionRow(
+                label = "\u4f5c\u8005",
+                value = callString(book, "getAuthor"),
                 composer = innerComposer,
+                onClickName = "EditBookAuthor",
+                onClick = { invokeFunction0(onEditAuthor) },
+                trailing = editImageVector(),
+                valueWeight = true,
             )
-            contentCopyImageVector()?.let { image ->
-                renderIcon(
-                    image = image,
-                    modifier = sizeModifier(modifierInstance(), 20),
-                    tint = colorScheme(innerComposer).longMethod("getSurfaceContainerHighest"),
+            if (displayText.isNotBlank()) {
+                renderDetailsDivider(innerComposer)
+                renderDetailsActionRow(
+                    label = "\u6807\u8bc6",
+                    value = displayText,
                     composer = innerComposer,
+                    onClickName = "CopyBookIdentifier",
+                    onClick = { copyBookIdentifiers(book) },
+                    trailing = contentCopyImageVector(),
+                    valueWeight = true,
                 )
             }
             targetUnit()
         }
-        renderVerticalSpacer(height = 12, composer = composer)
-        method(ROW_KT_CLASS, ROW_METHOD, 7).invoke(
-            null,
-            modifier,
-            arrangementStart(),
-            alignmentCenterVertically(),
-            content,
-            composer,
-            384,
-            0,
-        )
     }
 
     private fun hookBookDetailsSyncSizeItem() {
@@ -167,19 +154,23 @@ class FileEditCompletionHook(
             methods.forEach { method ->
                 method.isAccessible = true
                 XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
                         if (injectingRow.get() == true) return
                         if (!settingsProvider().canUseFileEdit) return
                         val lazyItemScope = param.args?.getOrNull(0) ?: return
                         val book = param.args?.getOrNull(1) ?: return
+                        val onOpenSync = param.args?.getOrNull(2) ?: return
                         val composer = param.args?.getOrNull(3) ?: return
                         injectingRow.set(true)
-                        runCatching {
-                            renderFileEditDetailsItem(lazyItemScope, book, composer)
+                        val rendered = runCatching {
+                            renderFileEditSyncDetailsCard(lazyItemScope, book, onOpenSync, composer)
+                        }.onSuccess {
+                            param.result = targetUnit()
                         }.onFailure {
                             XposedBridge.log("$LOG_PREFIX file edit details row render failed: ${it.stackTraceToString()}")
                         }
                         injectingRow.set(false)
+                        rendered.getOrNull()
                     }
                 })
             }
@@ -189,70 +180,28 @@ class FileEditCompletionHook(
         }
     }
 
-    private fun renderFileEditDetailsItem(lazyItemScope: Any, book: Any, composer: Any) {
-        val shape = roundedShape()
-        val cardModifier = clickableModifier(
-            backgroundModifier(
-                borderModifier(
-                    clipModifier(
-                        lazyAnimateItemModifier(lazyItemScope, fillMaxWidthModifier(modifierInstance())),
-                        shape,
-                    ),
-                    0.4f,
-                    colorScheme(composer).longMethod("getSurfaceContainerHighest"),
-                    shape,
-                ),
-                themeBackgroundAuto(composer),
-            ),
-            "OpenFileEditDetails",
-        ) {
-            openFileEditor(book)
-        }
-        val modifier = paddingModifier(cardModifier, start = 16, top = 15, end = 16, bottom = 15)
-        val content = functionProxy("FileEditDetailsRowContent", FUNCTION3_CLASS) { args ->
-            val rowScope = args?.getOrNull(0) ?: return@functionProxy targetUnit()
-            val innerComposer = args.getOrNull(1) ?: return@functionProxy targetUnit()
-            // Match the host sync row: label on the left, flexible spacer, value and arrow on the right.
-            renderDetailsText(
-                text = "\u7f16\u8f91",
-                modifier = null,
-                color = themeOnBackgroundVariant(innerComposer),
+    private fun renderFileEditSyncDetailsCard(lazyItemScope: Any, book: Any, onOpenSync: Any, composer: Any) {
+        renderDetailsCard(lazyItemScope, composer, "FileEditSyncDetailsCard") { innerComposer ->
+            renderDetailsActionRow(
+                label = "\u7f16\u8f91",
+                value = "\u56fe\u4e66\u7ed3\u6784",
                 composer = innerComposer,
+                onClickName = "OpenFileEditDetails",
+                onClick = { openFileEditor(book) },
+                trailing = navigateNextImageVector(),
             )
-            renderWeightedSpacer(rowScope, innerComposer)
-            renderDetailsText(
-                text = "\u56fe\u4e66\u7ed3\u6784",
-                modifier = null,
-                color = colorScheme(innerComposer).longMethod("getOnBackground"),
+            renderDetailsDivider(innerComposer)
+            renderDetailsActionRow(
+                label = "\u540c\u6b65",
+                value = syncSizeDisplayText(book),
                 composer = innerComposer,
+                onClickName = "OpenBookSync",
+                onClick = { invokeFunction0(onOpenSync) },
+                leadingValueIcon = syncStorageImageVector(book),
+                trailing = navigateNextImageVector(),
             )
-            navigateNextImageVector()?.let { image ->
-                renderIcon(
-                    image = image,
-                    modifier = paddingModifier(
-                        modifierInstance(),
-                        start = 4,
-                        top = 2,
-                        end = 0,
-                        bottom = 0,
-                    ),
-                    tint = colorScheme(innerComposer).longMethod("getSurfaceContainerHighest"),
-                    composer = innerComposer,
-                )
-            }
             targetUnit()
         }
-        renderVerticalSpacer(height = 12, composer = composer)
-        method(ROW_KT_CLASS, ROW_METHOD, 7).invoke(
-            null,
-            modifier,
-            arrangementStart(),
-            alignmentCenterVertically(),
-            content,
-            composer,
-            384,
-            0,
-        )
     }
 
     private fun bookIdentifierDisplayText(book: Any): String =
@@ -279,6 +228,17 @@ class FileEditCompletionHook(
             addText("cloudId", callString(book, "getCloudId"))
         }.joinToString("\n")
 
+    private fun syncSizeDisplayText(book: Any): String =
+        "${backupTypeName(book)} ${formatFileSize(callLong(book, "getSize")).replace(" ", "")}"
+
+    private fun backupTypeName(book: Any): String =
+        runCatching {
+            method(BACKUP_TYPE_CLASS, "getName", 1).invoke(
+                staticObject(BACKUP_TYPE_CLASS, "INSTANCE"),
+                Integer.valueOf(callInt(book, "getBackupType")),
+            )?.toString().orEmpty()
+        }.getOrDefault("").ifBlank { "\u672c\u5730\u5b58\u50a8" }
+
     private fun copyBookIdentifiers(book: Any) {
         val activity = activityProvider() ?: return
         val text = bookIdentifierClipboardText(book).ifBlank { bookIdentifierDisplayText(book) }
@@ -289,6 +249,11 @@ class FileEditCompletionHook(
             Toast.makeText(activity, "\u5df2\u590d\u5236\u6807\u8bc6", Toast.LENGTH_SHORT).show()
         }
         if (Looper.myLooper() == Looper.getMainLooper()) copy() else activity.runOnUiThread { copy() }
+    }
+
+    private fun invokeFunction0(callback: Any?) {
+        runCatching { XposedHelpers.callMethod(callback, "invoke") }
+            .onFailure { XposedBridge.log("$LOG_PREFIX callback invoke failed: ${it.stackTraceToString()}") }
     }
 
     private fun hookBookLocalSheet() {
@@ -1027,7 +992,7 @@ class FileEditCompletionHook(
             composer,
             0,
             24960,
-            TEXT_SECONDARY_SINGLE_LINE_MASK,
+            if (modifier == null) TEXT_SECONDARY_SINGLE_LINE_MASK else TEXT_SECONDARY_SINGLE_LINE_MASK_WITH_MODIFIER,
         )
     }
 
@@ -1069,6 +1034,128 @@ class FileEditCompletionHook(
                 14,
                 null,
             ),
+            0L,
+            composer,
+            0,
+            2,
+        )
+    }
+
+    private fun renderDetailsCard(
+        lazyItemScope: Any,
+        composer: Any,
+        name: String,
+        renderRows: (Any) -> Unit,
+    ) {
+        val shape = roundedShape()
+        val modifier = backgroundModifier(
+            borderModifier(
+                clipModifier(
+                    lazyAnimateItemModifier(lazyItemScope, fillMaxWidthModifier(modifierInstance())),
+                    shape,
+                ),
+                0.4f,
+                colorScheme(composer).longMethod("getSurfaceContainerHighest"),
+                shape,
+            ),
+            themeBackgroundAuto(composer),
+        )
+        val content = functionProxy(name, FUNCTION3_CLASS) { args ->
+            val innerComposer = args?.getOrNull(1) ?: return@functionProxy targetUnit()
+            renderRows(innerComposer)
+            targetUnit()
+        }
+        method(COLUMN_KT_CLASS, COLUMN_METHOD, 7).invoke(
+            null,
+            modifier,
+            arrangementTop(),
+            alignmentStart(),
+            content,
+            composer,
+            384,
+            0,
+        )
+    }
+
+    private fun renderDetailsActionRow(
+        label: String,
+        value: String,
+        composer: Any,
+        onClickName: String,
+        onClick: () -> Unit,
+        trailing: Any?,
+        leadingValueIcon: Any? = null,
+        valueWeight: Boolean = false,
+    ) {
+        val modifier = fillMaxWidthModifier(
+            paddingModifier(
+                clickableModifier(modifierInstance(), onClickName, onClick),
+                start = 16,
+                top = 15,
+                end = 12,
+                bottom = 15,
+            ),
+        )
+        val content = functionProxy("${onClickName}RowContent", FUNCTION3_CLASS) { args ->
+            val rowScope = args?.getOrNull(0) ?: return@functionProxy targetUnit()
+            val innerComposer = args.getOrNull(1) ?: return@functionProxy targetUnit()
+            renderDetailsText(
+                text = label,
+                modifier = null,
+                color = themeOnBackgroundVariant(innerComposer),
+                composer = innerComposer,
+            )
+            renderFixedWidthSpacer(width = 12, composer = innerComposer)
+            if (!valueWeight) renderWeightedSpacer(rowScope, innerComposer)
+            leadingValueIcon?.let { image ->
+                renderIcon(
+                    image = image,
+                    modifier = sizeModifier(
+                        paddingModifier(modifierInstance(), start = 0, top = 0, end = 4, bottom = 0),
+                        18,
+                    ),
+                    tint = syncIconTint(innerComposer),
+                    composer = innerComposer,
+                )
+            }
+            renderDetailsText(
+                text = value,
+                modifier = if (valueWeight) rowWeightModifier(rowScope, modifierInstance()) else null,
+                color = colorScheme(innerComposer).longMethod("getOnBackground"),
+                composer = innerComposer,
+            )
+            trailing?.let { image ->
+                renderIcon(
+                    image = image,
+                    modifier = paddingModifier(
+                        sizeModifier(modifierInstance(), 20),
+                        start = 4,
+                        top = 0,
+                        end = 0,
+                        bottom = 0,
+                    ),
+                    tint = colorScheme(innerComposer).longMethod("getSurfaceContainerHighest"),
+                    composer = innerComposer,
+                )
+            }
+            targetUnit()
+        }
+        method(ROW_KT_CLASS, ROW_METHOD, 7).invoke(
+            null,
+            modifier,
+            arrangementStart(),
+            alignmentCenterVertically(),
+            content,
+            composer,
+            384,
+            0,
+        )
+    }
+
+    private fun renderDetailsDivider(composer: Any) {
+        simpleDividerMethod().invoke(
+            null,
+            paddingModifier(modifierInstance(), start = 16, top = 0, end = 16, bottom = 0),
             0L,
             composer,
             0,
@@ -1183,11 +1270,39 @@ class FileEditCompletionHook(
             )
         }.getOrNull()
 
+    private fun syncStorageImageVector(book: Any): Any? =
+        when (callInt(book, "getBackupType")) {
+            1 -> coloredAppIcon(BAIDU_ICON_CLASS, "getBaiduNetdisk")
+            2 -> coloredAppIcon(YUN115_ICON_CLASS, "getYun115")
+            4 -> coloredAppIcon(ALIYUN_ICON_CLASS, "getAliyun")
+            else -> coloredAppIcon(ANDROID_OS_ICON_CLASS, "getAndroidOs")
+        }
+
+    private fun coloredAppIcon(className: String, methodName: String): Any? =
+        runCatching {
+            method(className, methodName, 1).invoke(
+                null,
+                staticObject(APP_ICONS_COLORED_CLASS, "INSTANCE"),
+            )
+        }.getOrNull()
+
+    private fun syncIconTint(composer: Any): Long =
+        runCatching { colorUnspecified() }.getOrElse { colorScheme(composer).longMethod("getPrimary") }
+
+    private fun colorUnspecified(): Long =
+        staticObject(COLOR_CLASS, "Companion").method0("getUnspecified") as Long
+
     private fun arrangementStart(): Any =
         staticObject(ARRANGEMENT_CLASS, "INSTANCE").method0("getStart")
 
+    private fun arrangementTop(): Any =
+        staticObject(ARRANGEMENT_CLASS, "INSTANCE").method0("getTop")
+
     private fun alignmentCenterVertically(): Any =
         staticObject(ALIGNMENT_CLASS, "INSTANCE").method0("getCenterVertically")
+
+    private fun alignmentStart(): Any =
+        staticObject(ALIGNMENT_CLASS, "INSTANCE").method0("getStart")
 
     private fun themeOnBackgroundVariant(composer: Any): Long =
         method(THEME_KT_CLASS, "getOnBackgroundVariant", 1).invoke(null, colorScheme(composer)) as Long
@@ -1325,6 +1440,9 @@ class FileEditCompletionHook(
     private fun callLong(target: Any, methodName: String): Long =
         runCatching { (XposedHelpers.callMethod(target, methodName) as? Number)?.toLong() ?: 0L }.getOrDefault(0L)
 
+    private fun callInt(target: Any, methodName: String): Int =
+        runCatching { (XposedHelpers.callMethod(target, methodName) as? Number)?.toInt() ?: 0 }.getOrDefault(0)
+
     private fun isEditableFile(file: File): Boolean =
         file.isFile && file.extension.lowercase(Locale.ROOT) in EDITABLE_EXTENSIONS
 
@@ -1350,9 +1468,12 @@ class FileEditCompletionHook(
         const val FILE_BACKUP_METHOD = "FileBackup"
         const val BOOK_TITLE_AUTHOR_ITEM_METHOD = "BookTitleAuthorItem"
         const val BOOK_SYNC_SIZE_ITEM_METHOD = "BookSyncSizeItem"
+        const val BACKUP_TYPE_CLASS = "app.zhendong.reamicro.constants.BackupType"
 
         const val ROW_KT_CLASS = "androidx.compose.foundation.layout.RowKt"
         const val ROW_METHOD = "Row"
+        const val COLUMN_KT_CLASS = "androidx.compose.foundation.layout.ColumnKt"
+        const val COLUMN_METHOD = "Column"
         const val SPACER_KT_CLASS = "androidx.compose.foundation.layout.SpacerKt"
         const val SPACER_METHOD = "Spacer"
         const val ARRANGEMENT_CLASS = "androidx.compose.foundation.layout.Arrangement"
@@ -1372,6 +1493,11 @@ class FileEditCompletionHook(
         const val NAVIGATE_NEXT_ICON_CLASS = "androidx.compose.material.icons.automirrored.filled.NavigateNextKt"
         const val ICONS_OUTLINED_CLASS = "androidx.compose.material.icons.Icons\$Outlined"
         const val ICONS_AUTO_MIRRORED_FILLED_CLASS = "androidx.compose.material.icons.Icons\$AutoMirrored\$Filled"
+        const val APP_ICONS_COLORED_CLASS = "app.zhendong.reamicro.arch.icons.AppIcons\$Colored"
+        const val ANDROID_OS_ICON_CLASS = "app.zhendong.reamicro.arch.icons.colored.AndroidOsKt"
+        const val BAIDU_ICON_CLASS = "app.zhendong.reamicro.arch.icons.colored.BaiduNetdiskKt"
+        const val YUN115_ICON_CLASS = "app.zhendong.reamicro.arch.icons.colored.Yun115Kt"
+        const val ALIYUN_ICON_CLASS = "app.zhendong.reamicro.arch.icons.colored.AliyunKt"
         const val DIVIDER_KT_CLASS = "app.zhendong.reamicro.arch.components.DividerKt"
         const val SIZE_KT_CLASS = "androidx.compose.foundation.layout.SizeKt"
         const val HEIGHT_METHOD = "height-3ABfNKs"
@@ -1407,6 +1533,7 @@ class FileEditCompletionHook(
         const val FUNCTION3_CLASS = "kotlin.jvm.functions.Function3"
         const val TEXT_DEFAULT_MASK_WITH_MODIFIER = 131064
         const val TEXT_SECONDARY_SINGLE_LINE_MASK = 110586
+        const val TEXT_SECONDARY_SINGLE_LINE_MASK_WITH_MODIFIER = 110584
         const val FILE_EDIT_TITLE_KEY = 0x524D4701
         const val FILE_EDIT_SUPPORTING_KEY = 0x524D4702
         const val FILE_EDIT_LEADING_KEY = 0x524D4703
