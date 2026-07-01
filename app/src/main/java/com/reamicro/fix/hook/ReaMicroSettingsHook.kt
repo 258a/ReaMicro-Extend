@@ -529,11 +529,11 @@ class ReaMicroSettingsHook(
                     composer = itemComposer,
                 )
             }
-            addLazyItem(lazyListScope, READER_SWITCHES_ITEM_KEY) { itemComposer ->
+            addLazyItem(lazyListScope, ONLINE_COMPLETION_SETTINGS_ITEM_KEY) { itemComposer ->
                 renderNestedSettingsEntry(
-                    title = "\u9605\u8bfb\u8865\u5168",
-                    callbackName = "OpenReaderCompletionSettings",
-                    route = InjectedRoute.ReaderCompletionSettings,
+                    title = ONLINE_COMPLETION_TITLE,
+                    callbackName = "OpenOnlineCompletionSettings",
+                    route = InjectedRoute.OnlineCompletionSettings,
                     composer = itemComposer,
                 )
             }
@@ -545,6 +545,22 @@ class ReaMicroSettingsHook(
                     composer = itemComposer,
                 )
             }
+            addLazyItem(lazyListScope, FONT_SETTINGS_ITEM_KEY) { itemComposer ->
+                renderNestedSettingsEntry(
+                    title = "\u5b57\u4f53\u8865\u5168",
+                    callbackName = "OpenFontSettings",
+                    route = InjectedRoute.FontSettings,
+                    composer = itemComposer,
+                )
+            }
+            addLazyItem(lazyListScope, READER_SWITCHES_ITEM_KEY) { itemComposer ->
+                renderNestedSettingsEntry(
+                    title = "\u9605\u8bfb\u8865\u5168",
+                    callbackName = "OpenReaderCompletionSettings",
+                    route = InjectedRoute.ReaderCompletionSettings,
+                    composer = itemComposer,
+                )
+            }
             addLazyItem(lazyListScope, ROTATION_SWITCHES_ITEM_KEY) { itemComposer ->
                 renderNestedSettingsEntry(
                     title = "\u65cb\u8f6c\u8865\u5168",
@@ -553,27 +569,11 @@ class ReaMicroSettingsHook(
                     composer = itemComposer,
                 )
             }
-            addLazyItem(lazyListScope, ONLINE_COMPLETION_SETTINGS_ITEM_KEY) { itemComposer ->
-                renderNestedSettingsEntry(
-                    title = ONLINE_COMPLETION_TITLE,
-                    callbackName = "OpenOnlineCompletionSettings",
-                    route = InjectedRoute.OnlineCompletionSettings,
-                    composer = itemComposer,
-                )
-            }
             addLazyItem(lazyListScope, AI_CONFIG_SETTINGS_ITEM_KEY) { itemComposer ->
                 renderNestedSettingsEntry(
                     title = AI_CONFIG_TITLE,
                     callbackName = "OpenAiConfigSettings",
                     route = InjectedRoute.AiConfigSettings,
-                    composer = itemComposer,
-                )
-            }
-            addLazyItem(lazyListScope, FONT_SETTINGS_ITEM_KEY) { itemComposer ->
-                renderNestedSettingsEntry(
-                    title = "\u5b57\u4f53\u8865\u5168",
-                    callbackName = "OpenFontSettings",
-                    route = InjectedRoute.FontSettings,
                     composer = itemComposer,
                 )
             }
@@ -958,29 +958,13 @@ class ReaMicroSettingsHook(
         val listContent = functionProxy("AssociationCompletionList", FUNCTION1_CLASS) { args ->
             val lazyListScope = args?.getOrNull(0) ?: return@functionProxy targetUnit()
             val snapshot = settings.snapshot()
-            val expandedState = associationExpandedState(snapshot.associationEnabled)
             val rows = buildList {
-                add(
-                    ToggleRow(
-                        key = ModuleSettings.KEY_ASSOCIATION_ENABLED,
-                        title = "\u5173\u8054\u8865\u5168",
-                        checked = snapshot.associationEnabled,
-                        checkedProvider = { booleanStateValue(expandedState) },
-                        onChanged = { checked, _ ->
-                            settings.setAssociationEnabled(checked)
-                            setBooleanState(expandedState, checked)
-                            checked
-                        },
-                    ),
-                )
                 add(
                     ToggleRow(
                         key = ModuleSettings.KEY_ASSOCIATION_MANUAL_EDIT_ENABLED,
                         title = "\u624b\u52a8\u7f16\u8f91",
                         checked = snapshot.associationManualEditEnabled,
-                        visibleProvider = {
-                            booleanStateValue(expandedState) && hasManualEditFeature()
-                        },
+                        visibleProvider = { hasManualEditFeature() },
                         onChanged = { checked, _ ->
                             settings.setAssociationManualEditEnabled(checked)
                             checked
@@ -992,7 +976,6 @@ class ReaMicroSettingsHook(
                         key = ModuleSettings.KEY_ASSOCIATION_UNLINK_ENABLED,
                         title = "\u53d6\u6d88\u5173\u8054",
                         checked = snapshot.associationUnlinkEnabled,
-                        visibleProvider = { booleanStateValue(expandedState) },
                         onChanged = { checked, _ ->
                             settings.setAssociationUnlinkEnabled(checked)
                             checked
@@ -1004,7 +987,6 @@ class ReaMicroSettingsHook(
                         key = ModuleSettings.KEY_ASSOCIATION_COVER_FIX_ENABLED,
                         title = "\u5c01\u9762\u4fee\u590d",
                         checked = snapshot.associationCoverFixEnabled,
-                        visibleProvider = { booleanStateValue(expandedState) },
                         onChanged = { checked, _ ->
                             settings.setAssociationCoverFixEnabled(checked)
                             checked
@@ -1017,7 +999,6 @@ class ReaMicroSettingsHook(
                             key = ModuleSettings.searchSourceKey(group.id),
                             title = group.title,
                             checked = snapshot.isSearchSourceGroupEnabled(group.id),
-                            visibleProvider = { booleanStateValue(expandedState) },
                             onChanged = { checked, updateRow ->
                                 setAssociationSearchSourceEnabled(group.id, checked) { value ->
                                     updateRow(ModuleSettings.searchSourceKey(group.id), value)
@@ -1039,24 +1020,11 @@ class ReaMicroSettingsHook(
         val listContent = functionProxy("ReaderCompletionList", FUNCTION1_CLASS) { args ->
             val lazyListScope = args?.getOrNull(0) ?: return@functionProxy targetUnit()
             val snapshot = settings.snapshot()
-            val expandedState = readerExpandedState(snapshot.readerEnabled)
             val rows = listOf(
-                ToggleRow(
-                    key = ModuleSettings.KEY_READER_ENABLED,
-                    title = "\u9605\u8bfb\u8865\u5168",
-                    checked = snapshot.readerEnabled,
-                    checkedProvider = { booleanStateValue(expandedState) },
-                    onChanged = { checked, _ ->
-                        settings.setReaderEnabled(checked)
-                        setBooleanState(expandedState, checked)
-                        checked
-                    },
-                ),
                 ToggleRow(
                     key = ModuleSettings.KEY_READER_AUTO_PAGE_ENABLED,
                     title = "\u81ea\u52a8\u9605\u8bfb",
                     checked = snapshot.readerAutoPageEnabled,
-                    visibleProvider = { booleanStateValue(expandedState) },
                     onChanged = { checked, _ ->
                         settings.setReaderAutoPageEnabled(checked)
                         checked
@@ -1066,7 +1034,6 @@ class ReaMicroSettingsHook(
                     key = ModuleSettings.KEY_READER_KEEP_SCREEN_ON_ENABLED,
                     title = "\u5c4f\u5e55\u5e38\u4eae",
                     checked = snapshot.readerKeepScreenOnEnabled,
-                    visibleProvider = { booleanStateValue(expandedState) },
                     onChanged = { checked, _ ->
                         settings.setReaderKeepScreenOnEnabled(checked)
                         checked
@@ -1076,7 +1043,6 @@ class ReaMicroSettingsHook(
                     key = ModuleSettings.KEY_READER_OVERWRITE_CHECK_ENABLED,
                     title = "\u8986\u76d6\u68c0\u67e5",
                     checked = snapshot.readerOverwriteCheckEnabled,
-                    visibleProvider = { booleanStateValue(expandedState) },
                     onChanged = { checked, _ ->
                         settings.setReaderOverwriteCheckEnabled(checked)
                         checked
@@ -1086,7 +1052,6 @@ class ReaMicroSettingsHook(
                     key = ModuleSettings.KEY_EDIT_FILE_ENABLED,
                     title = "\u6587\u4ef6\u7f16\u8f91",
                     checked = snapshot.editFileEnabled,
-                    visibleProvider = { booleanStateValue(expandedState) },
                     onChanged = { checked, _ ->
                         settings.setEditFileEnabled(checked)
                         checked
@@ -1096,7 +1061,6 @@ class ReaMicroSettingsHook(
                     key = ModuleSettings.KEY_READER_EDIT_OVERWRITE_ENABLED,
                     title = "\u7f16\u8f91\u8986\u5199",
                     checked = snapshot.readerEditOverwriteEnabled,
-                    visibleProvider = { booleanStateValue(expandedState) },
                     onChanged = { checked, _ ->
                         settings.setReaderEditOverwriteEnabled(checked)
                         checked
@@ -1106,7 +1070,6 @@ class ReaMicroSettingsHook(
                     key = ModuleSettings.KEY_READER_DICTIONARY_ENABLED,
                     title = "\u8bcd\u5178\u91ca\u4e49",
                     checked = snapshot.readerDictionaryEnabled,
-                    visibleProvider = { booleanStateValue(expandedState) },
                     onChanged = { checked, _ ->
                         settings.setReaderDictionaryEnabled(checked)
                         checked
@@ -1125,24 +1088,11 @@ class ReaMicroSettingsHook(
         val listContent = functionProxy("CloudCompletionList", FUNCTION1_CLASS) { args ->
             val lazyListScope = args?.getOrNull(0) ?: return@functionProxy targetUnit()
             val snapshot = settings.snapshot()
-            val expandedState = cloudExpandedState(snapshot.cloudEnabled)
             val rows = listOf(
-                ToggleRow(
-                    key = ModuleSettings.KEY_CLOUD_ENABLED,
-                    title = "\u4e91\u76d8\u8865\u5168",
-                    checked = snapshot.cloudEnabled,
-                    checkedProvider = { booleanStateValue(expandedState) },
-                    onChanged = { checked, _ ->
-                        settings.setCloudEnabled(checked)
-                        setBooleanState(expandedState, checked)
-                        checked
-                    },
-                ),
                 ToggleRow(
                     key = ModuleSettings.KEY_CLOUD_WEBDAV_ENABLED,
                     title = "WebDAV",
                     checked = snapshot.cloudWebDavEnabled,
-                    visibleProvider = { booleanStateValue(expandedState) },
                     onChanged = { checked, _ ->
                         settings.setCloudWebDavEnabled(checked)
                         checked
@@ -1152,7 +1102,6 @@ class ReaMicroSettingsHook(
                     key = ModuleSettings.KEY_CLOUD_LOCAL_LIBRARY_ENABLED,
                     title = "\u672c\u5730\u4e66\u5e93",
                     checked = snapshot.cloudLocalLibraryEnabled,
-                    visibleProvider = { booleanStateValue(expandedState) },
                     onChanged = { checked, _ ->
                         settings.setCloudLocalLibraryEnabled(checked)
                         checked
@@ -1162,7 +1111,6 @@ class ReaMicroSettingsHook(
                     key = ModuleSettings.KEY_CLOUD_EXTENDED_DISPLAY_ENABLED,
                     title = "\u6269\u5c55\u663e\u793a",
                     checked = snapshot.cloudExtendedDisplayEnabled,
-                    visibleProvider = { booleanStateValue(expandedState) },
                     onChanged = { checked, _ ->
                         settings.setCloudExtendedDisplayEnabled(checked)
                         checked
@@ -1172,7 +1120,6 @@ class ReaMicroSettingsHook(
                     key = ModuleSettings.KEY_CLOUD_DOWNLOAD_CANCEL_ENABLED,
                     title = "\u5141\u8bb8\u53d6\u6d88",
                     checked = snapshot.cloudDownloadCancelEnabled,
-                    visibleProvider = { booleanStateValue(expandedState) },
                     onChanged = { checked, _ ->
                         settings.setCloudDownloadCancelEnabled(checked)
                         checked
@@ -1191,7 +1138,6 @@ class ReaMicroSettingsHook(
         val listContent = functionProxy("RotationCompletionList", FUNCTION1_CLASS) { args ->
             val lazyListScope = args?.getOrNull(0) ?: return@functionProxy targetUnit()
             val snapshot = settings.snapshot()
-            val expandedState = rotationExpandedState(snapshot.rotationEnabled)
             val rotationState = RotationUiState.fromActivityOrientation(
                 activityProvider()?.requestedOrientation,
                 snapshot.rotationReverseEnabled,
@@ -1199,23 +1145,10 @@ class ReaMicroSettingsHook(
             val rows = buildList {
                 add(
                     ToggleRow(
-                        key = ModuleSettings.KEY_ROTATION_ENABLED,
-                        title = "\u65cb\u8f6c\u8865\u5168",
-                        checked = snapshot.rotationEnabled,
-                        checkedProvider = { booleanStateValue(expandedState) },
-                        onChanged = { checked, updateRow ->
-                            setBooleanState(expandedState, checked)
-                            setRotationEnabled(checked, rotationState, updateRow)
-                        },
-                    ),
-                )
-                add(
-                    ToggleRow(
                         key = ModuleSettings.KEY_ROTATION_AUTO_ENABLED,
                         title = "\u81ea\u52a8\u65cb\u8f6c",
                         checked = rotationState.autoEnabled,
                         checkedProvider = { currentRotationDisplayState().autoEnabled },
-                        visibleProvider = { booleanStateValue(expandedState) },
                         syncWithSnapshot = true,
                         onChanged = { checked, updateRow ->
                             setRotationBaseEnabled(ModuleSettings.KEY_ROTATION_AUTO_ENABLED, checked, updateRow)
@@ -1228,7 +1161,6 @@ class ReaMicroSettingsHook(
                         title = "\u7ad6\u5411\u9501\u5b9a",
                         checked = rotationState.portraitLockEnabled,
                         checkedProvider = { currentRotationDisplayState().portraitLockEnabled },
-                        visibleProvider = { booleanStateValue(expandedState) },
                         syncWithSnapshot = true,
                         onChanged = { checked, updateRow ->
                             setRotationBaseEnabled(ModuleSettings.KEY_ROTATION_PORTRAIT_LOCK_ENABLED, checked, updateRow)
@@ -1241,7 +1173,6 @@ class ReaMicroSettingsHook(
                         title = "\u6a2a\u5411\u9501\u5b9a",
                         checked = rotationState.landscapeLockEnabled,
                         checkedProvider = { currentRotationDisplayState().landscapeLockEnabled },
-                        visibleProvider = { booleanStateValue(expandedState) },
                         syncWithSnapshot = true,
                         onChanged = { checked, updateRow ->
                             setRotationBaseEnabled(ModuleSettings.KEY_ROTATION_LANDSCAPE_LOCK_ENABLED, checked, updateRow)
@@ -1254,7 +1185,6 @@ class ReaMicroSettingsHook(
                         title = "\u53cd\u5411\u65cb\u8f6c",
                         checked = rotationState.reverseEnabled,
                         checkedProvider = { currentRotationDisplayState().reverseEnabled },
-                        visibleProvider = { booleanStateValue(expandedState) },
                         syncWithSnapshot = true,
                         onChanged = { checked, updateRow ->
                             suppressRotationSnapshotSync()
@@ -2358,7 +2288,7 @@ class ReaMicroSettingsHook(
                         key = "ai_api_add",
                         title = "\u6dfb\u52a0 API",
                         subtitle = "OpenAI \u517c\u5bb9\u63a5\u53e3\uff1abase_url\u3001api_key\u3001model",
-                        onClick = ::openAiApiConfigDialog,
+                        onClick = { openAiApiConfigDialog() },
                     ),
                 )
                 if (configs.isEmpty()) {
@@ -2377,7 +2307,7 @@ class ReaMicroSettingsHook(
                                 title = config.displayName.compactOnlineSourceLine(),
                                 subtitle = aiApiSubtitle(config),
                                 onClick = { showToast(config.baseUrl) },
-                                onLongClick = { removeAiApiConfig(config) },
+                                onLongClick = { openAiApiConfigDialog(config) },
                                 trailingContent = { itemComposer ->
                                     renderAiApiSwitch(config, itemComposer)
                                 },
@@ -2398,8 +2328,7 @@ class ReaMicroSettingsHook(
         AiApiStore.list(activityProvider()?.applicationContext)
 
     private fun aiApiSubtitle(config: AiApiConfig): String =
-        (if (config.enabled) "\u5df2\u542f\u7528 \u00b7 " else "") +
-            "${config.baseUrl} \u00b7 ${AiApiStore.maskedKey(config.apiKey)}"
+        config.baseUrl
 
     private fun renderAiApiSwitch(config: AiApiConfig, composer: Any) {
         val latest = listAiApiConfigs().firstOrNull { it.id == config.id } ?: config
@@ -2441,15 +2370,11 @@ class ReaMicroSettingsHook(
         )
     }
 
-    private fun removeAiApiConfig(config: AiApiConfig) {
-        val removed = AiApiStore.remove(activityProvider()?.applicationContext, config.id)
-        if (removed) {
-            bumpAiApiVersion()
-            showToast("\u5df2\u79fb\u9664 API\uff1a${config.displayName}")
-        }
+    private fun openAiApiConfigDialog() {
+        openAiApiConfigDialog(existing = null)
     }
 
-    private fun openAiApiConfigDialog() {
+    private fun openAiApiConfigDialog(existing: AiApiConfig?) {
         val activity = activityProvider() ?: return
         activity.runOnUiThread {
             runCatching {
@@ -2461,33 +2386,51 @@ class ReaMicroSettingsHook(
                     hint = "base_url"
                     inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
                     setSingleLine(true)
+                    setText(existing?.baseUrl.orEmpty())
                 }
                 val apiKeyInput = EditText(activity).apply {
                     hint = "api_key"
                     inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
                     setSingleLine(true)
+                    setText(existing?.apiKey.orEmpty())
                 }
                 val modelInput = EditText(activity).apply {
                     hint = "model"
                     inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_NORMAL
                     setSingleLine(true)
+                    setText(existing?.model.orEmpty())
                 }
                 val status = TextView(activity).apply {
-                    text = "\u586b\u5b8c\u540e\u5148\u70b9\u51fb\u6d4b\u8bd5"
+                    text = if (existing == null) {
+                        "\u586b\u5b8c\u540e\u5148\u70b9\u51fb\u6d4b\u8bd5"
+                    } else {
+                        "\u5f53\u524d\u914d\u7f6e\u53ef\u76f4\u63a5\u5b8c\u6210\uff0c\u4fee\u6539\u540e\u9700\u8981\u91cd\u65b0\u6d4b\u8bd5"
+                    }
                     setPadding(0, 16, 0, 0)
                 }
                 val progress = ProgressBar(activity).apply {
                     visibility = View.GONE
+                }
+                val deleteButton = if (existing == null) {
+                    null
+                } else {
+                    TextView(activity).apply {
+                        text = "\u5220\u9664"
+                        setTextColor(Color.parseColor("#D64545"))
+                        gravity = Gravity.CENTER
+                        setPadding(0, 24, 0, 8)
+                    }
                 }
                 container.addView(baseUrlInput)
                 container.addView(apiKeyInput)
                 container.addView(modelInput)
                 container.addView(status)
                 container.addView(progress)
+                if (deleteButton != null) container.addView(deleteButton)
 
-                var testedBaseUrl = ""
-                var testedApiKey = ""
-                var testedModel = ""
+                var testedBaseUrl = existing?.baseUrl.orEmpty()
+                var testedApiKey = existing?.apiKey.orEmpty()
+                var testedModel = existing?.model.orEmpty()
                 var testing = false
 
                 val dialog = AlertDialog.Builder(activity)
@@ -2497,6 +2440,14 @@ class ReaMicroSettingsHook(
                     .setNeutralButton("\u5b8c\u6210", null)
                     .setNegativeButton("\u53d6\u6d88", null)
                     .create()
+                deleteButton?.setOnClickListener {
+                    val target = existing ?: return@setOnClickListener
+                    if (AiApiStore.remove(activity.applicationContext, target.id)) {
+                        bumpAiApiVersion()
+                        showToast("\u5df2\u5220\u9664 API\uff1a${target.displayName}")
+                    }
+                    dialog.dismiss()
+                }
 
                 fun values(): Triple<String, String, String> =
                     Triple(
@@ -2570,9 +2521,19 @@ class ReaMicroSettingsHook(
                             Toast.makeText(activity, "\u8bf7\u5148\u6d4b\u8bd5\u901a\u8fc7", Toast.LENGTH_SHORT).show()
                             return@setOnClickListener
                         }
-                        val config = AiApiStore.add(activity.applicationContext, baseUrl, apiKey, model)
+                        val config = if (existing == null) {
+                            AiApiStore.add(activity.applicationContext, baseUrl, apiKey, model)
+                        } else {
+                            AiApiStore.update(activity.applicationContext, existing.id, baseUrl, apiKey, model)
+                        }
                         bumpAiApiVersion()
-                        showToast("\u5df2\u6dfb\u52a0 API\uff1a${config.displayName}")
+                        showToast(
+                            if (existing == null) {
+                                "\u5df2\u6dfb\u52a0 API\uff1a${config.displayName}"
+                            } else {
+                                "\u5df2\u66f4\u65b0 API\uff1a${config.displayName}"
+                            },
+                        )
                         dialog.dismiss()
                     }
                 }

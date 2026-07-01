@@ -144,7 +144,7 @@ data class ModuleSettingsSnapshot(
     val associationSearchSources: Map<String, Boolean> = ModuleSettings.defaultAssociationSearchSources(),
 ) {
     val canRunAssociation: Boolean
-        get() = moduleEnabled && associationEnabled
+        get() = moduleEnabled
 
     val canRunAssociationSearch: Boolean
         get() = canRunAssociation && associationSearchSources.any { it.value }
@@ -159,28 +159,28 @@ data class ModuleSettingsSnapshot(
         get() = canRunAssociation && associationCoverFixEnabled
 
     val canRunReaderLongPress: Boolean
-        get() = moduleEnabled && readerEnabled && readerLongPressEnabled
+        get() = moduleEnabled && readerLongPressEnabled
 
     val canRunReaderAutoPage: Boolean
-        get() = moduleEnabled && readerEnabled && readerAutoPageEnabled
+        get() = moduleEnabled && readerAutoPageEnabled
 
     val canKeepScreenOnDuringAutoPage: Boolean
         get() = canRunReaderAutoPage && readerKeepScreenOnEnabled
 
     val canRunReaderOverwriteCheck: Boolean
-        get() = moduleEnabled && readerEnabled && readerOverwriteCheckEnabled
+        get() = moduleEnabled && readerOverwriteCheckEnabled
 
     val canEditReaderSelection: Boolean
-        get() = moduleEnabled && readerEnabled && readerEditOverwriteEnabled
+        get() = moduleEnabled && readerEditOverwriteEnabled
 
     val canShowReaderDictionary: Boolean
-        get() = moduleEnabled && readerEnabled && readerDictionaryEnabled
+        get() = moduleEnabled && readerDictionaryEnabled
 
     val canRunFontCompletion: Boolean
-        get() = moduleEnabled && fontEnabled
+        get() = moduleEnabled
 
     val canUseFontSettings: Boolean
-        get() = canRunFontCompletion && fontSettingsEnabled
+        get() = moduleEnabled
 
     val canRunAccountCompletion: Boolean
         get() = moduleEnabled && accountEnabled
@@ -192,25 +192,25 @@ data class ModuleSettingsSnapshot(
         get() = canRunAccountCompletion && accountCacheCleanupEnabled
 
     val canRunEditCompletion: Boolean
-        get() = moduleEnabled && readerEnabled
+        get() = moduleEnabled
 
     val canUseFileEdit: Boolean
-        get() = moduleEnabled && readerEnabled && editFileEnabled
+        get() = moduleEnabled && editFileEnabled
 
     val canRunWebDavCloud: Boolean
-        get() = moduleEnabled && cloudEnabled && cloudWebDavEnabled
+        get() = moduleEnabled && cloudWebDavEnabled
 
     val canRunLocalLibraryCloud: Boolean
-        get() = moduleEnabled && cloudEnabled && cloudLocalLibraryEnabled
+        get() = moduleEnabled && cloudLocalLibraryEnabled
 
     val canUseCloudExtendedDisplay: Boolean
-        get() = moduleEnabled && cloudEnabled && cloudExtendedDisplayEnabled
+        get() = moduleEnabled && cloudExtendedDisplayEnabled
 
     val canCancelCloudDownload: Boolean
-        get() = moduleEnabled && cloudEnabled && cloudDownloadCancelEnabled
+        get() = moduleEnabled && cloudDownloadCancelEnabled
 
     val canApplyRotation: Boolean
-        get() = moduleEnabled && rotationEnabled &&
+        get() = moduleEnabled &&
             (rotation.autoEnabled || rotation.portraitLockEnabled || rotation.landscapeLockEnabled)
 
     val enabledAssociationSearchSources: Set<BookSource>

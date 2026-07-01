@@ -70,50 +70,78 @@ class ModuleSettingsTest {
     }
 
     @Test
-    fun readerParentSwitchControlsLongPress() {
-        val disabledParent = ModuleSettingsSnapshot(
+    fun readerLongPressChildSwitchControlsLongPress() {
+        val disabledChild = ModuleSettingsSnapshot(
+            readerLongPressEnabled = false,
+        )
+        val enabledChild = disabledChild.copy(readerLongPressEnabled = true)
+        val disabledModule = enabledChild.copy(moduleEnabled = false)
+
+        assertFalse(disabledChild.canRunReaderLongPress)
+        assertTrue(enabledChild.canRunReaderLongPress)
+        assertFalse(disabledModule.canRunReaderLongPress)
+    }
+
+    @Test
+    fun readerAutoPageChildSwitchControlsAutoPage() {
+        val disabledChild = ModuleSettingsSnapshot(
+            readerAutoPageEnabled = false,
+        )
+        val enabledChild = disabledChild.copy(readerAutoPageEnabled = true)
+        val disabledModule = enabledChild.copy(moduleEnabled = false)
+
+        assertFalse(disabledChild.canRunReaderAutoPage)
+        assertTrue(enabledChild.canRunReaderAutoPage)
+        assertFalse(disabledModule.canRunReaderAutoPage)
+    }
+
+    @Test
+    fun associationCoverFixChildSwitchControlsCoverFix() {
+        val disabledChild = ModuleSettingsSnapshot(
+            associationCoverFixEnabled = false,
+        )
+        val enabledChild = disabledChild.copy(associationCoverFixEnabled = true)
+        val disabledModule = enabledChild.copy(moduleEnabled = false)
+
+        assertFalse(disabledChild.canUseAssociationCoverFix)
+        assertTrue(enabledChild.canUseAssociationCoverFix)
+        assertFalse(disabledModule.canUseAssociationCoverFix)
+    }
+
+    @Test
+    fun fileEditChildSwitchControlsFileEdit() {
+        val disabledChild = ModuleSettingsSnapshot(
+            editFileEnabled = false,
+        )
+        val enabledChild = disabledChild.copy(editFileEnabled = true)
+        val disabledModule = enabledChild.copy(moduleEnabled = false)
+
+        assertFalse(disabledChild.canUseFileEdit)
+        assertTrue(enabledChild.canUseFileEdit)
+        assertFalse(disabledModule.canUseFileEdit)
+    }
+
+    @Test
+    fun legacyReaderParentSwitchNoLongerBlocksChildSwitches() {
+        val snapshot = ModuleSettingsSnapshot(
             readerEnabled = false,
             readerLongPressEnabled = true,
-        )
-        val enabledParent = disabledParent.copy(readerEnabled = true)
-
-        assertFalse(disabledParent.canRunReaderLongPress)
-        assertTrue(enabledParent.canRunReaderLongPress)
-    }
-
-    @Test
-    fun readerParentSwitchControlsAutoPage() {
-        val disabledParent = ModuleSettingsSnapshot(
-            readerEnabled = false,
             readerAutoPageEnabled = true,
+            editFileEnabled = true,
         )
-        val enabledParent = disabledParent.copy(readerEnabled = true)
 
-        assertFalse(disabledParent.canRunReaderAutoPage)
-        assertTrue(enabledParent.canRunReaderAutoPage)
+        assertTrue(snapshot.canRunReaderLongPress)
+        assertTrue(snapshot.canRunReaderAutoPage)
+        assertTrue(snapshot.canUseFileEdit)
     }
 
     @Test
-    fun associationParentSwitchControlsCoverFix() {
-        val disabledParent = ModuleSettingsSnapshot(
+    fun legacyAssociationParentSwitchNoLongerBlocksChildSwitches() {
+        val snapshot = ModuleSettingsSnapshot(
             associationEnabled = false,
             associationCoverFixEnabled = true,
         )
-        val enabledParent = disabledParent.copy(associationEnabled = true)
 
-        assertFalse(disabledParent.canUseAssociationCoverFix)
-        assertTrue(enabledParent.canUseAssociationCoverFix)
-    }
-
-    @Test
-    fun readerParentSwitchControlsFileEdit() {
-        val disabledParent = ModuleSettingsSnapshot(
-            readerEnabled = false,
-            editFileEnabled = true,
-        )
-        val enabledParent = disabledParent.copy(readerEnabled = true)
-
-        assertFalse(disabledParent.canUseFileEdit)
-        assertTrue(enabledParent.canUseFileEdit)
+        assertTrue(snapshot.canUseAssociationCoverFix)
     }
 }

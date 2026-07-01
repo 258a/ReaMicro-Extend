@@ -84,6 +84,32 @@ object AiApiStore {
         return true
     }
 
+    fun update(context: Context, id: String, baseUrl: String, apiKey: String, model: String): AiApiConfig {
+        val normalizedBaseUrl = normalizeBaseUrl(baseUrl)
+        val normalizedApiKey = apiKey.trim()
+        val normalizedModel = model.trim()
+        require(normalizedBaseUrl.isNotBlank()) { "Base URL \u4e0d\u80fd\u4e3a\u7a7a" }
+        require(normalizedApiKey.isNotBlank()) { "API Key \u4e0d\u80fd\u4e3a\u7a7a" }
+        require(normalizedModel.isNotBlank()) { "Model \u4e0d\u80fd\u4e3a\u7a7a" }
+        val configs = list(context)
+        val previous = configs.firstOrNull { it.id == id }
+        val updated = AiApiConfig(
+            id = stableId("$normalizedBaseUrl|$normalizedApiKey|$normalizedModel"),
+            baseUrl = normalizedBaseUrl,
+            apiKey = normalizedApiKey,
+            model = normalizedModel,
+            enabled = previous?.enabled ?: true,
+        )
+        // Editing can change the stable id, so remove both the old row and any row with the new id.
+        val next = (configs.filterNot { it.id == id || it.id == updated.id } + updated)
+            .map { config ->
+                if (updated.enabled && config.id != updated.id) config.copy(enabled = false) else config
+            }
+            .sortedBy { it.displayName.lowercase() }
+        write(context, next)
+        return updated
+    }
+
     fun test(baseUrl: String, apiKey: String, model: String): AiApiTestResult {
         val normalizedBaseUrl = normalizeBaseUrl(baseUrl)
         val normalizedApiKey = apiKey.trim()
