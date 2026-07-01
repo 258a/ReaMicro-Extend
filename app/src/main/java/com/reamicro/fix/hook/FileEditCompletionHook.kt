@@ -2,6 +2,8 @@ package com.reamicro.fix.hook
 
 import android.app.Activity
 import android.app.Dialog
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
@@ -52,8 +54,105 @@ class FileEditCompletionHook(
     private val injectingRow = ThreadLocal.withInitial { false }
 
     fun install() {
+        hookBookDetailsTitleAuthorItem()
         hookBookDetailsSyncSizeItem()
         hookActivityResultFor(Activity::class.java)
+    }
+
+    private fun hookBookDetailsTitleAuthorItem() {
+        runCatching {
+            val itemsClass = cls(BOOK_OVERVIEW_ITEMS_CLASS)
+            val methods = itemsClass.declaredMethods.filter { method ->
+                method.name == BOOK_TITLE_AUTHOR_ITEM_METHOD &&
+                    method.parameterTypes.size == 6 &&
+                    method.parameterTypes.getOrNull(1)?.name == BOOK_CLASS
+            }
+            if (methods.isEmpty()) error("BookTitleAuthorItem composable not found")
+            methods.forEach { method ->
+                method.isAccessible = true
+                XposedBridge.hookMethod(method, object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        if (injectingRow.get() == true) return
+                        if (!settingsProvider().canUseFileEdit) return
+                        // The host has no public slot under title/author, so append the copy-only identifier row after it renders.
+                        val lazyItemScope = param.args?.getOrNull(0) ?: return
+                        val book = param.args?.getOrNull(1) ?: return
+                        val composer = param.args?.getOrNull(4) ?: return
+                        injectingRow.set(true)
+                        runCatching {
+                            renderBookIdentifierDetailsItem(lazyItemScope, book, composer)
+                        }.onFailure {
+                            XposedBridge.log("$LOG_PREFIX book identifier row render failed: ${it.stackTraceToString()}")
+                        }
+                        injectingRow.set(false)
+                    }
+                })
+            }
+            XposedBridge.log("$LOG_PREFIX book identifier BookTitleAuthorItem hook installed: ${methods.size}")
+        }.onFailure {
+            XposedBridge.log("$LOG_PREFIX book identifier BookTitleAuthorItem hook failed: ${it.stackTraceToString()}")
+        }
+    }
+
+    private fun renderBookIdentifierDetailsItem(lazyItemScope: Any, book: Any, composer: Any) {
+        val displayText = bookIdentifierDisplayText(book)
+        if (displayText.isBlank()) return
+        val shape = roundedShape()
+        val cardModifier = clickableModifier(
+            backgroundModifier(
+                borderModifier(
+                    clipModifier(
+                        lazyAnimateItemModifier(lazyItemScope, fillMaxWidthModifier(modifierInstance())),
+                        shape,
+                    ),
+                    0.4f,
+                    colorScheme(composer).longMethod("getSurfaceContainerHighest"),
+                    shape,
+                ),
+                themeBackgroundAuto(composer),
+            ),
+            "CopyBookIdentifier",
+        ) {
+            copyBookIdentifiers(book)
+        }
+        val modifier = paddingModifier(cardModifier, start = 16, top = 15, end = 12, bottom = 15)
+        val content = functionProxy("BookIdentifierRowContent", FUNCTION3_CLASS) { args ->
+            val rowScope = args?.getOrNull(0) ?: return@functionProxy targetUnit()
+            val innerComposer = args.getOrNull(1) ?: return@functionProxy targetUnit()
+            renderDetailsText(
+                text = "\u6807\u8bc6",
+                modifier = null,
+                color = themeOnBackgroundVariant(innerComposer),
+                composer = innerComposer,
+            )
+            renderFixedWidthSpacer(width = 12, composer = innerComposer)
+            renderDetailsText(
+                text = displayText,
+                modifier = rowWeightModifier(rowScope, modifierInstance()),
+                color = colorScheme(innerComposer).longMethod("getOnBackground"),
+                composer = innerComposer,
+            )
+            contentCopyImageVector()?.let { image ->
+                renderIcon(
+                    image = image,
+                    modifier = sizeModifier(modifierInstance(), 20),
+                    tint = colorScheme(innerComposer).longMethod("getSurfaceContainerHighest"),
+                    composer = innerComposer,
+                )
+            }
+            targetUnit()
+        }
+        renderVerticalSpacer(height = 12, composer = composer)
+        method(ROW_KT_CLASS, ROW_METHOD, 7).invoke(
+            null,
+            modifier,
+            arrangementStart(),
+            alignmentCenterVertically(),
+            content,
+            composer,
+            384,
+            0,
+        )
     }
 
     private fun hookBookDetailsSyncSizeItem() {
@@ -154,6 +253,42 @@ class FileEditCompletionHook(
             384,
             0,
         )
+    }
+
+    private fun bookIdentifierDisplayText(book: Any): String =
+        callString(book, "getUuid")
+            .ifBlank { callLong(book, "getUid").takeIf { it > 0L }?.let { "UID $it" }.orEmpty() }
+            .ifBlank { callLong(book, "getId").takeIf { it > 0L }?.let { "ID $it" }.orEmpty() }
+            .ifBlank { callString(book, "getBackupCode") }
+            .ifBlank { callString(book, "getUri") }
+
+    private fun bookIdentifierClipboardText(book: Any): String =
+        buildList {
+            fun addText(label: String, value: String) {
+                if (value.isNotBlank()) add("$label: $value")
+            }
+            fun addLong(label: String, value: Long) {
+                if (value > 0L) add("$label: $value")
+            }
+            addLong("id", callLong(book, "getId"))
+            addLong("uid", callLong(book, "getUid"))
+            addText("uuid", callString(book, "getUuid"))
+            addText("uri", callString(book, "getUri"))
+            addText("backupId", callString(book, "getBackupId"))
+            addText("backupCode", callString(book, "getBackupCode"))
+            addText("cloudId", callString(book, "getCloudId"))
+        }.joinToString("\n")
+
+    private fun copyBookIdentifiers(book: Any) {
+        val activity = activityProvider() ?: return
+        val text = bookIdentifierClipboardText(book).ifBlank { bookIdentifierDisplayText(book) }
+        if (text.isBlank()) return
+        val copy = {
+            val clipboard = activity.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            clipboard?.setPrimaryClip(ClipData.newPlainText("\u56fe\u4e66\u6807\u8bc6", text))
+            Toast.makeText(activity, "\u5df2\u590d\u5236\u6807\u8bc6", Toast.LENGTH_SHORT).show()
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) copy() else activity.runOnUiThread { copy() }
     }
 
     private fun hookBookLocalSheet() {
@@ -964,6 +1099,15 @@ class FileEditCompletionHook(
         )
     }
 
+    private fun renderFixedWidthSpacer(width: Int, composer: Any) {
+        method(SPACER_KT_CLASS, SPACER_METHOD, 3).invoke(
+            null,
+            widthModifier(modifierInstance(), width),
+            composer,
+            0,
+        )
+    }
+
     private fun startPaddingModifier(baseModifier: Any, start: Int): Any =
         method(PADDING_KT_CLASS, PADDING_ABSOLUTE_DEFAULT_METHOD, 7).invoke(
             null,
@@ -978,6 +1122,9 @@ class FileEditCompletionHook(
 
     private fun heightModifier(baseModifier: Any, height: Int): Any =
         method(SIZE_KT_CLASS, HEIGHT_METHOD, 2).invoke(null, baseModifier, udp(height))
+
+    private fun widthModifier(baseModifier: Any, width: Int): Any =
+        method(SIZE_KT_CLASS, WIDTH_METHOD, 2).invoke(null, baseModifier, udp(width))
 
     private fun sizeModifier(baseModifier: Any, size: Int): Any =
         method(SIZE_KT_CLASS, SIZE_METHOD, 2).invoke(null, baseModifier, udp(size))
@@ -1025,6 +1172,14 @@ class FileEditCompletionHook(
             method(NAVIGATE_NEXT_ICON_CLASS, "getNavigateNext", 1).invoke(
                 null,
                 staticObject(ICONS_AUTO_MIRRORED_FILLED_CLASS, "INSTANCE"),
+            )
+        }.getOrNull()
+
+    private fun contentCopyImageVector(): Any? =
+        runCatching {
+            method(CONTENT_COPY_ICON_CLASS, "getContentCopy", 1).invoke(
+                null,
+                staticObject(ICONS_OUTLINED_CLASS, "INSTANCE"),
             )
         }.getOrNull()
 
@@ -1193,6 +1348,7 @@ class FileEditCompletionHook(
         const val BOOK_LOCAL_SHEET_METHOD = "BookLocalSheet"
         const val BOOK_LOCAL_SHEET_CONTENT_METHOD = "BookLocalSheet\$lambda\$2"
         const val FILE_BACKUP_METHOD = "FileBackup"
+        const val BOOK_TITLE_AUTHOR_ITEM_METHOD = "BookTitleAuthorItem"
         const val BOOK_SYNC_SIZE_ITEM_METHOD = "BookSyncSizeItem"
 
         const val ROW_KT_CLASS = "androidx.compose.foundation.layout.RowKt"
@@ -1212,12 +1368,14 @@ class FileEditCompletionHook(
         const val ICON_METHOD = "Icon-ww6aTOc"
         const val IMAGE_VECTOR_CLASS = "androidx.compose.ui.graphics.vector.ImageVector"
         const val EDIT_ICON_CLASS = "androidx.compose.material.icons.outlined.EditKt"
+        const val CONTENT_COPY_ICON_CLASS = "androidx.compose.material.icons.outlined.ContentCopyKt"
         const val NAVIGATE_NEXT_ICON_CLASS = "androidx.compose.material.icons.automirrored.filled.NavigateNextKt"
         const val ICONS_OUTLINED_CLASS = "androidx.compose.material.icons.Icons\$Outlined"
         const val ICONS_AUTO_MIRRORED_FILLED_CLASS = "androidx.compose.material.icons.Icons\$AutoMirrored\$Filled"
         const val DIVIDER_KT_CLASS = "app.zhendong.reamicro.arch.components.DividerKt"
         const val SIZE_KT_CLASS = "androidx.compose.foundation.layout.SizeKt"
         const val HEIGHT_METHOD = "height-3ABfNKs"
+        const val WIDTH_METHOD = "width-3ABfNKs"
         const val SIZE_METHOD = "size-3ABfNKs"
         const val FILL_MAX_WIDTH_DEFAULT_METHOD = "fillMaxWidth\$default"
         const val PADDING_KT_CLASS = "androidx.compose.foundation.layout.PaddingKt"

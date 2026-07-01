@@ -1555,7 +1555,8 @@ html[data-theme="dark"] .sheet{background:#191c20}html[data-theme="dark"] .sheet
 </main>
 <script>
 const api=window.ReaMicroFileEditor;
-const state={title:"",status:"",metadata:{},files:[],groups:{},open:{},editing:null,content:"",dirty:false,matches:[],matchIndex:-1,actionFile:null,renameFile:null,searchResults:[],searchResultIndex:-1,decorating:false,searchDirty:true,renderVersion:0,layoutVersion:-1,layoutNodes:[],layoutLength:0,layoutFrame:0,editorSyncFrame:0,openSearchToken:0,scopeJobToken:0,searchSessionToken:0,treeScrollTop:0,lineOffsetCacheText:null,lineOffsetCache:[0],page:"meta",coverPickerArmed:0,coverPicking:false,coverPickerBlockedUntil:0};
+// Title, author, and cover are now handled by ReaMicro itself, so the file editor opens directly on the EPUB tree.
+const state={title:"",status:"",metadata:{},files:[],groups:{},open:{},editing:null,content:"",dirty:false,matches:[],matchIndex:-1,actionFile:null,renameFile:null,searchResults:[],searchResultIndex:-1,decorating:false,searchDirty:true,renderVersion:0,layoutVersion:-1,layoutNodes:[],layoutLength:0,layoutFrame:0,editorSyncFrame:0,openSearchToken:0,scopeJobToken:0,searchSessionToken:0,treeScrollTop:0,lineOffsetCacheText:null,lineOffsetCache:[0],page:"tree",coverPickerArmed:0,coverPicking:false,coverPickerBlockedUntil:0};
 const byId=(id)=>document.getElementById(id);
 const esc=(s)=>String(s==null?"":s).replace(/[&<>"']/g,(c)=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
 function callJson(fn){try{const raw=fn();return JSON.parse(raw||"{}");}catch(e){return {ok:false,message:String(e)}}}
@@ -1624,8 +1625,8 @@ function hideConfirm(){const mask=byId("confirmMask"),card=byId("confirmCard");i
 async function confirmLeaveEditor(){if(!(state.dirty&&byId("text")))return true;const action=await showUnsavedConfirm();if(action==="cancel")return false;if(action==="save")return persistCurrentFile(true);return true}
 function finishCloseEditor(){state.openSearchToken++;state.editing=null;state.dirty=false;updateSaveState();state.matches=[];state.matchIndex=-1;state.searchResults=[];state.searchResultIndex=-1;state.searchDirty=true;byId("app").classList.remove("editing");byId("replace").classList.remove("open");hideConfirm();updateEditorBottomInset();restoreTreeScroll()}
 async function closeEditor(){if(!(await confirmLeaveEditor()))return;finishCloseEditor()}
-function closeOrBack(){if(state.editing)closeEditor();else if(state.page==="tree"){state.page="meta";renderAll();window.scrollTo(0,0)}else api.close()}
-function handleBack(){if(state.editing){closeEditor();return true}if(state.page==="tree"){state.page="meta";renderAll();window.scrollTo(0,0);return true}return false}
+function closeOrBack(){if(state.editing)closeEditor();else api.close()}
+function handleBack(){if(state.editing){closeEditor();return true}return false}
 function toggleGroup(k){state.open[k]=!state.open[k];renderTree()}
 function toggleReplace(){const panel=byId("replace");panel.classList.toggle("open");byId("searchBtn").classList.toggle("active",panel.classList.contains("open"));wireSearchInputs();updateScopeCount();updateEditorBottomInset();if(!panel.classList.contains("open")){state.matches=[];state.matchIndex=-1;state.searchResults=[];state.searchResultIndex=-1;state.searchDirty=true;updateSearchStatus();const line=byId("matchLine");if(line)line.style.display="none"}}
 function wireSearchInputs(){["find","regex","textOnly"].forEach(id=>{const el=byId(id);if(el&&el.dataset.wired!=="1"){el.dataset.wired="1";el.oninput=()=>{state.searchDirty=true;updateSearchStatus()};el.onchange=()=>{state.searchDirty=true;updateSearchStatus()}}});updateScopeUi()}
