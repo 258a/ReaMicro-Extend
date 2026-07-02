@@ -631,18 +631,6 @@ class ReaMicroSettingsHook(
                 )
                 add(
                     ToggleRow(
-                        key = ModuleSettings.KEY_ASSOCIATION_UNLINK_ENABLED,
-                        title = "\u53d6\u6d88\u5173\u8054",
-                        checked = snapshot.associationUnlinkEnabled,
-                        visibleProvider = { booleanStateValue(associationExpandedState) },
-                        onChanged = { checked, _ ->
-                            settings.setAssociationUnlinkEnabled(checked)
-                            checked
-                        },
-                    ),
-                )
-                add(
-                    ToggleRow(
                         key = ModuleSettings.KEY_ASSOCIATION_COVER_FIX_ENABLED,
                         title = "\u5c01\u9762\u4fee\u590d",
                         checked = snapshot.associationCoverFixEnabled,
@@ -984,17 +972,6 @@ class ReaMicroSettingsHook(
                         visibleProvider = { hasManualEditFeature() },
                         onChanged = { checked, _ ->
                             settings.setAssociationManualEditEnabled(checked)
-                            checked
-                        },
-                    ),
-                )
-                add(
-                    ToggleRow(
-                        key = ModuleSettings.KEY_ASSOCIATION_UNLINK_ENABLED,
-                        title = "\u53d6\u6d88\u5173\u8054",
-                        checked = snapshot.associationUnlinkEnabled,
-                        onChanged = { checked, _ ->
-                            settings.setAssociationUnlinkEnabled(checked)
                             checked
                         },
                     ),

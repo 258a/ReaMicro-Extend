@@ -156,7 +156,7 @@ data class ModuleSettingsSnapshot(
         get() = canRunAssociation && associationManualEditEnabled
 
     val canUseAssociationUnlink: Boolean
-        get() = canRunAssociation && associationUnlinkEnabled
+        get() = false
 
     val canUseAssociationCoverFix: Boolean
         get() = canRunAssociation && associationCoverFixEnabled

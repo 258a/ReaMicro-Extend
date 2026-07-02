@@ -69,14 +69,17 @@ class ReaMicroHookEntry {
             activityProvider = { currentActivityRef?.get() },
             settingsProvider = moduleSettings::snapshot,
         ).install()
-        BookDetailsAssociationActionHook(
+        val bookDetailsAssociationActionHook = BookDetailsAssociationActionHook(
             classLoader = classLoader,
             activityProvider = { currentActivityRef?.get() },
             settingsProvider = moduleSettings::snapshot,
-        ).install()
+        )
+        bookDetailsAssociationActionHook.install()
         BookOverviewImageSelectionHook(
             classLoader = classLoader,
             activityProvider = { currentActivityRef?.get() },
+            canRequestCoverFix = bookDetailsAssociationActionHook::canFixCurrentCover,
+            requestCoverFix = bookDetailsAssociationActionHook::requestCoverFixForCurrentDetails,
         ).install()
         LocalExportHook(
             classLoader = classLoader,

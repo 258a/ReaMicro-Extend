@@ -48,6 +48,8 @@ import org.json.JSONObject
 class BookOverviewImageSelectionHook(
     private val classLoader: ClassLoader,
     private val activityProvider: () -> Activity?,
+    private val canRequestCoverFix: () -> Boolean = { false },
+    private val requestCoverFix: () -> Boolean = { false },
 ) {
     private val contextStack = ThreadLocal.withInitial { mutableListOf<BookImageContext>() }
     private val activeSourceDialogs = Collections.synchronizedSet(mutableSetOf<String>())
@@ -144,7 +146,7 @@ class BookOverviewImageSelectionHook(
         val activity = activityProvider() ?: return
         activity.runOnUiThread {
             val colors = DialogColors(activity)
-            val dialog = Dialog(activity)
+            val dialog = imageDialog(activity)
             val card = dialogCard(activity, colors)
             card.addView(dialogTitle(activity, "${target.label}图片"))
             card.addView(actionRow(activity, "选取图片", "使用阅微原来的本地图片选择", colors) {
@@ -169,6 +171,14 @@ class BookOverviewImageSelectionHook(
                     invokeFunction0(secondaryAction)
                 })
             }
+            if (target == ImageTarget.Cover && canRequestCoverFix()) {
+                card.addView(actionRow(activity, "封面修复", "上传当前关联封面到书库", colors) {
+                    dialog.dismiss()
+                    if (!requestCoverFix()) {
+                        activity.toast("当前页面无法执行封面修复")
+                    }
+                })
+            }
             card.addView(actionRow(activity, "取消", "", colors) {
                 dialog.dismiss()
             })
@@ -183,7 +193,7 @@ class BookOverviewImageSelectionHook(
         val activity = activityProvider() ?: return
         activity.runOnUiThread {
             val colors = DialogColors(activity)
-            val dialog = Dialog(activity)
+            val dialog = imageDialog(activity)
             val card = dialogCard(activity, colors)
             var previewBytes: ByteArray? = null
 
@@ -274,7 +284,7 @@ class BookOverviewImageSelectionHook(
             }
             val preset = AiApiStore.imagePreset(appContext, presetTarget, selectedPresetId)
             val colors = DialogColors(activity)
-            val dialog = Dialog(activity)
+            val dialog = imageDialog(activity)
             val card = dialogCard(activity, colors)
             var generatedBytes: ByteArray? = null
 
@@ -1004,7 +1014,7 @@ class BookOverviewImageSelectionHook(
 private fun dialogCard(context: Context, colors: BookOverviewImageSelectionHook.DialogColors): LinearLayout =
     LinearLayout(context).apply {
         orientation = LinearLayout.VERTICAL
-        setPadding(dp(context, 18), dp(context, 18), dp(context, 18), dp(context, 18))
+        setPadding(dp(context, 16), dp(context, 12), dp(context, 16), dp(context, 14))
         background = GradientDrawable().apply {
             setColor(colors.card)
             cornerRadius = dp(context, 22).toFloat()
@@ -1025,7 +1035,7 @@ private fun dialogTitle(context: Context, title: String): TextView =
         layoutParams = LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { bottomMargin = dp(context, 10) }
+        ).apply { bottomMargin = dp(context, 8) }
     }
 
 private fun dialogMessage(
@@ -1169,6 +1179,9 @@ private fun compactButton(
         background = rounded(if (neutral) colors.neutralSoft else colors.primarySoft, colors.border, dp(context, 12))
     }
 
+private fun imageDialog(activity: Activity): Dialog =
+    Dialog(activity, android.R.style.Theme_Translucent_NoTitleBar)
+
 private fun showDialog(dialog: Dialog, content: View, activity: Activity, widthRatio: Float) {
     dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
     dialog.setContentView(content)
@@ -1176,16 +1189,23 @@ private fun showDialog(dialog: Dialog, content: View, activity: Activity, widthR
         window.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
         window.setDimAmount(0.46f)
         window.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+        window.decorView.setPadding(0, 0, 0, 0)
+        window.setGravity(Gravity.CENTER)
     }
     dialog.show()
     dialog.window?.let { window ->
         window.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
         window.setDimAmount(0.46f)
         window.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
-        window.setLayout(
-            (activity.resources.displayMetrics.widthPixels * widthRatio).toInt(),
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        )
+        window.decorView.setPadding(0, 0, 0, 0)
+        window.findViewById<View>(android.R.id.content)?.setPadding(0, 0, 0, 0)
+        window.setGravity(Gravity.CENTER)
+        val attributes = window.attributes
+        attributes.width = (activity.resources.displayMetrics.widthPixels * widthRatio).toInt()
+        attributes.height = ViewGroup.LayoutParams.WRAP_CONTENT
+        attributes.gravity = Gravity.CENTER
+        window.attributes = attributes
+        window.setLayout(attributes.width, attributes.height)
     }
 }
 
