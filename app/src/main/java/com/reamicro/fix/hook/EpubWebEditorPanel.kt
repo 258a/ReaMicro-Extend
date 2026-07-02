@@ -540,20 +540,20 @@ internal class EpubWebEditorPanel(
             val imageFile = image.canonicalFile
             val targetFile = target.canonicalFile
             if (imageFile != targetFile) {
-                if (target.exists()) require(target.delete()) { "横图文件已存在且无法替换" }
+                if (target.exists()) require(target.delete()) { "横幅文件已存在且无法替换" }
                 val coverFile = opfFile()?.let { findCoverFile(it) }?.canonicalFile
                 if (coverFile != null && imageFile == coverFile) {
                     image.copyTo(target, overwrite = true)
                 } else if (!image.renameTo(target)) {
                     image.copyTo(target, overwrite = true)
-                    require(image.delete()) { "横图已复制但原文件无法移除" }
+                    require(image.delete()) { "横幅已复制但原文件无法移除" }
                 }
             }
             target.setLastModified(System.currentTimeMillis())
             refreshBookFileCache(coverPathOverride = coverPath)
             JSONObject()
                 .put("ok", true)
-                .put("message", "已设为横图")
+                .put("message", "已设为横幅")
                 .put("path", relativePath(target))
                 .toString()
         }
@@ -953,7 +953,7 @@ internal class EpubWebEditorPanel(
         return bookCover
             ?: metadataCover.takeIf { it.isNotBlank() }
             ?: opfFile()?.let { findCoverFile(it) }?.let(::relativePath)
-            ?: error("未找到封面，无法生成横图命名")
+            ?: error("未找到封面，无法生成横幅命名")
     }
 
     private fun isBookRelativePath(value: String): Boolean =
@@ -1661,12 +1661,12 @@ function replaceCurrent(){const text=byId("text");if(!text)return;if(state.searc
 function replaceInValue(value,pattern,rep){const ranges=findRanges(value,pattern);if(!ranges.length)return {value,count:0};let out="",last=0;ranges.forEach(r=>{out+=value.slice(last,r[0])+rep;last=r[1]});out+=value.slice(last);return {value:out,count:ranges.length}}
 function scopeFiles(scopeValue){const scope=scopeValue||byId("scope").value;if(scope==="current")return state.editing?[state.editing]:[];return state.files.filter(f=>f.editable&&(scope==="all"||f.kind==="html"))}
 function replaceAll(){const pattern=activePattern();if(!pattern)return;const rep=byId("repl").value;const scope=byId("scope").value;const files=scopeFiles(scope);if(!files.length)return;if(pattern.textOnly){toast("仅文本模式暂只支持查找定位");return}let changed=0,total=0;const changedPaths=[];files.forEach(f=>{let content;if(state.editing&&f.path===state.editing.path&&byId("text"))content=byId("text").value;else{const r=callJson(()=>api.readText(f.path));if(!r.ok)return;content=r.content||""}const next=replaceInValue(content,pattern,rep);if(!next.count)return;total+=next.count;changed++;changedPaths.push(f.path);if(state.editing&&f.path===state.editing.path&&byId("text")){byId("text").value=next.value;state.dirty=true;updateSaveState();state.searchDirty=true;syncEditor();buildMatches(false)}else callJson(()=>api.replaceText(f.path,next.value))});toast("已替换 "+total+" 处，涉及 "+changed+" 个文件");const refreshPaths=changedPathsForRefresh(changedPaths);invalidateDecorations(refreshPaths);refresh(refreshPaths)}
-function openActionSheet(path){const f=state.files.find(x=>x.path===path);if(!f)return;state.actionFile=f;const coverButton=f.kind==="image"?'<button class="plain" onclick="FileEditorNative.setCover(state.actionFile.path)">设为封面</button>':'';const bannerButton=f.kind==="image"?'<button class="plain" onclick="FileEditorNative.setBanner(state.actionFile.path)">设为横图</button>':'';showSheet('<h3>'+esc(f.name)+'</h3><p>'+esc(f.path)+'</p><button class="primary" onclick="FileEditorNative.openFile(state.actionFile.path);hideSheet()">打开</button>'+coverButton+bannerButton+'<button class="plain" onclick="FileEditorNative.openRenameSheet()">重命名</button><button class="danger" onclick="FileEditorNative.deleteActionFile()">删除文件</button><button class="plain" onclick="FileEditorNative.hideSheet()">取消</button>')}
+function openActionSheet(path){const f=state.files.find(x=>x.path===path);if(!f)return;state.actionFile=f;const coverButton=f.kind==="image"?'<button class="plain" onclick="FileEditorNative.setCover(state.actionFile.path)">设为封面</button>':'';const bannerButton=f.kind==="image"?'<button class="plain" onclick="FileEditorNative.setBanner(state.actionFile.path)">设为横幅</button>':'';showSheet('<h3>'+esc(f.name)+'</h3><p>'+esc(f.path)+'</p><button class="primary" onclick="FileEditorNative.openFile(state.actionFile.path);hideSheet()">打开</button>'+coverButton+bannerButton+'<button class="plain" onclick="FileEditorNative.openRenameSheet()">重命名</button><button class="danger" onclick="FileEditorNative.deleteActionFile()">删除文件</button><button class="plain" onclick="FileEditorNative.hideSheet()">取消</button>')}
 function openRenameSheet(){const f=state.actionFile;if(!f)return;showSheet('<h3>重命名文件</h3><p>'+esc(f.path)+'</p><input id="renameInput" class="field" value="'+esc(f.name)+'"><button class="primary" onclick="FileEditorNative.submitRename()">保存名称</button><button class="plain" onclick="FileEditorNative.hideSheet()">取消</button>');setTimeout(()=>byId("renameInput").focus(),80)}
 function submitRename(){const f=state.actionFile;const name=byId("renameInput").value;const r=callJson(()=>api.renameFile(f.path,name));toast(r.message);hideSheet();refresh()}
 function deleteActionFile(){const f=state.actionFile;if(!f)return;if(!confirm("删除 "+f.name+"？"))return;const r=callJson(()=>api.deleteFile(f.path));toast(r.message);hideSheet();refresh()}
 function setCover(path){const r=callJson(()=>api.setCover(path));toast(r.message||"已设为封面");hideSheet();if(r.ok){if(r.metadata)state.metadata=r.metadata;const coverPath=state.metadata?.coverPath||path;refresh([path,coverPath]);if(state.page==="meta"){renderMetaPage();loadCoverPreview()}}}
-function setBanner(path){const r=callJson(()=>api.setBanner(path));toast(r.message||"已设为横图");hideSheet();if(r.ok)refresh([path,r.path])}
+function setBanner(path){const r=callJson(()=>api.setBanner(path));toast(r.message||"已设为横幅");hideSheet();if(r.ok)refresh([path,r.path])}
 function openAddSheet(groupPath){state.addGroup=groupPath||"";showSheet('<h3>添加文件</h3><p>'+(groupPath?esc(groupPath):"ROOT")+'</p><button class="primary" onclick="FileEditorNative.pickFile()">导入文件</button><button class="plain" onclick="FileEditorNative.openNewTextSheet()">新建文本文件</button><button class="plain" onclick="FileEditorNative.hideSheet()">取消</button>')}
 function openNewTextSheet(){showSheet('<h3>新建文本文件</h3><p>建议使用 .xhtml、.html、.css 或 .xml</p><input id="newTextName" class="field" placeholder="chapter.xhtml"><button class="primary" onclick="FileEditorNative.createText()">创建</button><button class="plain" onclick="FileEditorNative.hideSheet()">取消</button>');setTimeout(()=>byId("newTextName").focus(),80)}
 function createText(){const r=callJson(()=>api.createTextFile(state.addGroup,byId("newTextName").value));toast(r.message);hideSheet();refresh()}

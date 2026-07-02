@@ -32,6 +32,19 @@ data class AiDictionaryPreset(
     val builtIn: Boolean = false,
 )
 
+enum class AiImagePresetTarget(val id: String, val title: String) {
+    Cover("cover", "\u5c01\u9762\u9884\u8bbe"),
+    Banner("banner", "\u6a2a\u5e45\u9884\u8bbe"),
+}
+
+data class AiImagePreset(
+    val id: String,
+    val target: AiImagePresetTarget,
+    val name: String,
+    val prompt: String,
+    val builtIn: Boolean = false,
+)
+
 data class AiDictionarySettings(
     val apiId: String = "",
     val presetId: String = AiApiStore.DEFAULT_DICTIONARY_PRESET_ID,
@@ -39,13 +52,22 @@ data class AiDictionarySettings(
     val singleUsePreset: Boolean = true,
 )
 
+data class AiImageSettings(
+    val apiId: String = "",
+    val coverPresetId: String = AiApiStore.DEFAULT_IMAGE_COVER_PRESET_ID,
+    val bannerPresetId: String = AiApiStore.DEFAULT_IMAGE_BANNER_PRESET_ID,
+)
+
 object AiApiStore {
     private const val CONFIG_FILE_NAME = "reamicro_ai_apis.json"
     private const val DICTIONARY_SETTINGS_FILE_NAME = "reamicro_dictionary_settings.json"
+    private const val IMAGE_SETTINGS_FILE_NAME = "reamicro_image_settings.json"
     private const val CONNECT_TIMEOUT_MS = 12_000
     private const val READ_TIMEOUT_MS = 25_000
     private const val DICTIONARY_MAX_TOKENS = 300
     const val DEFAULT_DICTIONARY_PRESET_ID = "dictionary_short"
+    const val DEFAULT_IMAGE_COVER_PRESET_ID = "image_cover_default"
+    const val DEFAULT_IMAGE_BANNER_PRESET_ID = "image_banner_default"
     private val reasoningEffortUnsupportedApis = Collections.synchronizedSet(mutableSetOf<String>())
 
     val BUILTIN_DICTIONARY_PRESETS = listOf(
@@ -65,6 +87,23 @@ object AiApiStore {
             id = "dictionary_classical",
             name = "\u6587\u8a00\u6587/\u53e4\u8bd7\u8bcd",
             prompt = "\u8bf7\u89e3\u91ca\u300c{{text}}\u300d\u5728\u53e4\u6587\u4e2d\u7684\u542b\u4e49\uff0c\u5305\u62ec\u51fa\u5904\u548c\u7528\u6cd5\u3002",
+            builtIn = true,
+        ),
+    )
+
+    val BUILTIN_IMAGE_PRESETS = listOf(
+        AiImagePreset(
+            id = DEFAULT_IMAGE_COVER_PRESET_ID,
+            target = AiImagePresetTarget.Cover,
+            name = "\u9ed8\u8ba4\u5c01\u9762",
+            prompt = "\u6839\u636e\u300c{{text}}\u300d\u751f\u6210\u4e00\u5f20\u7ad6\u7248\u5c0f\u8bf4\u5c01\u9762\uff0c\u4e3b\u4f53\u660e\u786e\uff0c\u753b\u9762\u5e72\u51c0\uff0c\u9002\u5408\u4e2d\u6587\u4e66\u7c4d\u5c01\u9762\u3002",
+            builtIn = true,
+        ),
+        AiImagePreset(
+            id = DEFAULT_IMAGE_BANNER_PRESET_ID,
+            target = AiImagePresetTarget.Banner,
+            name = "\u9ed8\u8ba4\u6a2a\u5e45",
+            prompt = "\u6839\u636e\u300c{{text}}\u300d\u751f\u6210\u4e00\u5f20\u6a2a\u5e45\u56fe\uff0c\u5bbd\u5c4f\u6784\u56fe\uff0c\u4e3b\u4f53\u660e\u786e\uff0c\u9002\u5408\u6a2a\u5411\u5c55\u793a\u3002",
             builtIn = true,
         ),
     )
@@ -194,6 +233,14 @@ object AiApiStore {
             ?: configs.firstOrNull { it.enabled }
     }
 
+    fun imageApi(context: Context?): AiApiConfig? {
+        context ?: return null
+        val configs = list(context)
+        val settings = imageSettings(context)
+        return configs.firstOrNull { it.id == settings.apiId }
+            ?: configs.firstOrNull { it.enabled }
+    }
+
     fun setEnabled(context: Context?, id: String, enabled: Boolean): Boolean {
         context ?: return false
         val configs = list(context)
@@ -214,6 +261,9 @@ object AiApiStore {
     fun dictionarySettings(context: Context?): AiDictionarySettings =
         readDictionaryState(context).settings
 
+    fun imageSettings(context: Context?): AiImageSettings =
+        readImageState(context).settings
+
     fun dictionaryPresets(context: Context?): List<AiDictionaryPreset> {
         val custom = readDictionaryState(context).customPresets
         return (BUILTIN_DICTIONARY_PRESETS + custom)
@@ -224,10 +274,27 @@ object AiApiStore {
         dictionaryPresets(context).firstOrNull { it.id == presetId }
             ?: BUILTIN_DICTIONARY_PRESETS.first()
 
+    fun imagePresets(context: Context?, target: AiImagePresetTarget): List<AiImagePreset> {
+        val custom = readImageState(context).customPresets
+        return (BUILTIN_IMAGE_PRESETS.filter { it.target == target } + custom.filter { it.target == target })
+            .distinctBy { it.id }
+    }
+
+    fun imagePreset(context: Context?, target: AiImagePresetTarget, presetId: String): AiImagePreset =
+        imagePresets(context, target).firstOrNull { it.id == presetId }
+            ?: defaultImagePreset(target)
+
     fun setDictionaryApiId(context: Context?, apiId: String): Boolean {
         context ?: return false
         val state = readDictionaryState(context)
         writeDictionaryState(context, state.copy(settings = state.settings.copy(apiId = apiId.trim())))
+        return true
+    }
+
+    fun setImageApiId(context: Context?, apiId: String): Boolean {
+        context ?: return false
+        val state = readImageState(context)
+        writeImageState(context, state.copy(settings = state.settings.copy(apiId = apiId.trim())))
         return true
     }
 
@@ -236,6 +303,14 @@ object AiApiStore {
         val target = dictionaryPresets(context).firstOrNull { it.id == presetId } ?: return false
         val state = readDictionaryState(context)
         writeDictionaryState(context, state.copy(settings = state.settings.copy(presetId = target.id)))
+        return true
+    }
+
+    fun setImagePresetId(context: Context?, target: AiImagePresetTarget, presetId: String): Boolean {
+        context ?: return false
+        val preset = imagePresets(context, target).firstOrNull { it.id == presetId } ?: return false
+        val state = readImageState(context)
+        writeImageState(context, state.copy(settings = state.settings.withImagePresetId(target, preset.id)))
         return true
     }
 
@@ -276,6 +351,30 @@ object AiApiStore {
         return preset
     }
 
+    fun addImagePreset(context: Context, target: AiImagePresetTarget, name: String, prompt: String): AiImagePreset {
+        val normalizedName = name.trim()
+        val normalizedPrompt = prompt.trim()
+        require(normalizedName.isNotBlank()) { "\u9884\u8bbe\u540d\u79f0\u4e0d\u80fd\u4e3a\u7a7a" }
+        require(normalizedPrompt.isNotBlank()) { "\u63d0\u793a\u8bcd\u4e0d\u80fd\u4e3a\u7a7a" }
+        val preset = AiImagePreset(
+            id = "image_${target.id}_" + stableId("${target.id}|$normalizedName|$normalizedPrompt").removePrefix("ai_"),
+            target = target,
+            name = normalizedName,
+            prompt = normalizedPrompt,
+        )
+        val state = readImageState(context)
+        val nextCustom = (state.customPresets.filterNot { it.id == preset.id } + preset)
+            .sortedWith(compareBy<AiImagePreset> { it.target.id }.thenBy { it.name.lowercase() })
+        writeImageState(
+            context,
+            state.copy(
+                settings = state.settings.withImagePresetId(target, preset.id),
+                customPresets = nextCustom,
+            ),
+        )
+        return preset
+    }
+
     fun updateDictionaryPreset(context: Context, id: String, name: String, prompt: String): AiDictionaryPreset {
         require(BUILTIN_DICTIONARY_PRESETS.none { it.id == id }) { "\u5185\u7f6e\u9884\u8bbe\u4e0d\u80fd\u4fee\u6539" }
         val normalizedName = name.trim()
@@ -292,6 +391,22 @@ object AiApiStore {
         return updated
     }
 
+    fun updateImagePreset(context: Context, id: String, name: String, prompt: String): AiImagePreset {
+        require(BUILTIN_IMAGE_PRESETS.none { it.id == id }) { "\u5185\u7f6e\u9884\u8bbe\u4e0d\u80fd\u4fee\u6539" }
+        val normalizedName = name.trim()
+        val normalizedPrompt = prompt.trim()
+        require(normalizedName.isNotBlank()) { "\u9884\u8bbe\u540d\u79f0\u4e0d\u80fd\u4e3a\u7a7a" }
+        require(normalizedPrompt.isNotBlank()) { "\u63d0\u793a\u8bcd\u4e0d\u80fd\u4e3a\u7a7a" }
+        val state = readImageState(context)
+        val previous = state.customPresets.firstOrNull { it.id == id }
+            ?: throw IllegalArgumentException("\u672a\u627e\u5230\u9884\u8bbe")
+        val updated = previous.copy(name = normalizedName, prompt = normalizedPrompt)
+        val nextCustom = state.customPresets.map { if (it.id == id) updated else it }
+            .sortedWith(compareBy<AiImagePreset> { it.target.id }.thenBy { it.name.lowercase() })
+        writeImageState(context, state.copy(customPresets = nextCustom))
+        return updated
+    }
+
     fun removeDictionaryPreset(context: Context?, id: String): Boolean {
         context ?: return false
         if (BUILTIN_DICTIONARY_PRESETS.any { it.id == id }) return false
@@ -304,6 +419,28 @@ object AiApiStore {
             state.settings
         }
         writeDictionaryState(context, state.copy(settings = nextSettings, customPresets = nextCustom))
+        return true
+    }
+
+    fun removeImagePreset(context: Context?, id: String): Boolean {
+        context ?: return false
+        if (BUILTIN_IMAGE_PRESETS.any { it.id == id }) return false
+        val state = readImageState(context)
+        val removed = state.customPresets.firstOrNull { it.id == id } ?: return false
+        val nextCustom = state.customPresets.filterNot { it.id == id }
+        val nextSettings = when (removed.target) {
+            AiImagePresetTarget.Cover -> if (state.settings.coverPresetId == id) {
+                state.settings.copy(coverPresetId = DEFAULT_IMAGE_COVER_PRESET_ID)
+            } else {
+                state.settings
+            }
+            AiImagePresetTarget.Banner -> if (state.settings.bannerPresetId == id) {
+                state.settings.copy(bannerPresetId = DEFAULT_IMAGE_BANNER_PRESET_ID)
+            } else {
+                state.settings
+            }
+        }
+        writeImageState(context, state.copy(settings = nextSettings, customPresets = nextCustom))
         return true
     }
 
@@ -457,6 +594,9 @@ object AiApiStore {
     private fun dictionarySettingsFile(context: Context): File =
         File(context.filesDir, DICTIONARY_SETTINGS_FILE_NAME)
 
+    private fun imageSettingsFile(context: Context): File =
+        File(context.filesDir, IMAGE_SETTINGS_FILE_NAME)
+
     private fun readDictionaryState(context: Context?): DictionaryStoreState {
         context ?: return DictionaryStoreState()
         val file = dictionarySettingsFile(context)
@@ -530,6 +670,92 @@ object AiApiStore {
         dictionarySettingsFile(context).writeText(json.toString(2), Charsets.UTF_8)
     }
 
+    private fun readImageState(context: Context?): ImageStoreState {
+        context ?: return ImageStoreState()
+        val file = imageSettingsFile(context)
+        if (!file.isFile) return ImageStoreState()
+        return runCatching {
+            val json = JSONObject(file.readText(Charsets.UTF_8))
+            val settings = AiImageSettings(
+                apiId = json.optString("api_id").trim(),
+                coverPresetId = json.optString("cover_preset_id").ifBlank { DEFAULT_IMAGE_COVER_PRESET_ID },
+                bannerPresetId = json.optString("banner_preset_id").ifBlank { DEFAULT_IMAGE_BANNER_PRESET_ID },
+            )
+            val customPresets = buildList {
+                val array = json.optJSONArray("custom_presets") ?: JSONArray()
+                for (index in 0 until array.length()) {
+                    val item = array.optJSONObject(index) ?: continue
+                    val target = imagePresetTarget(item.optString("target")) ?: continue
+                    val preset = AiImagePreset(
+                        id = item.optString("id").trim(),
+                        target = target,
+                        name = item.optString("name").trim(),
+                        prompt = item.optString("prompt").trim(),
+                    )
+                    if (
+                        preset.id.isNotBlank() &&
+                        preset.name.isNotBlank() &&
+                        preset.prompt.isNotBlank() &&
+                        BUILTIN_IMAGE_PRESETS.none { it.id == preset.id }
+                    ) {
+                        add(preset)
+                    }
+                }
+            }.distinctBy { it.id }
+            ImageStoreState(settings, customPresets)
+        }.getOrElse { ImageStoreState() }
+    }
+
+    private fun writeImageState(context: Context, state: ImageStoreState) {
+        val customPresets = state.customPresets
+            .filter { it.id.isNotBlank() && it.name.isNotBlank() && it.prompt.isNotBlank() && !it.builtIn }
+            .distinctBy { it.id }
+        val coverPresetId = validImagePresetId(AiImagePresetTarget.Cover, state.settings.coverPresetId, customPresets)
+        val bannerPresetId = validImagePresetId(AiImagePresetTarget.Banner, state.settings.bannerPresetId, customPresets)
+        val array = JSONArray()
+        customPresets.forEach { preset ->
+            array.put(
+                JSONObject()
+                    .put("id", preset.id)
+                    .put("target", preset.target.id)
+                    .put("name", preset.name)
+                    .put("prompt", preset.prompt),
+            )
+        }
+        val json = JSONObject()
+            .put("api_id", state.settings.apiId)
+            .put("cover_preset_id", coverPresetId)
+            .put("banner_preset_id", bannerPresetId)
+            .put("custom_presets", array)
+        imageSettingsFile(context).writeText(json.toString(2), Charsets.UTF_8)
+    }
+
+    private fun defaultImagePreset(target: AiImagePresetTarget): AiImagePreset =
+        BUILTIN_IMAGE_PRESETS.first { it.target == target }
+
+    private fun validImagePresetId(
+        target: AiImagePresetTarget,
+        presetId: String,
+        customPresets: List<AiImagePreset>,
+    ): String =
+        if (
+            BUILTIN_IMAGE_PRESETS.any { it.target == target && it.id == presetId } ||
+            customPresets.any { it.target == target && it.id == presetId }
+        ) {
+            presetId
+        } else {
+            defaultImagePreset(target).id
+        }
+
+    private fun imagePresetTarget(value: String): AiImagePresetTarget? =
+        AiImagePresetTarget.values().firstOrNull { it.id == value }
+
+    private fun AiImageSettings.withImagePresetId(target: AiImagePresetTarget, presetId: String): AiImageSettings =
+        when (target) {
+            AiImagePresetTarget.Cover -> copy(coverPresetId = presetId)
+            AiImagePresetTarget.Banner -> copy(bannerPresetId = presetId)
+        }
+
     private fun normalizeBaseUrl(value: String): String =
         value.trim().trimEnd('/')
 
@@ -590,5 +816,10 @@ object AiApiStore {
     private data class DictionaryStoreState(
         val settings: AiDictionarySettings = AiDictionarySettings(),
         val customPresets: List<AiDictionaryPreset> = emptyList(),
+    )
+
+    private data class ImageStoreState(
+        val settings: AiImageSettings = AiImageSettings(),
+        val customPresets: List<AiImagePreset> = emptyList(),
     )
 }

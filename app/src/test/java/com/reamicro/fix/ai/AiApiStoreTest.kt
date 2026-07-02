@@ -31,6 +31,25 @@ class AiApiStoreTest {
     }
 
     @Test
+    fun imageSettingsDefaultToCoverAndBannerPresets() {
+        val settings = AiApiStore.imageSettings(null)
+
+        assertEquals(AiApiStore.DEFAULT_IMAGE_COVER_PRESET_ID, settings.coverPresetId)
+        assertEquals(AiApiStore.DEFAULT_IMAGE_BANNER_PRESET_ID, settings.bannerPresetId)
+    }
+
+    @Test
+    fun imageHasCoverAndBannerBuiltinPresets() {
+        val coverPresets = AiApiStore.imagePresets(null, AiImagePresetTarget.Cover)
+        val bannerPresets = AiApiStore.imagePresets(null, AiImagePresetTarget.Banner)
+
+        assertEquals(listOf("\u9ed8\u8ba4\u5c01\u9762"), coverPresets.map { it.name })
+        assertEquals(listOf("\u9ed8\u8ba4\u6a2a\u5e45"), bannerPresets.map { it.name })
+        assertTrue(coverPresets.all { it.builtIn })
+        assertTrue(bannerPresets.all { it.builtIn })
+    }
+
+    @Test
     fun dictionaryPromptReplacesSelectedTextPlaceholder() {
         val prompt = AiApiStore.renderDictionaryPrompt("\u89e3\u91ca {{text}}", "\u6625\u98ce")
 

@@ -43,6 +43,8 @@ import android.widget.Toast
 import com.reamicro.fix.ai.AiApiConfig
 import com.reamicro.fix.ai.AiApiStore
 import com.reamicro.fix.ai.AiDictionaryPreset
+import com.reamicro.fix.ai.AiImagePreset
+import com.reamicro.fix.ai.AiImagePresetTarget
 import com.reamicro.fix.association.model.BookSource
 import com.reamicro.fix.association.provider.AssociationSearchProviderRegistry
 import com.reamicro.fix.association.provider.ExternalSourceLoader
@@ -471,6 +473,9 @@ class ReaMicroSettingsHook(
                 InjectedRoute.DictionarySettings -> renderDictionarySettingsContent(innerPaddings, innerComposer)
                 InjectedRoute.DictionaryApiPicker -> renderDictionaryApiPickerContent(innerPaddings, innerComposer)
                 InjectedRoute.DictionaryPresetPicker -> renderDictionaryPresetPickerContent(innerPaddings, innerComposer)
+                InjectedRoute.ImageSettings -> renderImageSettingsContent(innerPaddings, innerComposer)
+                InjectedRoute.ImageApiPicker -> renderImageApiPickerContent(innerPaddings, innerComposer)
+                is InjectedRoute.ImagePresetPicker -> renderImagePresetPickerContent(currentRoute.target, innerPaddings, innerComposer)
                 InjectedRoute.FontSettings -> renderFontSettingsContent(innerPaddings, innerComposer)
                 is InjectedRoute.FontPicker -> renderFontPickerContent(currentRoute.target, innerPaddings, innerComposer)
                 InjectedRoute.FontLibrary -> renderFontLibraryContent(innerPaddings, innerComposer)
@@ -2272,12 +2277,18 @@ class ReaMicroSettingsHook(
             val lazyListScope = args?.getOrNull(0) ?: return@functionProxy targetUnit()
             aiApiVersionValue()
             val configs = listAiApiConfigs()
-            val dictionaryRows = listOf(
+            val managementRows = listOf(
                 ActionRow(
                     key = "dictionary_settings",
                     title = DICTIONARY_SETTINGS_TITLE,
                     subtitle = dictionarySettingsSummary(),
                     onClick = { openNestedInjectedRoute(InjectedRoute.DictionarySettings) },
+                ),
+                ActionRow(
+                    key = "image_settings",
+                    title = IMAGE_SETTINGS_TITLE,
+                    subtitle = imageSettingsSummary(),
+                    onClick = { openNestedInjectedRoute(InjectedRoute.ImageSettings) },
                 ),
             )
             val rows = buildList {
@@ -2315,7 +2326,7 @@ class ReaMicroSettingsHook(
                 }
             }
             addLazyItem(lazyListScope, DICTIONARY_SETTINGS_CONTENT_ITEM_KEY) { itemComposer ->
-                renderHostActionCard(dictionaryRows, itemComposer)
+                renderHostActionCard(managementRows, itemComposer)
             }
             addLazyItem(lazyListScope, AI_CONFIG_CONTENT_ITEM_KEY) { itemComposer ->
                 renderHostActionCard(rows, itemComposer)
@@ -2478,6 +2489,138 @@ class ReaMicroSettingsHook(
         renderHostLazyColumn(innerPaddings, listContent, composer)
     }
 
+    private fun renderImageSettingsContent(innerPaddings: Any, composer: Any) {
+        val listContent = functionProxy("ImageSettingsList", FUNCTION1_CLASS) { args ->
+            val lazyListScope = args?.getOrNull(0) ?: return@functionProxy targetUnit()
+            aiApiVersionValue()
+            val rows = listOf(
+                ActionRow(
+                    key = "image_api_picker",
+                    title = "\u0041\u0050\u0049 \u914d\u7f6e",
+                    subtitle = imageApiSelectionSummary(),
+                    onClick = { openNestedInjectedRoute(InjectedRoute.ImageApiPicker) },
+                ),
+                ActionRow(
+                    key = "image_cover_preset_picker",
+                    title = AiImagePresetTarget.Cover.title,
+                    subtitle = imagePresetSelectionSummary(AiImagePresetTarget.Cover),
+                    onClick = { openNestedInjectedRoute(InjectedRoute.ImagePresetPicker(AiImagePresetTarget.Cover)) },
+                ),
+                ActionRow(
+                    key = "image_banner_preset_picker",
+                    title = AiImagePresetTarget.Banner.title,
+                    subtitle = imagePresetSelectionSummary(AiImagePresetTarget.Banner),
+                    onClick = { openNestedInjectedRoute(InjectedRoute.ImagePresetPicker(AiImagePresetTarget.Banner)) },
+                ),
+            )
+            addLazyItem(lazyListScope, IMAGE_SETTINGS_CONTENT_ITEM_KEY) { itemComposer ->
+                renderHostActionCard(rows, itemComposer)
+            }
+            targetUnit()
+        }
+        renderHostLazyColumn(innerPaddings, listContent, composer)
+    }
+
+    private fun renderImageApiPickerContent(innerPaddings: Any, composer: Any) {
+        val listContent = functionProxy("ImageApiPickerList", FUNCTION1_CLASS) { args ->
+            val lazyListScope = args?.getOrNull(0) ?: return@functionProxy targetUnit()
+            aiApiVersionValue()
+            val context = activityProvider()?.applicationContext
+            val imageSettings = AiApiStore.imageSettings(context)
+            val configs = listAiApiConfigs()
+            val rows = buildList {
+                add(
+                    ActionRow(
+                        key = "image_api_follow",
+                        title = "\u8ddf\u968f API \u914d\u7f6e",
+                        subtitle = "\u4f7f\u7528 API \u914d\u7f6e\u9875\u4e2d\u542f\u7528\u7684 API",
+                        trailing = if (imageSettings.apiId.isBlank()) "\u5f53\u524d" else null,
+                        onClick = {
+                            AiApiStore.setImageApiId(context, "")
+                            bumpAiApiVersion()
+                            navigateBackFromInjectedRoute()
+                        },
+                    ),
+                )
+                if (configs.isEmpty()) {
+                    add(
+                        ActionRow(
+                            key = "image_api_empty",
+                            title = "\u6682\u65e0 API",
+                            subtitle = "\u8bf7\u5148\u5728 API \u914d\u7f6e\u9875\u6dfb\u52a0 API",
+                        ),
+                    )
+                } else {
+                    configs.forEach { config ->
+                        add(
+                            ActionRow(
+                                key = "image_api_${config.id}",
+                                title = config.displayName.compactOnlineSourceLine(),
+                                subtitle = config.baseUrl,
+                                trailing = if (imageSettings.apiId == config.id) "\u5f53\u524d" else null,
+                                onClick = {
+                                    AiApiStore.setImageApiId(context, config.id)
+                                    bumpAiApiVersion()
+                                    navigateBackFromInjectedRoute()
+                                },
+                            ),
+                        )
+                    }
+                }
+            }
+            addLazyItem(lazyListScope, IMAGE_API_PICKER_CONTENT_ITEM_KEY) { itemComposer ->
+                renderHostActionCard(rows, itemComposer)
+            }
+            targetUnit()
+        }
+        renderHostLazyColumn(innerPaddings, listContent, composer)
+    }
+
+    private fun renderImagePresetPickerContent(target: AiImagePresetTarget, innerPaddings: Any, composer: Any) {
+        val listContent = functionProxy("ImagePresetPickerList${target.id}", FUNCTION1_CLASS) { args ->
+            val lazyListScope = args?.getOrNull(0) ?: return@functionProxy targetUnit()
+            aiApiVersionValue()
+            val context = activityProvider()?.applicationContext
+            val imageSettings = AiApiStore.imageSettings(context)
+            val selectedPresetId = imagePresetId(imageSettings, target)
+            val rows = buildList {
+                add(
+                    ActionRow(
+                        key = "image_${target.id}_preset_add",
+                        title = "\u6dfb\u52a0\u9884\u8bbe",
+                        subtitle = "\u586b\u5199\u9884\u8bbe\u540d\u79f0\u548c\u751f\u56fe\u63d0\u793a\u8bcd",
+                        onClick = { openImagePresetDialog(target) },
+                    ),
+                )
+                AiApiStore.imagePresets(context, target).forEach { preset ->
+                    add(
+                        ActionRow(
+                            key = "image_${target.id}_preset_${preset.id}",
+                            title = preset.name.compactOnlineSourceLine(),
+                            subtitle = preset.prompt.compactOnlineSourceLine().let { line ->
+                                if (line.length > 72) line.take(72) + "..." else line
+                            },
+                            trailing = if (selectedPresetId == preset.id) "\u5f53\u524d" else null,
+                            onClick = {
+                                AiApiStore.setImagePresetId(context, target, preset.id)
+                                bumpAiApiVersion()
+                                navigateBackFromInjectedRoute()
+                            },
+                            onLongClick = if (preset.builtIn) null else {
+                                { openImagePresetDialog(target, preset) }
+                            },
+                        ),
+                    )
+                }
+            }
+            addLazyItem(lazyListScope, IMAGE_PRESET_PICKER_CONTENT_ITEM_KEY) { itemComposer ->
+                renderHostActionCard(rows, itemComposer)
+            }
+            targetUnit()
+        }
+        renderHostLazyColumn(innerPaddings, listContent, composer)
+    }
+
     private fun dictionarySettingsSummary(): String {
         val preset = dictionaryPresetSelectionSummary()
         val api = dictionaryApiSelectionSummary()
@@ -2500,6 +2643,36 @@ class ReaMicroSettingsHook(
         val dictionarySettings = AiApiStore.dictionarySettings(context)
         return AiApiStore.dictionaryPreset(context, dictionarySettings.presetId).name
     }
+
+    private fun imageSettingsSummary(): String {
+        val cover = imagePresetSelectionSummary(AiImagePresetTarget.Cover)
+        val banner = imagePresetSelectionSummary(AiImagePresetTarget.Banner)
+        val api = imageApiSelectionSummary()
+        return "$cover / $banner / $api"
+    }
+
+    private fun imageApiSelectionSummary(): String {
+        val context = activityProvider()?.applicationContext
+        val imageSettings = AiApiStore.imageSettings(context)
+        val config = AiApiStore.imageApi(context)
+        return when {
+            config == null -> "\u672a\u9009\u62e9 API"
+            imageSettings.apiId.isBlank() -> "\u8ddf\u968f API \u914d\u7f6e\uff1a${config.displayName}"
+            else -> config.displayName
+        }
+    }
+
+    private fun imagePresetSelectionSummary(target: AiImagePresetTarget): String {
+        val context = activityProvider()?.applicationContext
+        val imageSettings = AiApiStore.imageSettings(context)
+        return AiApiStore.imagePreset(context, target, imagePresetId(imageSettings, target)).name
+    }
+
+    private fun imagePresetId(settings: com.reamicro.fix.ai.AiImageSettings, target: AiImagePresetTarget): String =
+        when (target) {
+            AiImagePresetTarget.Cover -> settings.coverPresetId
+            AiImagePresetTarget.Banner -> settings.bannerPresetId
+        }
 
     private fun openDictionaryPresetDialog() {
         openDictionaryPresetDialog(existing = null)
@@ -2628,6 +2801,138 @@ class ReaMicroSettingsHook(
             }.onFailure {
                 XposedBridge.log("$LOG_PREFIX failed to open dictionary preset dialog: ${it.stackTraceToString()}")
                 showToast("\u65e0\u6cd5\u6253\u5f00\u8bcd\u5178\u9884\u8bbe")
+            }
+        }
+    }
+
+    private fun openImagePresetDialog(target: AiImagePresetTarget) {
+        openImagePresetDialog(target, existing = null)
+    }
+
+    private fun openImagePresetDialog(target: AiImagePresetTarget, existing: AiImagePreset?) {
+        val activity = activityProvider() ?: return
+        activity.runOnUiThread {
+            runCatching {
+                val actualTarget = existing?.target ?: target
+                val container = LinearLayout(activity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(48, 24, 48, 0)
+                }
+                val nameInput = EditText(activity).apply {
+                    hint = "\u9884\u8bbe\u540d\u79f0"
+                    inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_NORMAL
+                    setSingleLine(true)
+                    setText(existing?.name.orEmpty())
+                }
+                val promptInput = EditText(activity).apply {
+                    hint = "\u751f\u56fe\u63d0\u793a\u8bcd\uff0c\u53ef\u7528 {{text}} \u4ee3\u8868\u751f\u6210\u4e3b\u9898"
+                    inputType = InputType.TYPE_CLASS_TEXT or
+                        InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                        InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+                    minLines = 5
+                    maxLines = 8
+                    gravity = Gravity.TOP or Gravity.START
+                    setSingleLine(false)
+                    setText(existing?.prompt.orEmpty())
+                }
+                fun actionButton(title: String, color: Int): TextView =
+                    TextView(activity).apply {
+                        text = title
+                        setTextColor(color)
+                        gravity = Gravity.CENTER
+                        setSingleLine(true)
+                        textSize = 16f
+                        setPadding(0, 24, 0, 8)
+                        layoutParams = LinearLayout.LayoutParams(
+                            0,
+                            ViewGroup.LayoutParams.WRAP_CONTENT,
+                            1f,
+                        )
+                    }
+                val primaryColor = Color.rgb(45, 135, 120)
+                val finishButton = actionButton("\u5b8c\u6210", primaryColor)
+                val deleteButton = existing?.takeUnless { it.builtIn }?.let {
+                    actionButton("\u5220\u9664", Color.parseColor("#D64545"))
+                }
+                val cancelButton = actionButton("\u53d6\u6d88", primaryColor)
+                val actionRow = LinearLayout(activity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    addView(finishButton)
+                    if (deleteButton != null) addView(deleteButton)
+                    addView(cancelButton)
+                }
+                container.addView(nameInput)
+                container.addView(promptInput)
+                container.addView(actionRow)
+
+                fun hasAllValues(): Boolean =
+                    nameInput.text?.toString()?.trim()?.isNotBlank() == true &&
+                        promptInput.text?.toString()?.trim()?.isNotBlank() == true
+
+                fun refreshButtons() {
+                    val canFinish = hasAllValues()
+                    finishButton.isEnabled = canFinish
+                    finishButton.alpha = if (canFinish) 1f else 0.38f
+                }
+
+                val watcher = object : TextWatcher {
+                    override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+                    override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                        refreshButtons()
+                    }
+                    override fun afterTextChanged(s: Editable?) = Unit
+                }
+                nameInput.addTextChangedListener(watcher)
+                promptInput.addTextChangedListener(watcher)
+
+                val dialog = AlertDialog.Builder(activity)
+                    .setTitle(actualTarget.title)
+                    .setView(container)
+                    .create()
+                dialog.setOnShowListener {
+                    dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+                    refreshButtons()
+                    deleteButton?.setOnClickListener {
+                        val targetPreset = existing ?: return@setOnClickListener
+                        if (AiApiStore.removeImagePreset(activity.applicationContext, targetPreset.id)) {
+                            bumpAiApiVersion()
+                            showToast("\u5df2\u5220\u9664\u9884\u8bbe\uff1a${targetPreset.name}")
+                        }
+                        dialog.dismiss()
+                    }
+                    finishButton.setOnClickListener {
+                        val name = nameInput.text?.toString().orEmpty()
+                        val prompt = promptInput.text?.toString().orEmpty()
+                        runCatching {
+                            if (existing == null) {
+                                AiApiStore.addImagePreset(activity.applicationContext, actualTarget, name, prompt)
+                            } else {
+                                AiApiStore.updateImagePreset(activity.applicationContext, existing.id, name, prompt)
+                            }
+                        }.onSuccess { preset ->
+                            bumpAiApiVersion()
+                            showToast(
+                                if (existing == null) {
+                                    "\u5df2\u6dfb\u52a0\u9884\u8bbe\uff1a${preset.name}"
+                                } else {
+                                    "\u5df2\u66f4\u65b0\u9884\u8bbe\uff1a${preset.name}"
+                                },
+                            )
+                            dialog.dismiss()
+                        }.onFailure { error ->
+                            Toast.makeText(activity, error.message ?: "\u65e0\u6cd5\u4fdd\u5b58\u9884\u8bbe", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                    cancelButton.setOnClickListener {
+                        dialog.dismiss()
+                    }
+                }
+                dialog.show()
+                dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+            }.onFailure {
+                XposedBridge.log("$LOG_PREFIX failed to open image preset dialog: ${it.stackTraceToString()}")
+                showToast("\u65e0\u6cd5\u6253\u5f00\u751f\u56fe\u9884\u8bbe")
             }
         }
     }
@@ -4822,6 +5127,9 @@ class ReaMicroSettingsHook(
         object DictionarySettings : InjectedRoute(DICTIONARY_SETTINGS_TITLE)
         object DictionaryApiPicker : InjectedRoute("\u0041\u0050\u0049 \u914d\u7f6e")
         object DictionaryPresetPicker : InjectedRoute("\u8bcd\u5178\u9884\u8bbe")
+        object ImageSettings : InjectedRoute(IMAGE_SETTINGS_TITLE)
+        object ImageApiPicker : InjectedRoute("\u0041\u0050\u0049 \u914d\u7f6e")
+        data class ImagePresetPicker(val target: AiImagePresetTarget) : InjectedRoute(target.title)
         object FontSettings : InjectedRoute(FONT_SETTINGS_TITLE)
         data class FontPicker(val target: FontPickerTarget) : InjectedRoute(target.title)
         object FontLibrary : InjectedRoute(FONT_LIBRARY_TITLE)
@@ -4841,6 +5149,10 @@ class ReaMicroSettingsHook(
         InjectedRoute.DictionarySettings,
         InjectedRoute.DictionaryApiPicker,
         InjectedRoute.DictionaryPresetPicker,
+        InjectedRoute.ImageSettings,
+        InjectedRoute.ImageApiPicker,
+        InjectedRoute.ImagePresetPicker(AiImagePresetTarget.Cover),
+        InjectedRoute.ImagePresetPicker(AiImagePresetTarget.Banner),
     )
 
     private data class RotationUiState(
@@ -5052,6 +5364,9 @@ class ReaMicroSettingsHook(
         const val DICTIONARY_THINKING_SWITCH_ITEM_KEY = 0x524D466E
         const val DICTIONARY_API_PICKER_CONTENT_ITEM_KEY = 0x524D466F
         const val DICTIONARY_PRESET_PICKER_CONTENT_ITEM_KEY = 0x524D4670
+        const val IMAGE_SETTINGS_CONTENT_ITEM_KEY = 0x524D4671
+        const val IMAGE_API_PICKER_CONTENT_ITEM_KEY = 0x524D4672
+        const val IMAGE_PRESET_PICKER_CONTENT_ITEM_KEY = 0x524D4673
         const val ACCOUNT_CREDENTIAL_DOCUMENT_REQUEST_CODE = 0x524D47
         const val ACCOUNT_DATA_DOCUMENT_REQUEST_CODE = 0x524D48
         const val ONLINE_SOURCE_DOCUMENT_REQUEST_CODE = 0x524D49
@@ -5068,6 +5383,7 @@ class ReaMicroSettingsHook(
         const val ONLINE_COMPLETION_TITLE = "在线补全"
         const val AI_CONFIG_TITLE = "API \u914d\u7f6e"
         const val DICTIONARY_SETTINGS_TITLE = "\u8bcd\u5178\u7ba1\u7406"
+        const val IMAGE_SETTINGS_TITLE = "\u751f\u56fe\u7ba1\u7406"
         const val HOST_ABOUT_TITLE = "关于阅微"
         const val MODULE_ENTRY_TITLE = "补全计划"
         const val FONT_SETTINGS_TITLE = "字体设置"

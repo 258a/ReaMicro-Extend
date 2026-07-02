@@ -58,6 +58,7 @@ private const val MODULE_SETTINGS_PREFS = "reamicro_fix_module_settings"
 private const val READER_AUTO_PAGE_PREFS = "reamicro_reader_auto_page"
 private const val AI_API_CONFIG_FILE = "reamicro_ai_apis.json"
 private const val AI_DICTIONARY_SETTINGS_FILE = "reamicro_dictionary_settings.json"
+private const val AI_IMAGE_SETTINGS_FILE = "reamicro_image_settings.json"
 private const val ONLINE_SOURCE_DIR = "reamicro_online_sources"
 private const val ASSOCIATION_SOURCE_DIR = "reamicro_sources"
 private const val WEBDAV_KEY_URL = "url"
@@ -82,6 +83,7 @@ private val MODULE_BACKUP_PREFS = setOf(
 private val MODULE_BACKUP_FILES = setOf(
     AI_API_CONFIG_FILE,
     AI_DICTIONARY_SETTINGS_FILE,
+    AI_IMAGE_SETTINGS_FILE,
 )
 
 private val MODULE_BACKUP_DIRS = setOf(
