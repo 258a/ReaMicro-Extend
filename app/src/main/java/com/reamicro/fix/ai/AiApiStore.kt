@@ -124,14 +124,7 @@ object AiApiStore {
                     }
                 }
             }.distinctBy { it.id }
-            val firstEnabled = configs.indexOfFirst { it.enabled }
-            if (firstEnabled < 0) {
-                configs
-            } else {
-                configs.mapIndexed { index, config ->
-                    if (index == firstEnabled) config else config.copy(enabled = false)
-                }
-            }
+            configs
         }.getOrElse { emptyList() }
     }
 
@@ -148,7 +141,7 @@ object AiApiStore {
             apiKey = normalizedApiKey,
             model = normalizedModel,
         )
-        val next = (list(context).filterNot { it.id == config.id }.map { it.copy(enabled = false) } + config)
+        val next = (list(context).filterNot { it.id == config.id } + config)
             .sortedBy { it.displayName.lowercase() }
         write(context, next)
         return config
@@ -181,9 +174,6 @@ object AiApiStore {
         )
         // Editing can change the stable id, so remove both the old row and any row with the new id.
         val next = (configs.filterNot { it.id == id || it.id == updated.id } + updated)
-            .map { config ->
-                if (updated.enabled && config.id != updated.id) config.copy(enabled = false) else config
-            }
             .sortedBy { it.displayName.lowercase() }
         write(context, next)
         return updated
@@ -256,11 +246,7 @@ object AiApiStore {
         write(
             context,
             configs.map { config ->
-                when {
-                    config.id == id -> config.copy(enabled = enabled)
-                    enabled -> config.copy(enabled = false)
-                    else -> config
-                }
+                if (config.id == id) config.copy(enabled = enabled) else config
             },
         )
         return true
