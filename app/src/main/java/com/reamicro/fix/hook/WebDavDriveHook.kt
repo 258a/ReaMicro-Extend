@@ -171,6 +171,8 @@ class WebDavDriveHook(
     private val onlineCompletionLocalSheetDepth = ThreadLocal<Int>()
     private val onlineCompletionUpdateRowInjecting = ThreadLocal<Boolean>()
     private val webDavBackupCardDepth = ThreadLocal<Int>()
+    private var webDavAccountNavGraphScopeStrong: Any? = null
+    private var localLibraryAccountNavGraphScopeStrong: Any? = null
     private var webDavAccountNavGraphScopeRef: WeakReference<Any>? = null
     private var localLibraryAccountNavGraphScopeRef: WeakReference<Any>? = null
     @Volatile private var webDavAccountRouteRenderAtMs: Long = 0L
@@ -3601,11 +3603,12 @@ class WebDavDriveHook(
 
     private fun hookThirdAccountWebDavRoute() {
         runCatching {
-            val methods = routeMethods(THIRD_ACCOUNT_ROUTE_METHOD, THIRD_ACCOUNT_ROUTE_METHOD_LEGACY)
+            val methods = setupRouteMethods()
             methods.forEach { method ->
                 XposedBridge.hookMethod(method, object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val backStackEntry = param.args?.getOrNull(2) ?: return
+                        if (!isRouteDestination(backStackEntry, ROUTE_THIRD_ACCOUNT_CLASS)) return
                         val route = runCatching { navBackStackEntryToThirdAccount(backStackEntry) }.getOrNull() ?: return
                         val type = route.javaClass.methods.firstOrNull { it.name == "getType" && it.parameterTypes.isEmpty() }
                             ?.invoke(route) as? Number ?: return
@@ -3614,8 +3617,9 @@ class WebDavDriveHook(
                             clearWebDavAccountContext()
                             markLocalLibraryAccountContext(navGraphScope)
                             val composer = param.args?.getOrNull(3) ?: return
-                            renderLocalLibraryAccountRoute(navGraphScope, composer)
-                            param.result = targetUnit()
+                            if (renderLocalLibraryAccountRoute(navGraphScope, composer)) {
+                                param.result = targetUnit()
+                            }
                             return
                         }
                         if (type.toInt() != BACKUP_TYPE_WEBDAV) {
@@ -3626,12 +3630,13 @@ class WebDavDriveHook(
                         clearLocalLibraryAccountContext()
                         markWebDavAccountContext(navGraphScope)
                         val composer = param.args?.getOrNull(3) ?: return
-                        renderWebDavAccountRoute(navGraphScope, composer)
-                        param.result = targetUnit()
+                        if (renderWebDavAccountRoute(navGraphScope, composer)) {
+                            param.result = targetUnit()
+                        }
                     }
                 })
             }
-            XposedBridge.log("$LOG_PREFIX WebDAV third account route hook installed: ${methods.joinToString { it.name }}")
+            XposedBridge.log("$LOG_PREFIX WebDAV third account route hook installed: ${methods.size} setup lambdas")
         }.onFailure {
             XposedBridge.log("$LOG_PREFIX failed to hook WebDAV third account route: ${it.stackTraceToString()}")
         }
@@ -3688,7 +3693,9 @@ class WebDavDriveHook(
             XposedBridge.hookMethod(defaultFolder, object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     if (!isWebDavAccountContext()) return
-                    val navGraphScope = webDavAccountNavGraphScope.get() ?: webDavAccountNavGraphScopeRef?.get()
+                    val navGraphScope = webDavAccountNavGraphScope.get()
+                        ?: webDavAccountNavGraphScopeStrong
+                        ?: webDavAccountNavGraphScopeRef?.get()
                     param.args?.set(0, currentWebDavBackupDir())
                     param.args?.set(1, functionProxy("WebDavAccountDefaultFolder", FUNCTION0_CLASS) {
                         navGraphScope?.let { navigateCloudFolder(it) }
@@ -3701,7 +3708,9 @@ class WebDavDriveHook(
             XposedBridge.hookMethod(logout, object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     if (!isWebDavAccountContext()) return
-                    val navGraphScope = webDavAccountNavGraphScope.get() ?: webDavAccountNavGraphScopeRef?.get()
+                    val navGraphScope = webDavAccountNavGraphScope.get()
+                        ?: webDavAccountNavGraphScopeStrong
+                        ?: webDavAccountNavGraphScopeRef?.get()
                     param.args?.set(0, functionProxy("WebDavAccountLogout", FUNCTION0_CLASS) {
                         clearWebDavLogin()
                         clearWebDavAccountContext()
@@ -3851,7 +3860,11 @@ class WebDavDriveHook(
             XposedBridge.hookMethod(method, object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
                     val navGraphScope = param.args?.getOrNull(0) ?: return
-                    if ((webDavAccountScreenDepth.get() ?: 0) <= 0 && webDavAccountNavGraphScopeRef?.get() !== navGraphScope) return
+                    if (
+                        (webDavAccountScreenDepth.get() ?: 0) <= 0 &&
+                        webDavAccountNavGraphScopeStrong !== navGraphScope &&
+                        webDavAccountNavGraphScopeRef?.get() !== navGraphScope
+                    ) return
                     navigateCloudFolder(navGraphScope)
                     param.result = targetUnit()
                 }
@@ -3864,11 +3877,12 @@ class WebDavDriveHook(
 
     private fun hookThirdLoginWebDavRoute() {
         runCatching {
-            val methods = routeMethods(THIRD_LOGIN_ROUTE_METHOD, THIRD_LOGIN_ROUTE_METHOD_LEGACY)
+            val methods = setupRouteMethods()
             methods.forEach { method ->
                 XposedBridge.hookMethod(method, object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         val backStackEntry = param.args?.getOrNull(2) ?: return
+                        if (!isRouteDestination(backStackEntry, ROUTE_THIRD_LOGIN_CLASS)) return
                         val route = runCatching { navBackStackEntryToThirdLogin(backStackEntry) }.getOrNull() ?: return
                         val type = route.javaClass.methods.firstOrNull { it.name == "getType" && it.parameterTypes.isEmpty() }
                             ?.invoke(route) as? Number ?: return
@@ -3880,23 +3894,40 @@ class WebDavDriveHook(
                     }
                 })
             }
-            XposedBridge.log("$LOG_PREFIX WebDAV third login route hook installed: ${methods.joinToString { it.name }}")
+            XposedBridge.log("$LOG_PREFIX WebDAV third login route hook installed: ${methods.size} setup lambdas")
         }.onFailure {
             XposedBridge.log("$LOG_PREFIX failed to hook WebDAV third login route: ${it.stackTraceToString()}")
         }
     }
 
-    private fun routeMethods(vararg names: String): List<Method> {
+    private fun setupRouteMethods(): List<Method> {
         val appClass = cls(APP_KT_CLASS)
-        val methods = names.distinct().mapNotNull { name ->
-            appClass.declaredMethods.firstOrNull {
-                it.name == name && it.parameterTypes.size == 5
-            }?.apply { isAccessible = true }
-        }
+        val methods = appClass.declaredMethods
+            .filter { it.name.startsWith(SETUP_ROUTE_METHOD_PREFIX) && it.parameterTypes.size == 5 }
+            .onEach { it.isAccessible = true }
         if (methods.isEmpty()) {
-            error("No route methods found for ${names.joinToString()}")
+            error("No setup route methods found")
         }
         return methods
+    }
+
+    private fun isRouteDestination(backStackEntry: Any, routeClassName: String): Boolean {
+        val destination = runCatching {
+            backStackEntry.javaClass.methods.firstOrNull {
+                it.name == "getDestination" && it.parameterTypes.isEmpty()
+            }?.apply { isAccessible = true }?.invoke(backStackEntry)
+        }.getOrNull() ?: return false
+        val route = runCatching {
+            destination.javaClass.methods.firstOrNull {
+                it.name == "getRoute" && it.parameterTypes.isEmpty()
+            }?.apply { isAccessible = true }?.invoke(destination)?.toString().orEmpty()
+        }.getOrDefault("")
+        if (route.isBlank()) return false
+        val dottedClassName = routeClassName.replace('$', '.')
+        val simpleName = routeClassName.substringAfterLast('$')
+        return route.contains(routeClassName) ||
+            route.contains(dottedClassName) ||
+            route.contains(simpleName)
     }
 
     private fun navBackStackEntryToThirdLogin(backStackEntry: Any): Any {
@@ -3948,7 +3979,7 @@ class WebDavDriveHook(
         }
     }
 
-    private fun renderWebDavAccountRoute(navGraphScope: Any, composer: Any) {
+    private fun renderWebDavAccountRoute(navGraphScope: Any, composer: Any): Boolean {
         markWebDavAccountContext(navGraphScope)
         webDavAccountNavGraphScope.set(navGraphScope)
         webDavAccountScreenDepth.set((webDavAccountScreenDepth.get() ?: 0) + 1)
@@ -3959,8 +3990,10 @@ class WebDavDriveHook(
                 composer,
                 0,
             )
+            return true
         } catch (throwable: Throwable) {
             XposedBridge.log("$LOG_PREFIX failed to render WebDAV account route: ${throwable.stackTraceToString()}")
+            return false
         } finally {
             val next = (webDavAccountScreenDepth.get() ?: 0) - 1
             if (next <= 0) {
@@ -3972,7 +4005,7 @@ class WebDavDriveHook(
         }
     }
 
-    private fun renderLocalLibraryAccountRoute(navGraphScope: Any, composer: Any) {
+    private fun renderLocalLibraryAccountRoute(navGraphScope: Any, composer: Any): Boolean {
         markLocalLibraryAccountContext(navGraphScope)
         localLibraryAccountNavGraphScope.set(navGraphScope)
         localLibraryAccountScreenDepth.set((localLibraryAccountScreenDepth.get() ?: 0) + 1)
@@ -3983,8 +4016,10 @@ class WebDavDriveHook(
                 composer,
                 0,
             )
+            return true
         } catch (throwable: Throwable) {
             XposedBridge.log("$LOG_PREFIX failed to render local library account route: ${throwable.stackTraceToString()}")
+            return false
         } finally {
             val next = (localLibraryAccountScreenDepth.get() ?: 0) - 1
             if (next <= 0) {
@@ -4072,21 +4107,25 @@ class WebDavDriveHook(
     }
 
     private fun markWebDavAccountContext(navGraphScope: Any) {
+        webDavAccountNavGraphScopeStrong = navGraphScope
         webDavAccountNavGraphScopeRef = WeakReference(navGraphScope)
         webDavAccountRouteRenderAtMs = System.currentTimeMillis()
     }
 
     private fun clearWebDavAccountContext() {
+        webDavAccountNavGraphScopeStrong = null
         webDavAccountNavGraphScopeRef = null
         webDavAccountRouteRenderAtMs = 0L
     }
 
     private fun markLocalLibraryAccountContext(navGraphScope: Any) {
+        localLibraryAccountNavGraphScopeStrong = navGraphScope
         localLibraryAccountNavGraphScopeRef = WeakReference(navGraphScope)
         localLibraryAccountRouteRenderAtMs = System.currentTimeMillis()
     }
 
     private fun clearLocalLibraryAccountContext() {
+        localLibraryAccountNavGraphScopeStrong = null
         localLibraryAccountNavGraphScopeRef = null
         localLibraryAccountRouteRenderAtMs = 0L
     }
@@ -4094,12 +4133,14 @@ class WebDavDriveHook(
     private fun isWebDavAccountContext(): Boolean =
         (webDavAccountScreenDepth.get() ?: 0) > 0 ||
             webDavAccountNavGraphScope.get() != null ||
+            webDavAccountNavGraphScopeStrong != null ||
             webDavAccountNavGraphScopeRef?.get() != null ||
             (System.currentTimeMillis() - webDavAccountRouteRenderAtMs) in 0..ACCOUNT_CONTEXT_GRACE_MS
 
     private fun isLocalLibraryAccountContext(): Boolean =
         (localLibraryAccountScreenDepth.get() ?: 0) > 0 ||
             localLibraryAccountNavGraphScope.get() != null ||
+            localLibraryAccountNavGraphScopeStrong != null ||
             localLibraryAccountNavGraphScopeRef?.get() != null ||
             (System.currentTimeMillis() - localLibraryAccountRouteRenderAtMs) in 0..ACCOUNT_CONTEXT_GRACE_MS
 
@@ -11691,10 +11732,7 @@ img{max-width:100%;max-height:100%;height:auto;}
         const val APP_KT_CLASS = "app.zhendong.reamicro.AppKt"
         const val NAV_GRAPH_SCOPE_CLASS = "app.zhendong.reamicro.NavGraphScope"
         const val NAVIGATE_METHOD = "navigate"
-        const val THIRD_LOGIN_ROUTE_METHOD = "setup\$lambda\$0\$17"
-        const val THIRD_LOGIN_ROUTE_METHOD_LEGACY = "setup\$lambda\$0\$16"
-        const val THIRD_ACCOUNT_ROUTE_METHOD = "setup\$lambda\$0\$18"
-        const val THIRD_ACCOUNT_ROUTE_METHOD_LEGACY = "setup\$lambda\$0\$17"
+        const val SETUP_ROUTE_METHOD_PREFIX = "setup\$lambda\$0\$"
         const val ROUTE_HOME_CLASS = "app.zhendong.reamicro.Route\$Home"
         const val ROUTE_STORAGE_CLASS = "app.zhendong.reamicro.Route\$Storage"
         const val ROUTE_CLOUD_FOLDER_CLASS = "app.zhendong.reamicro.Route\$CloudFolder"
