@@ -59,6 +59,10 @@ import com.reamicro.fix.notification.onlineCompletionDownloadText
 import com.reamicro.fix.notification.onlineCompletionDownloadTitle
 import com.reamicro.fix.settings.ModuleSettings
 import com.reamicro.fix.settings.ModuleSettingsSnapshot
+import com.reamicro.fix.webdav.CleartextScope
+import com.reamicro.fix.webdav.WebDavCredentials
+import com.reamicro.fix.webdav.WebDavHttpException
+import com.reamicro.fix.webdav.WebDavRemoteClient
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
@@ -80,7 +84,6 @@ import java.net.URLDecoder
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Locale
-import java.util.TimeZone
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ConcurrentHashMap
@@ -169,12 +172,18 @@ class WebDavDriveHook(
     private var webDavAccountAuthFlow: Any? = null
     private val localLibraryAccountAuthLock = Any()
     private var localLibraryAccountAuthFlow: Any? = null
-    private var webDavHttpClient: Any? = null
     private val webDavCleartextAllowed = ThreadLocal<Boolean>()
     private val webDavCleartextAllowedHosts = ConcurrentHashMap<String, Boolean>()
     private val webDavCleartextAllowedLoggedHosts = ConcurrentHashMap<String, Boolean>()
-    private val alistTokenCache = ConcurrentHashMap<String, AlistTokenCache>()
-    private val alistUnsupportedUntil = ConcurrentHashMap<String, Long>()
+    private val webDavRemoteClient by lazy {
+        WebDavRemoteClient(
+            classLoader = classLoader,
+            log = ::logWebDav,
+            cleartextScope = object : CleartextScope {
+                override fun <T> run(block: () -> T): T = withWebDavCleartextAllowed(block)
+            },
+        )
+    }
     private val webDavStorageViewModels = mutableListOf<WeakReference<Any>>()
     private var cloudStorageRepositoryRef: WeakReference<Any>? = null
     private var bookshelfRepositoryRef: WeakReference<Any>? = null
@@ -4619,92 +4628,25 @@ class WebDavDriveHook(
     private fun searchAlistBooks(query: String): List<WebDavEntry>? =
         runCatching {
             val credentials = webDavCredentials() ?: return null
-            val endpoint = alistApiEndpoint(credentials.url) ?: return null
-            val cacheKey = alistCacheKey(endpoint, credentials)
-            if (isAlistUnsupported(cacheKey)) return null
-            val token = cachedAlistToken(endpoint, credentials, cacheKey) ?: return null
-            val results = mutableListOf<WebDavEntry>()
-            var page = 1
-            var total = Int.MAX_VALUE
-            while (results.size < HOME_SEARCH_RESULT_LIMIT && page <= ALIST_SEARCH_MAX_PAGES) {
-                val response = executeRawOkHttpRequest(
-                    url = "${endpoint.apiBase}/fs/search",
-                    method = "POST",
-                    headers = mapOf(
-                        "Authorization" to token,
-                        "Content-Type" to "application/json",
-                    ),
-                    requestBodyOverride = newOkHttpStringRequestBody(
-                        JSONObject()
-                            .put("parent", endpoint.rootPath)
-                            .put("keywords", query)
-                            .put("scope", 0)
-                            .put("page", page)
-                            .put("per_page", ALIST_SEARCH_PAGE_SIZE)
-                            .put("password", "")
-                            .toString(),
-                        "application/json; charset=utf-8",
-                    ),
+            webDavRemoteClient.searchAlistBooks(
+                credentials = credentials,
+                query = query,
+                resultLimit = HOME_SEARCH_RESULT_LIMIT,
+                pageSize = ALIST_SEARCH_PAGE_SIZE,
+                maxPages = ALIST_SEARCH_MAX_PAGES,
+            )?.mapNotNull { entry ->
+                if (!isSupportedBookFile(entry.name)) return@mapNotNull null
+                WebDavEntry(
+                    name = entry.name,
+                    path = entry.path,
+                    isDirectory = false,
+                    size = entry.size,
+                    updatedAt = entry.updatedAt,
                 )
-                if (response.code !in 200..299) {
-                    logWebDav("OpenList/AList search failed code=${response.code} body=${response.bodyString.orEmpty().take(160)}")
-                    markAlistUnsupported(cacheKey)
-                    return null
-                }
-                val body = response.bodyString.orEmpty()
-                val root = JSONObject(body)
-                if (!alistResponseOk(body) && root.optInt("code", 0) != 200) {
-                    logWebDav("OpenList/AList search rejected body=${body.take(160)}")
-                    markAlistUnsupported(cacheKey)
-                    return null
-                }
-                val data = root.optJSONObject("data") ?: run {
-                    markAlistUnsupported(cacheKey)
-                    return null
-                }
-                total = data.optInt("total", total)
-                val content = data.optJSONArray("content") ?: data.optJSONArray("files") ?: JSONArray()
-                if (content.length() == 0) break
-                for (index in 0 until content.length()) {
-                    val item = content.optJSONObject(index) ?: continue
-                    val entry = alistSearchEntry(item, endpoint.rootPath) ?: continue
-                    if (isSupportedBookFile(entry.name)) {
-                        results.add(entry)
-                    }
-                    if (results.size >= HOME_SEARCH_RESULT_LIMIT) break
-                }
-                if (page * ALIST_SEARCH_PAGE_SIZE >= total) break
-                page += 1
             }
-            results
         }.onFailure {
             logWebDav("OpenList/AList search unavailable: ${it.message}")
         }.getOrNull()
-
-    private fun alistSearchEntry(item: JSONObject, rootPath: String): WebDavEntry? {
-        val name = item.optString("name", "").trim()
-        if (name.isBlank() || name.startsWith(".")) return null
-        val isDirectory = item.optBoolean("is_dir", item.optBoolean("isDir", false))
-        if (isDirectory) return null
-        val rawPath = item.optString("path", "").trim()
-        val parent = item.optString("parent", "").trim()
-        val path = when {
-            rawPath.isNotBlank() && rawPath.substringAfterLast('/') == name -> rawPath
-            rawPath.isNotBlank() -> childWebDavPath(rawPath, name)
-            parent.isNotBlank() -> childWebDavPath(parent, name)
-            else -> childWebDavPath("/", name)
-        }
-        val relativePath = alistAbsoluteToWebDavPath(path, rootPath) ?: return null
-        return WebDavEntry(
-            name = name,
-            path = relativePath,
-            isDirectory = false,
-            size = item.optLong("size", 0L),
-            updatedAt = parseAlistDate(
-                item.optString("modified", "").ifBlank { item.optString("updated_at", "") },
-            ),
-        )
-    }
 
     private fun searchLocalLibraryBooks(query: String): List<Any> {
         val needle = query.trim()
@@ -9905,10 +9847,10 @@ img{max-width:100%;max-height:100%;height:auto;}
     private fun listWebDav(path: String): List<WebDavEntry> {
         val credentials = webDavCredentials() ?: return emptyList()
         val normalizedPath = normalizeWebDavPath(path.ifBlank { "/" })
-        val requestUrl = buildWebDavUrl(credentials.url, normalizedPath, directory = true)
+        val requestUrl = webDavRemoteClient.buildUrl(credentials.url, normalizedPath, directory = true)
         logWebDav("PROPFIND ${requestUrl.toString().redactWebDavUrl()}")
         return runCatching {
-            val response = webDavRequest(
+            val response = webDavRemoteClient.request(
                 credentials = credentials,
                 method = "PROPFIND",
                 path = normalizedPath,
@@ -9933,7 +9875,7 @@ img{max-width:100%;max-height:100%;height:auto;}
             (0 until nodes.length).mapNotNull { index ->
                 val element = nodes.item(index) as? Element ?: return@mapNotNull null
                 val href = element.textOf("href")
-                val entryPath = normalizeWebDavPath(pathFromHref(credentials.url, href))
+                val entryPath = normalizeWebDavPath(webDavRemoteClient.pathFromHref(credentials.url, href))
                 if (entryPath == current) return@mapNotNull null
                 val name = element.textOf("displayname").ifBlank { entryPath.substringAfterLast('/') }
                 if (name.isBlank()) return@mapNotNull null
@@ -9943,7 +9885,7 @@ img{max-width:100%;max-height:100%;height:auto;}
                     path = entryPath,
                     isDirectory = isDirectory,
                     size = element.textOf("getcontentlength").toLongOrNull() ?: 0L,
-                    updatedAt = parseWebDavDate(element.textOf("getlastmodified")),
+                    updatedAt = webDavRemoteClient.parseWebDavDate(element.textOf("getlastmodified")),
                 )
             }.filterNot { it.name.startsWith(".") }
                 .let(::sortWebDavEntries)
@@ -9962,7 +9904,7 @@ img{max-width:100%;max-height:100%;height:auto;}
 
     private fun webDavMkcol(path: String) {
         val credentials = webDavCredentials() ?: error("WebDAV not authorized")
-        val code = webDavRequest(credentials, "MKCOL", normalizeWebDavPath(path)).code
+        val code = webDavRemoteClient.request(credentials, "MKCOL", normalizeWebDavPath(path)).code
         if (code !in 200..299 && code != 405) {
             error("WebDAV MKCOL failed: HTTP $code")
         }
@@ -9970,12 +9912,12 @@ img{max-width:100%;max-height:100%;height:auto;}
 
     private fun webDavMove(from: String, to: String) {
         val credentials = webDavCredentials() ?: error("WebDAV not authorized")
-        val code = webDavRequest(
+        val code = webDavRemoteClient.request(
             credentials = credentials,
             method = "MOVE",
             path = normalizeWebDavPath(from),
             headers = mapOf(
-                "Destination" to buildWebDavUrl(credentials.url, normalizeWebDavPath(to)).toString(),
+                "Destination" to webDavRemoteClient.buildUrl(credentials.url, normalizeWebDavPath(to)).toString(),
                 "Overwrite" to "T",
             ),
         ).code
@@ -9986,7 +9928,7 @@ img{max-width:100%;max-height:100%;height:auto;}
 
     private fun webDavDelete(path: String) {
         val credentials = webDavCredentials() ?: error("WebDAV not authorized")
-        val code = webDavRequest(credentials, "DELETE", normalizeWebDavPath(path)).code
+        val code = webDavRemoteClient.request(credentials, "DELETE", normalizeWebDavPath(path)).code
         if (code !in 200..299 && code != 404) {
             error("WebDAV DELETE failed: HTTP $code")
         }
@@ -9995,7 +9937,7 @@ img{max-width:100%;max-height:100%;height:auto;}
     private fun webDavDownload(path: String, outputFile: File, onProgress: ((Int) -> Unit)? = null) {
         val credentials = webDavCredentials() ?: error("WebDAV not authorized")
         outputFile.parentFile?.mkdirs()
-        webDavRequestToFile(credentials, "GET", normalizeWebDavPath(path), outputFile, onProgress)
+        webDavRemoteClient.requestToFile(credentials, "GET", normalizeWebDavPath(path), outputFile, onProgress)
     }
 
     private fun webDavUpload(path: String, file: File) {
@@ -10011,7 +9953,7 @@ img{max-width:100%;max-height:100%;height:auto;}
             response = webDavPut(credentials, normalizedPath, file)
         }
         if (response.code !in 200..299 && response.code != 201 && response.code != 204) {
-            if (response.code == 405 && tryAlistUploadFallback(credentials, normalizedPath, file)) {
+            if (response.code == 405 && webDavRemoteClient.tryAlistUploadFallback(credentials, normalizedPath, file, EPUB_MIME_TYPE)) {
                 return
             }
             val detail = response.bodyString.orEmpty().take(200).ifBlank { "no response body" }
@@ -10019,19 +9961,8 @@ img{max-width:100%;max-height:100%;height:auto;}
         }
     }
 
-    private fun webDavPut(credentials: WebDavCredentials, path: String, file: File): WebDavHttpResponse =
-        executeOkHttpRequest(
-            credentials = credentials,
-            method = "PUT",
-            path = path,
-            directory = false,
-            body = null,
-            headers = mapOf(
-                "Content-Type" to EPUB_MIME_TYPE,
-                "Overwrite" to "T",
-            ),
-            requestBodyOverride = newOkHttpFileRequestBody(file, EPUB_MIME_TYPE),
-        )
+    private fun webDavPut(credentials: WebDavCredentials, path: String, file: File) =
+        webDavRemoteClient.putFile(credentials, path, file, EPUB_MIME_TYPE)
 
     private fun ensureWebDavParentDirs(path: String) {
         val parent = parentWebDavPath(path)
@@ -10043,330 +9974,6 @@ img{max-width:100%;max-height:100%;height:auto;}
             runCatching { webDavMkcol(current) }
                 .onFailure { logWebDav("MKCOL skipped path=$current error=${it.message}") }
         }
-    }
-
-    private fun tryAlistUploadFallback(credentials: WebDavCredentials, path: String, file: File): Boolean =
-        runCatching {
-            val endpoint = alistApiEndpoint(credentials.url) ?: return false
-            val cacheKey = alistCacheKey(endpoint, credentials)
-            if (isAlistUnsupported(cacheKey)) return false
-            val token = cachedAlistToken(endpoint, credentials, cacheKey) ?: return false
-            val upload = executeRawOkHttpRequest(
-                url = "${endpoint.apiBase}/fs/put",
-                method = "PUT",
-                headers = mapOf(
-                    "Authorization" to token,
-                    "File-Path" to childWebDavPath(endpoint.rootPath, normalizeWebDavPath(path).trimStart('/')),
-                    "As-Task" to "false",
-                    "Content-Type" to EPUB_MIME_TYPE,
-                ),
-                requestBodyOverride = newOkHttpFileRequestBody(file, EPUB_MIME_TYPE),
-            )
-            val ok = upload.code in 200..299 && alistResponseOk(upload.bodyString.orEmpty())
-            logWebDav("AList upload fallback path=$path code=${upload.code} ok=$ok body=${upload.bodyString.orEmpty().take(160)}")
-            ok
-        }.onFailure {
-            logWebDav("AList upload fallback failed path=$path error=${it.message}")
-        }.getOrDefault(false)
-
-    private fun alistApiEndpoint(webDavUrl: String): AlistApiEndpoint? =
-        runCatching {
-            val uri = URI(webDavUrl.trimEnd('/'))
-            val path = uri.path.orEmpty().trimEnd('/')
-            val marker = "/dav"
-            val markerIndex = path.lowercase(Locale.ROOT).lastIndexOf(marker)
-            if (markerIndex < 0) return null
-            val afterMarkerIndex = markerIndex + marker.length
-            if (path.length > afterMarkerIndex && path[afterMarkerIndex] != '/') return null
-            val apiPath = path.substring(0, markerIndex).ifBlank { "" } + "/api"
-            val rootPath = path.substring(afterMarkerIndex).ifBlank { "/" }
-            AlistApiEndpoint(
-                apiBase = URI(uri.scheme, uri.userInfo, uri.host, uri.port, apiPath, null, null).toString().trimEnd('/'),
-                rootPath = normalizeWebDavPath(rootPath),
-            )
-        }.getOrNull()
-
-    private fun cachedAlistToken(endpoint: AlistApiEndpoint, credentials: WebDavCredentials, cacheKey: String): String? {
-        val now = System.currentTimeMillis()
-        alistTokenCache[cacheKey]?.takeIf { now < it.expiresAtMs }?.let { return it.token }
-        val token = alistToken(endpoint.apiBase, credentials.username, credentials.password)
-        if (token.isNullOrBlank()) {
-            markAlistUnsupported(cacheKey)
-            return null
-        }
-        alistTokenCache[cacheKey] = AlistTokenCache(
-            token = token,
-            expiresAtMs = now + ALIST_TOKEN_CACHE_TTL_MS,
-        )
-        alistUnsupportedUntil.remove(cacheKey)
-        return token
-    }
-
-    private fun alistCacheKey(endpoint: AlistApiEndpoint, credentials: WebDavCredentials): String =
-        "${endpoint.apiBase}|${endpoint.rootPath}|${credentials.username}|${credentials.password.hashCode()}"
-
-    private fun isAlistUnsupported(cacheKey: String): Boolean {
-        val until = alistUnsupportedUntil[cacheKey] ?: return false
-        if (System.currentTimeMillis() < until) return true
-        alistUnsupportedUntil.remove(cacheKey)
-        return false
-    }
-
-    private fun markAlistUnsupported(cacheKey: String) {
-        alistUnsupportedUntil[cacheKey] = System.currentTimeMillis() + ALIST_UNSUPPORTED_CACHE_TTL_MS
-        alistTokenCache.remove(cacheKey)
-    }
-
-    private fun alistToken(apiBase: String, username: String, password: String): String? {
-        val login = executeRawOkHttpRequest(
-            url = "$apiBase/auth/login",
-            method = "POST",
-            headers = mapOf("Content-Type" to "application/json"),
-            requestBodyOverride = newOkHttpStringRequestBody(
-                """{"username":${username.jsonQuote()},"password":${password.jsonQuote()}}""",
-                "application/json; charset=utf-8",
-            ),
-        )
-        if (login.code !in 200..299) {
-            logWebDav("AList login failed code=${login.code} body=${login.bodyString.orEmpty().take(160)}")
-            return null
-        }
-        return Regex(""""token"\s*:\s*"([^"]+)"""")
-            .find(login.bodyString.orEmpty())
-            ?.groupValues
-            ?.getOrNull(1)
-    }
-
-    private fun alistResponseOk(body: String): Boolean =
-        Regex(""""code"\s*:\s*200""").containsMatchIn(body) ||
-            Regex(""""message"\s*:\s*"success"""", RegexOption.IGNORE_CASE).containsMatchIn(body)
-
-    private fun webDavRequest(
-        credentials: WebDavCredentials,
-        method: String,
-        path: String,
-        directory: Boolean = false,
-        body: String? = null,
-        headers: Map<String, String> = emptyMap(),
-    ): WebDavHttpResponse {
-        val response = executeOkHttpRequest(credentials, method, path, directory, body, headers)
-        return WebDavHttpResponse(
-            code = response.code,
-            bodyString = response.bodyString ?: "",
-        )
-    }
-
-    private fun webDavRequestToFile(
-        credentials: WebDavCredentials,
-        method: String,
-        path: String,
-        outputFile: File,
-        onProgress: ((Int) -> Unit)? = null,
-    ) {
-        val response = executeOkHttpRequest(credentials, method, path, false, null, emptyMap(), outputFile, onProgress)
-        if (response.code !in 200..299) {
-            error("WebDAV $method failed: HTTP ${response.code}")
-        }
-    }
-
-    private fun executeOkHttpRequest(
-        credentials: WebDavCredentials,
-        method: String,
-        path: String,
-        directory: Boolean,
-        body: String?,
-        headers: Map<String, String>,
-        outputFile: File? = null,
-        onProgress: ((Int) -> Unit)? = null,
-        requestBodyOverride: Any? = null,
-    ): WebDavHttpResponse {
-        val url = buildWebDavUrl(credentials.url, path, directory).toString()
-        val requestBuilder = cls(OKHTTP_REQUEST_BUILDER_CLASS).getDeclaredConstructor()
-            .apply { isAccessible = true }
-            .newInstance()
-        requestBuilder.javaClass.getDeclaredMethod("url", String::class.java)
-            .apply { isAccessible = true }
-            .invoke(requestBuilder, url)
-
-        val token = Base64.encodeToString(
-            "${credentials.username}:${credentials.password}".toByteArray(Charsets.UTF_8),
-            Base64.NO_WRAP,
-        )
-        requestBuilder.javaClass.getDeclaredMethod("header", String::class.java, String::class.java)
-            .apply { isAccessible = true }
-            .invoke(requestBuilder, "Authorization", "Basic $token")
-        headers.forEach { (name, value) ->
-            requestBuilder.javaClass.getDeclaredMethod("header", String::class.java, String::class.java)
-                .apply { isAccessible = true }
-                .invoke(requestBuilder, name, value)
-        }
-
-        val requestBody = requestBodyOverride ?: body?.let { newOkHttpRequestBody(it) }
-        requestBuilder.javaClass.getDeclaredMethod("method", String::class.java, cls(OKHTTP_REQUEST_BODY_CLASS))
-            .apply { isAccessible = true }
-            .invoke(requestBuilder, method, requestBody)
-        val request = requestBuilder.javaClass.getDeclaredMethod("build")
-            .apply { isAccessible = true }
-            .invoke(requestBuilder)
-
-        val client = okHttpClient()
-        val call = client.javaClass.getDeclaredMethod("newCall", cls(OKHTTP_REQUEST_CLASS))
-            .apply { isAccessible = true }
-            .invoke(client, request)
-        val response = withWebDavCleartextAllowed {
-            call.javaClass.getDeclaredMethod("execute")
-                .apply { isAccessible = true }
-                .invoke(call)
-        }
-        try {
-            val code = response.javaClass.getDeclaredMethod("code")
-                .apply { isAccessible = true }
-                .invoke(response) as Int
-            val bodyObj = response.javaClass.getDeclaredMethod("body")
-                .apply { isAccessible = true }
-                .invoke(response)
-            val bodyString = if (outputFile == null) {
-                bodyObj?.javaClass?.methods?.firstOrNull { it.name == "string" && it.parameterTypes.isEmpty() }
-                    ?.apply { isAccessible = true }
-                    ?.invoke(bodyObj)
-                    ?.toString()
-            } else {
-                if (code in 200..299) {
-                    val input = bodyObj?.javaClass?.methods?.firstOrNull { it.name == "byteStream" && it.parameterTypes.isEmpty() }
-                        ?.apply { isAccessible = true }
-                        ?.invoke(bodyObj) as? java.io.InputStream
-                        ?: error("WebDAV $method response has no body")
-                    val totalBytes = bodyObj.javaClass.methods.firstOrNull {
-                        it.name == "contentLength" && it.parameterTypes.isEmpty()
-                    }?.apply { isAccessible = true }?.invoke(bodyObj) as? Long ?: -1L
-                    input.use { source ->
-                        outputFile.outputStream().use { sink ->
-                            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                            var copied = 0L
-                            while (true) {
-                                val read = source.read(buffer)
-                                if (read <= 0) break
-                                sink.write(buffer, 0, read)
-                                copied += read
-                                if (totalBytes > 0L) {
-                                    onProgress?.invoke(((copied * 100L) / totalBytes).toInt().coerceIn(0, 100))
-                                }
-                            }
-                            onProgress?.invoke(100)
-                        }
-                    }
-                }
-                null
-            }
-            logWebDav("$method response path=${normalizeWebDavPath(path)} code=$code")
-            return WebDavHttpResponse(code, bodyString)
-        } finally {
-            runCatching {
-                response.javaClass.getDeclaredMethod("close")
-                    .apply { isAccessible = true }
-                    .invoke(response)
-            }
-        }
-    }
-
-    private fun executeRawOkHttpRequest(
-        url: String,
-        method: String,
-        headers: Map<String, String> = emptyMap(),
-        requestBodyOverride: Any? = null,
-    ): WebDavHttpResponse {
-        val requestBuilder = cls(OKHTTP_REQUEST_BUILDER_CLASS).getDeclaredConstructor()
-            .apply { isAccessible = true }
-            .newInstance()
-        requestBuilder.javaClass.getDeclaredMethod("url", String::class.java)
-            .apply { isAccessible = true }
-            .invoke(requestBuilder, url)
-        headers.forEach { (name, value) ->
-            requestBuilder.javaClass.getDeclaredMethod("header", String::class.java, String::class.java)
-                .apply { isAccessible = true }
-                .invoke(requestBuilder, name, value)
-        }
-        requestBuilder.javaClass.getDeclaredMethod("method", String::class.java, cls(OKHTTP_REQUEST_BODY_CLASS))
-            .apply { isAccessible = true }
-            .invoke(requestBuilder, method, requestBodyOverride)
-        val request = requestBuilder.javaClass.getDeclaredMethod("build")
-            .apply { isAccessible = true }
-            .invoke(requestBuilder)
-        val call = okHttpClient().javaClass.getDeclaredMethod("newCall", cls(OKHTTP_REQUEST_CLASS))
-            .apply { isAccessible = true }
-            .invoke(okHttpClient(), request)
-        val response = withWebDavCleartextAllowed {
-            call.javaClass.getDeclaredMethod("execute")
-                .apply { isAccessible = true }
-                .invoke(call)
-        }
-        try {
-            val code = response.javaClass.getDeclaredMethod("code")
-                .apply { isAccessible = true }
-                .invoke(response) as Int
-            val bodyObj = response.javaClass.getDeclaredMethod("body")
-                .apply { isAccessible = true }
-                .invoke(response)
-            val bodyString = bodyObj?.javaClass?.methods?.firstOrNull {
-                it.name == "string" && it.parameterTypes.isEmpty()
-            }?.apply { isAccessible = true }?.invoke(bodyObj)?.toString()
-            return WebDavHttpResponse(code, bodyString)
-        } finally {
-            runCatching {
-                response.javaClass.getDeclaredMethod("close")
-                    .apply { isAccessible = true }
-                    .invoke(response)
-            }
-        }
-    }
-
-    private fun okHttpClient(): Any =
-        webDavHttpClient ?: synchronized(this) {
-            webDavHttpClient ?: cls(OKHTTP_CLIENT_CLASS).getDeclaredConstructor()
-                .apply { isAccessible = true }
-                .newInstance()
-                .also { webDavHttpClient = it }
-        }
-
-    private fun newOkHttpRequestBody(content: String): Any =
-        cls(OKHTTP_REQUEST_BODY_CLASS).getDeclaredMethod(
-            "create",
-            String::class.java,
-            cls(OKHTTP_MEDIA_TYPE_CLASS),
-        ).apply { isAccessible = true }.invoke(null, content, null)
-
-    private fun newOkHttpStringRequestBody(content: String, mimeType: String): Any {
-        val mediaType = cls(OKHTTP_MEDIA_TYPE_CLASS).getDeclaredMethod("get", String::class.java)
-            .apply { isAccessible = true }
-            .invoke(null, mimeType)
-        val requestBodyClass = cls(OKHTTP_REQUEST_BODY_CLASS)
-        return requestBodyClass.declaredMethods.firstOrNull {
-            it.name == "create" &&
-                it.parameterTypes.size == 2 &&
-                it.parameterTypes[0] == String::class.java
-        }?.apply { isAccessible = true }?.invoke(null, content, mediaType)
-            ?: requestBodyClass.declaredMethods.first {
-                it.name == "create" &&
-                    it.parameterTypes.size == 2 &&
-                    it.parameterTypes[1] == String::class.java
-            }.apply { isAccessible = true }.invoke(null, mediaType, content)
-    }
-
-    private fun newOkHttpFileRequestBody(file: File, mimeType: String): Any {
-        val mediaType = cls(OKHTTP_MEDIA_TYPE_CLASS).getDeclaredMethod("get", String::class.java)
-            .apply { isAccessible = true }
-            .invoke(null, mimeType)
-        val requestBodyClass = cls(OKHTTP_REQUEST_BODY_CLASS)
-        return requestBodyClass.declaredMethods.firstOrNull {
-            it.name == "create" &&
-                it.parameterTypes.size == 2 &&
-                it.parameterTypes[0] == File::class.java
-        }?.apply { isAccessible = true }?.invoke(null, file, mediaType)
-            ?: requestBodyClass.declaredMethods.first {
-                it.name == "create" &&
-                    it.parameterTypes.size == 2 &&
-                    it.parameterTypes[1] == File::class.java
-            }.apply { isAccessible = true }.invoke(null, mediaType, file)
     }
 
     private inline fun <T> withWebDavCleartextAllowed(block: () -> T): T {
@@ -10394,74 +10001,15 @@ img{max-width:100%;max-height:100%;height:auto;}
         }
     }
 
-    private fun buildWebDavUrl(baseUrl: String, path: String, directory: Boolean = false): URL {
-        val base = URI(baseUrl.trimEnd('/') + "/")
-        val segments = normalizeWebDavPath(path).trim('/').split('/').filter { it.isNotBlank() }
-        val encodedPath = segments.joinToString("/") {
-            URLEncoder.encode(it, "UTF-8").replace("+", "%20")
-        }
-        val suffix = if (directory && encodedPath.isNotBlank()) "/" else ""
-        return base.resolve(encodedPath + suffix).toURL()
-    }
-
-    private fun pathFromHref(baseUrl: String, href: String): String {
-        val basePath = runCatching { URI(baseUrl).rawPath.orEmpty() }.getOrDefault("")
-        val rawPath = runCatching { URI(href).rawPath }.getOrNull()
-            ?: runCatching { URL(href).path }.getOrNull()
-            ?: href
-        val decodedBase = URLDecoder.decode(basePath, "UTF-8").trimEnd('/')
-        val decodedPath = URLDecoder.decode(rawPath, "UTF-8")
-        val relative = if (decodedBase.isNotBlank() && decodedPath.startsWith(decodedBase)) {
-            decodedPath.removePrefix(decodedBase)
-        } else {
-            decodedPath
-        }
-        return relative.ifBlank { "/" }
-    }
-
     private fun parentWebDavPath(path: String): String {
         val normalized = normalizeWebDavPath(path)
         return normalized.substringBeforeLast('/', "").ifBlank { "/" }
-    }
-
-    private fun alistAbsoluteToWebDavPath(path: String, rootPath: String): String? {
-        val normalizedPath = normalizeWebDavPath(path)
-        val normalizedRoot = normalizeWebDavPath(rootPath)
-        if (normalizedRoot == "/") return normalizedPath
-        return when {
-            normalizedPath == normalizedRoot -> "/"
-            normalizedPath.startsWith(normalizedRoot.trimEnd('/') + "/") ->
-                normalizeWebDavPath(normalizedPath.removePrefix(normalizedRoot))
-            else -> null
-        }
     }
 
     private fun normalizeWebDavPath(path: String): String {
         val trimmed = path.trim()
         if (trimmed.isBlank() || trimmed == "root") return "/"
         return "/" + trimmed.trim('/').replace(Regex("/{2,}"), "/")
-    }
-
-    private fun parseWebDavDate(value: String): Long =
-        runCatching {
-            SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss zzz", Locale.US).apply {
-                timeZone = TimeZone.getTimeZone("GMT")
-            }.parse(value)?.time ?: 0L
-        }.getOrDefault(0L)
-
-    private fun parseAlistDate(value: String): Long {
-        val text = value.trim()
-        if (text.isBlank()) return 0L
-        return runCatching { java.time.Instant.parse(text).toEpochMilli() }
-            .getOrElse {
-                runCatching {
-                    SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSXXX", Locale.US).parse(text)?.time ?: 0L
-                }.getOrElse {
-                    runCatching {
-                        SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", Locale.US).parse(text)?.time ?: 0L
-                    }.getOrDefault(0L)
-                }
-            }
     }
 
     private fun Element.textOf(localName: String): String {
@@ -11681,22 +11229,6 @@ img{max-width:100%;max-height:100%;height:auto;}
         val backup: Any,
     )
 
-    private data class WebDavCredentials(
-        val url: String,
-        val username: String,
-        val password: String,
-    )
-
-    private data class AlistApiEndpoint(
-        val apiBase: String,
-        val rootPath: String,
-    )
-
-    private data class AlistTokenCache(
-        val token: String,
-        val expiresAtMs: Long,
-    )
-
     private data class WebDavEntry(
         val name: String,
         val path: String,
@@ -11737,11 +11269,6 @@ img{max-width:100%;max-height:100%;height:auto;}
         val extensionLabel: String,
         var textIndex: Int = 0,
         var extensionSuppressed: Boolean = false,
-    )
-
-    private data class WebDavHttpResponse(
-        val code: Int,
-        val bodyString: String?,
     )
 
     private data class WebDavImportSource(
@@ -11791,11 +11318,6 @@ img{max-width:100%;max-height:100%;height:auto;}
         var files: Int = 0,
         var bytes: Long = 0L,
     )
-
-    private class WebDavHttpException(
-        val code: Int,
-        message: String,
-    ) : IllegalStateException(message)
 
     private class CloudDownloadCancelledException : CancellationException("download cancelled")
     private class OnlineCompletionDownloadCancelledException : CancellationException("online completion download cancelled")
