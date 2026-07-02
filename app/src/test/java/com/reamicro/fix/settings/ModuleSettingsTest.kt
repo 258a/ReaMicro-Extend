@@ -16,6 +16,17 @@ class ModuleSettingsTest {
     }
 
     @Test
+    fun legacyParentSwitchDefaultsStayEnabled() {
+        assertTrue(ModuleSettings.DEFAULT_ASSOCIATION_ENABLED)
+        assertTrue(ModuleSettings.DEFAULT_READER_ENABLED)
+        assertTrue(ModuleSettings.DEFAULT_FONT_ENABLED)
+        assertTrue(ModuleSettings.DEFAULT_ACCOUNT_ENABLED)
+        assertTrue(ModuleSettings.DEFAULT_EDIT_ENABLED)
+        assertTrue(ModuleSettings.DEFAULT_CLOUD_ENABLED)
+        assertTrue(ModuleSettings.DEFAULT_ROTATION_ENABLED)
+    }
+
+    @Test
     fun sourceFileGroupsRunWhenTheirPreferenceIsEnabled() {
         val sourceFileGroups = listOf(
             SearchSourceGroup(
@@ -143,5 +154,17 @@ class ModuleSettingsTest {
         )
 
         assertTrue(snapshot.canUseAssociationCoverFix)
+    }
+
+    @Test
+    fun legacyAccountParentSwitchNoLongerBlocksChildSwitches() {
+        val snapshot = ModuleSettingsSnapshot(
+            accountEnabled = false,
+            accountExportEnabled = true,
+            accountCacheCleanupEnabled = true,
+        )
+
+        assertTrue(snapshot.canRunAccountDataExport)
+        assertTrue(snapshot.canRunStartupCacheCleanup)
     }
 }

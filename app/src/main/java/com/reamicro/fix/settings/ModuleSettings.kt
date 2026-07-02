@@ -38,30 +38,30 @@ object ModuleSettings {
     private const val KEY_ASSOCIATION_SOURCE_PREFIX = "association_source_"
     private const val KEY_ONLINE_SOURCE_PREFIX = "online_source_"
     const val DEFAULT_MODULE_ENABLED = true
-    const val DEFAULT_ASSOCIATION_ENABLED = false
+    const val DEFAULT_ASSOCIATION_ENABLED = true
     const val DEFAULT_ASSOCIATION_MANUAL_EDIT_ENABLED = false
     const val DEFAULT_ASSOCIATION_UNLINK_ENABLED = false
     const val DEFAULT_ASSOCIATION_COVER_FIX_ENABLED = false
-    const val DEFAULT_READER_ENABLED = false
+    const val DEFAULT_READER_ENABLED = true
     const val DEFAULT_READER_LONG_PRESS_ENABLED = false
     const val DEFAULT_READER_AUTO_PAGE_ENABLED = false
     const val DEFAULT_READER_KEEP_SCREEN_ON_ENABLED = true
     const val DEFAULT_READER_OVERWRITE_CHECK_ENABLED = false
     const val DEFAULT_READER_EDIT_OVERWRITE_ENABLED = false
     const val DEFAULT_READER_DICTIONARY_ENABLED = true
-    const val DEFAULT_FONT_ENABLED = false
+    const val DEFAULT_FONT_ENABLED = true
     const val DEFAULT_FONT_SETTINGS_ENABLED = false
-    const val DEFAULT_ACCOUNT_ENABLED = false
+    const val DEFAULT_ACCOUNT_ENABLED = true
     const val DEFAULT_ACCOUNT_EXPORT_ENABLED = false
     const val DEFAULT_ACCOUNT_CACHE_CLEANUP_ENABLED = false
-    const val DEFAULT_EDIT_ENABLED = false
+    const val DEFAULT_EDIT_ENABLED = true
     const val DEFAULT_EDIT_FILE_ENABLED = false
     const val DEFAULT_CLOUD_ENABLED = true
     const val DEFAULT_CLOUD_WEBDAV_ENABLED = true
     const val DEFAULT_CLOUD_LOCAL_LIBRARY_ENABLED = true
     const val DEFAULT_CLOUD_EXTENDED_DISPLAY_ENABLED = false
     const val DEFAULT_CLOUD_DOWNLOAD_CANCEL_ENABLED = false
-    const val DEFAULT_ROTATION_ENABLED = false
+    const val DEFAULT_ROTATION_ENABLED = true
     const val DEFAULT_ROTATION_AUTO_ENABLED = false
     const val DEFAULT_ROTATION_PORTRAIT_LOCK_ENABLED = false
     const val DEFAULT_ROTATION_LANDSCAPE_LOCK_ENABLED = false
@@ -183,7 +183,7 @@ data class ModuleSettingsSnapshot(
         get() = moduleEnabled
 
     val canRunAccountCompletion: Boolean
-        get() = moduleEnabled && accountEnabled
+        get() = moduleEnabled
 
     val canRunAccountDataExport: Boolean
         get() = canRunAccountCompletion && accountExportEnabled

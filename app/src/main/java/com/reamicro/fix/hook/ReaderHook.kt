@@ -114,7 +114,7 @@ class ReaderHook(
 
     private fun canRunFullTextSearch(): Boolean {
         val snapshot = settingsProvider()
-        return snapshot.moduleEnabled && snapshot.readerEnabled
+        return snapshot.moduleEnabled
     }
 
     private fun canShowReaderSearchEntry(): Boolean =

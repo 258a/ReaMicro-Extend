@@ -220,6 +220,7 @@ class XposedModuleSettings(
     }
 
     private fun readSnapshot(prefs: SharedPreferences): ModuleSettingsSnapshot {
+        migrateLegacyParentSwitches(prefs)
         migrateHiddenWanFengLiSource(prefs)
         val rotation = ModuleSettings.normalizeRotationSelection(
             autoEnabled = prefs.getBoolean(
@@ -399,6 +400,17 @@ class XposedModuleSettings(
         }
     }
 
+    private fun migrateLegacyParentSwitches(prefs: SharedPreferences) {
+        val disabledKeys = LEGACY_PARENT_SWITCH_KEYS.filter { key ->
+            !prefs.getBoolean(key, true)
+        }
+        if (disabledKeys.isEmpty()) return
+        val editor = prefs.edit()
+        disabledKeys.forEach { key -> editor.putBoolean(key, true) }
+        editor.commit()
+        XposedBridge.log("ReaMicro LSP legacy parent switches forced on: ${disabledKeys.joinToString()}")
+    }
+
     private fun logSnapshot(snapshot: ModuleSettingsSnapshot) {
         val key = listOf(
             snapshot.moduleEnabled,
@@ -470,5 +482,14 @@ class XposedModuleSettings(
     private companion object {
         const val CACHE_WINDOW_MS = 200L
         const val ASSOCIATION_SOURCE_KEY_PREFIX = "association_source_"
+        val LEGACY_PARENT_SWITCH_KEYS = listOf(
+            ModuleSettings.KEY_ASSOCIATION_ENABLED,
+            ModuleSettings.KEY_READER_ENABLED,
+            ModuleSettings.KEY_FONT_ENABLED,
+            ModuleSettings.KEY_ACCOUNT_ENABLED,
+            ModuleSettings.KEY_EDIT_ENABLED,
+            ModuleSettings.KEY_CLOUD_ENABLED,
+            ModuleSettings.KEY_ROTATION_ENABLED,
+        )
     }
 }

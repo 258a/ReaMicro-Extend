@@ -1125,6 +1125,24 @@ class ReaMicroSettingsHook(
                         checked
                     },
                 ),
+                ToggleRow(
+                    key = ModuleSettings.KEY_ACCOUNT_EXPORT_ENABLED,
+                    title = "\u5bfc\u51fa\u8865\u5168",
+                    checked = snapshot.accountExportEnabled,
+                    onChanged = { checked, _ ->
+                        settings.setAccountExportEnabled(checked)
+                        checked
+                    },
+                ),
+                ToggleRow(
+                    key = ModuleSettings.KEY_ACCOUNT_CACHE_CLEANUP_ENABLED,
+                    title = "\u7f13\u5b58\u6e05\u7406",
+                    checked = snapshot.accountCacheCleanupEnabled,
+                    onChanged = { checked, _ ->
+                        settings.setAccountCacheCleanupEnabled(checked)
+                        checked
+                    },
+                ),
             )
             addLazyItem(lazyListScope, CLOUD_SWITCHES_ITEM_KEY) { itemComposer ->
                 renderHostSettingsCard(rows, itemComposer)
@@ -1212,44 +1230,6 @@ class ReaMicroSettingsHook(
             accountListVersionValue()
             val accounts = accountController.displayAccounts()
             val expandedState = accountSwitchExpandedState(accounts.isNotEmpty())
-            val snapshot = settings.snapshot()
-            val accountCompletionExpandedState = accountExpandedState(snapshot.accountEnabled)
-            val accountRows = listOf(
-                ToggleRow(
-                    key = ModuleSettings.KEY_ACCOUNT_ENABLED,
-                    title = "\u8d26\u53f7\u8865\u5168",
-                    checked = snapshot.accountEnabled,
-                    checkedProvider = { booleanStateValue(accountCompletionExpandedState) },
-                    onChanged = { checked, _ ->
-                        settings.setAccountEnabled(checked)
-                        setBooleanState(accountCompletionExpandedState, checked)
-                        checked
-                    },
-                ),
-                ToggleRow(
-                    key = ModuleSettings.KEY_ACCOUNT_EXPORT_ENABLED,
-                    title = "\u5bfc\u51fa\u8865\u5168",
-                    checked = snapshot.accountExportEnabled,
-                    visibleProvider = { booleanStateValue(accountCompletionExpandedState) },
-                    onChanged = { checked, _ ->
-                        settings.setAccountExportEnabled(checked)
-                        checked
-                    },
-                ),
-                ToggleRow(
-                    key = ModuleSettings.KEY_ACCOUNT_CACHE_CLEANUP_ENABLED,
-                    title = "\u7f13\u5b58\u6e05\u7406",
-                    checked = snapshot.accountCacheCleanupEnabled,
-                    visibleProvider = { booleanStateValue(accountCompletionExpandedState) },
-                    onChanged = { checked, _ ->
-                        settings.setAccountCacheCleanupEnabled(checked)
-                        checked
-                    },
-                ),
-            )
-            addLazyItem(lazyListScope, ACCOUNT_COMPLETION_SWITCHES_ITEM_KEY) { itemComposer ->
-                renderHostSettingsCard(accountRows, itemComposer)
-            }
             addLazyItem(lazyListScope, ACCOUNT_EXPORT_ACTION_ITEM_KEY) { itemComposer ->
                 renderHostActionCard(
                     listOf(
