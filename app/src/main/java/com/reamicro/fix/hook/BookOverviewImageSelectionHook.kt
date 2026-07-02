@@ -22,14 +22,11 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.Window
 import android.view.WindowManager
-import android.widget.AdapterView
-import android.widget.ArrayAdapter
 import android.widget.EditText
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
-import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import com.reamicro.fix.ai.AiApiConfig
@@ -271,12 +268,11 @@ class BookOverviewImageSelectionHook(
             val config = AiApiStore.imageApi(appContext)
             val settings = AiApiStore.imageSettings(appContext)
             val presetTarget = target.aiTarget
-            val presets = AiApiStore.imagePresets(appContext, presetTarget)
             val selectedPresetId = when (target) {
                 ImageTarget.Cover -> settings.coverPresetId
                 ImageTarget.Banner -> settings.bannerPresetId
             }
-            val selectedIndex = presets.indexOfFirst { it.id == selectedPresetId }.takeIf { it >= 0 } ?: 0
+            val preset = AiApiStore.imagePreset(appContext, presetTarget, selectedPresetId)
             val colors = DialogColors(activity)
             val dialog = Dialog(activity)
             val card = dialogCard(activity, colors)
@@ -284,29 +280,11 @@ class BookOverviewImageSelectionHook(
 
             card.addView(dialogTitle(activity, "生成${target.label}"))
             card.addView(dialogMessage(activity, "当前模型：${config?.displayName ?: "未配置"}", colors))
-
-            val reference = editText(activity, "参考图片链接", singleLine = false).apply {
-                minLines = 2
-                setText(defaultReferenceUrl(context.book))
-                inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
-            }
-            card.addView(reference)
-
-            val presetLabel = fieldLabel(activity, "提示预设", colors)
-            card.addView(presetLabel)
-            val spinner = Spinner(activity).apply {
-                adapter = ArrayAdapter(
-                    activity,
-                    android.R.layout.simple_spinner_dropdown_item,
-                    presets.map { it.name },
-                )
-                setSelection(selectedIndex)
-            }
-            card.addView(spinner, fieldParams(activity))
+            card.addView(dialogMessage(activity, "参考图片：生成时自动读取当前封面并上传", colors))
 
             val prompt = editText(activity, "提示词内容", singleLine = false).apply {
                 minLines = 4
-                setText(presets.getOrNull(selectedIndex)?.prompt.orEmpty())
+                setText(preset.prompt)
                 gravity = Gravity.TOP or Gravity.START
             }
             card.addView(prompt)
@@ -325,15 +303,6 @@ class BookOverviewImageSelectionHook(
             }
             card.addView(progress, centeredWrapParams(activity))
             card.addView(status)
-
-            spinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-                override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
-                    val selected = presets.getOrNull(position) ?: return
-                    if (!prompt.hasFocus()) prompt.setText(selected.prompt)
-                }
-
-                override fun onNothingSelected(parent: AdapterView<*>?) = Unit
-            }
 
             val buttons = horizontalActions(activity)
             val generate = compactButton(activity, "生图", colors)
@@ -367,7 +336,7 @@ class BookOverviewImageSelectionHook(
                         generateImage(
                             config = api,
                             prompt = renderImagePrompt(template, context.book),
-                            referenceUrl = reference.text?.toString().orEmpty().trim(),
+                            referenceDataUrl = loadReferenceImageDataUrl(context.book),
                             requestedSize = size.text?.toString().orEmpty().trim(),
                             target = target,
                         )
@@ -456,29 +425,60 @@ class BookOverviewImageSelectionHook(
     private fun generateImage(
         config: AiApiConfig,
         prompt: String,
-        referenceUrl: String,
+        referenceDataUrl: String?,
         requestedSize: String,
         target: ImageTarget,
     ): ByteArray {
-        val finalPrompt = if (referenceUrl.isNotBlank()) {
-            "$prompt\n\n参考图片：$referenceUrl"
-        } else {
-            prompt
-        }
         val sizes = imageSizeCandidates(requestedSize, target)
         var lastError: Throwable? = null
         for (size in sizes) {
-            val body = JSONObject()
-                .put("model", config.model)
-                .put("prompt", finalPrompt)
-                .put("n", 1)
-            if (size.isNotBlank()) body.put("size", size)
-            val bytes = runCatching {
-                requestImageGeneration(config, body)
-            }.onFailure { lastError = it }.getOrNull()
-            if (bytes != null) return bytes
+            imageRequestBodies(config.model, prompt, size, referenceDataUrl).forEach { body ->
+                val bytes = runCatching {
+                    requestImageGeneration(config, body)
+                }.onFailure { lastError = it }.getOrNull()
+                if (bytes != null) return bytes
+            }
         }
         throw lastError ?: IllegalStateException("未获取到生图结果")
+    }
+
+    private fun imageRequestBodies(
+        model: String,
+        prompt: String,
+        size: String,
+        referenceDataUrl: String?,
+    ): List<JSONObject> {
+        val normalizedSize = normalizeImageSize(size)
+        fun base(): JSONObject =
+            JSONObject()
+                .put("model", model)
+                .put("prompt", prompt)
+                .put("n", 1)
+                .also { body ->
+                    if (normalizedSize.isNotBlank()) body.put("size", normalizedSize)
+                }
+
+        val bodies = mutableListOf<JSONObject>()
+        if (!referenceDataUrl.isNullOrBlank()) {
+            bodies += base()
+                .put("image", JSONArray().put(referenceDataUrl))
+                .put("response_format", "b64_json")
+            bodies += base()
+                .put("image", referenceDataUrl)
+                .put("response_format", "b64_json")
+            bodies += base()
+                .put("image_urls", JSONArray().put(referenceDataUrl))
+                .put("response_format", "b64_json")
+            bodies += base()
+                .put("image", JSONArray().put(referenceDataUrl))
+            bodies += base()
+                .put("image", referenceDataUrl)
+            bodies += base()
+                .put("image_urls", JSONArray().put(referenceDataUrl))
+        }
+        bodies += base().put("response_format", "b64_json")
+        bodies += base()
+        return bodies.distinctBy { it.toString() }
     }
 
     private fun requestImageGeneration(config: AiApiConfig, body: JSONObject): ByteArray {
@@ -612,6 +612,14 @@ class BookOverviewImageSelectionHook(
         return listOf(normalized, fallback, "").distinct()
     }
 
+    private fun normalizeImageSize(value: String): String =
+        when (val normalized = value.trim()) {
+            "1k", "1K" -> "1K"
+            "2k", "2K" -> "2K"
+            "4k", "4K" -> "4K"
+            else -> normalized
+        }
+
     private fun imageGenerationUrl(baseUrl: String): String {
         val base = baseUrl.trim().trimEnd('/')
         return when {
@@ -725,6 +733,54 @@ class BookOverviewImageSelectionHook(
         return output.toByteArray()
     }
 
+    private fun loadReferenceImageDataUrl(book: Any): String? =
+        loadReferenceImageBytes(book)?.let { bytes ->
+            val mime = imageExtensionAndMime(bytes).second
+            "data:$mime;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
+        }
+
+    private fun loadReferenceImageBytes(book: Any): ByteArray? {
+        val activity = activityProvider() ?: return null
+        val cover = callString(book, "getCover").trim()
+        val direct = when {
+            cover.startsWith("data:image/", ignoreCase = true) ->
+                runCatching { decodeDataUrl(cover)?.also(::validateImageBytes) }.getOrNull()
+            isRemoteUrl(cover) ->
+                runCatching { downloadImageBytes(cover) }.getOrNull()
+            cover.startsWith("content://", ignoreCase = true) ->
+                runCatching { readImageUri(activity, Uri.parse(cover)) }.getOrNull()
+            else -> null
+        }
+        if (direct != null) return direct
+
+        val bookDir = resolveBookDir(activity, book) ?: return null
+        val relatives = listOf(
+            safeRelativePath(cover),
+            DEFAULT_COVER_FILE,
+        ).filter { it.isNotBlank() }.distinct()
+        relatives.forEach { relative ->
+            runCatching { readImageFile(childFile(bookDir, relative)) }
+                .getOrNull()
+                ?.let { return it }
+        }
+        return null
+    }
+
+    private fun readImageFile(file: File): ByteArray? {
+        if (!file.isFile) return null
+        val bytes = file.inputStream().use { readLimited(it, MAX_IMAGE_BYTES) }
+        validateImageBytes(bytes)
+        return bytes
+    }
+
+    private fun readImageUri(activity: Activity, uri: Uri): ByteArray? {
+        val bytes = activity.contentResolver.openInputStream(uri)
+            ?.use { readLimited(it, MAX_IMAGE_BYTES) }
+            ?: return null
+        validateImageBytes(bytes)
+        return bytes
+    }
+
     private fun coverRelativeForWrite(book: Any): String {
         val current = safeRelativePath(callString(book, "getCover"))
         return current.ifBlank { DEFAULT_COVER_FILE }
@@ -793,9 +849,6 @@ class BookOverviewImageSelectionHook(
             else -> null
         }
     }
-
-    private fun defaultReferenceUrl(book: Any): String =
-        callString(book, "getCover").trim().takeIf(::isRemoteUrl).orEmpty()
 
     private fun extractApiError(text: String): String =
         runCatching {
@@ -951,7 +1004,7 @@ class BookOverviewImageSelectionHook(
 private fun dialogCard(context: Context, colors: BookOverviewImageSelectionHook.DialogColors): LinearLayout =
     LinearLayout(context).apply {
         orientation = LinearLayout.VERTICAL
-        setPadding(dp(context, 18), dp(context, 18), dp(context, 18), dp(context, 10))
+        setPadding(dp(context, 18), dp(context, 18), dp(context, 18), dp(context, 18))
         background = GradientDrawable().apply {
             setColor(colors.card)
             cornerRadius = dp(context, 22).toFloat()
@@ -987,7 +1040,7 @@ private fun dialogMessage(
         layoutParams = LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { bottomMargin = dp(context, 12) }
+        ).apply { bottomMargin = dp(context, 8) }
     }
 
 private fun actionRow(
@@ -1055,7 +1108,17 @@ private fun previewImageView(context: Context, target: BookOverviewImageSelectio
         visibility = View.GONE
         adjustViewBounds = true
         scaleType = ImageView.ScaleType.FIT_CENTER
-        background = rounded(Color.rgb(24, 28, 34), Color.TRANSPARENT, dp(context, 12))
+        background = rounded(
+            if ((context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+                Configuration.UI_MODE_NIGHT_YES
+            ) {
+                Color.rgb(38, 43, 50)
+            } else {
+                Color.rgb(246, 248, 251)
+            },
+            themeColor(context, android.R.attr.divider, Color.rgb(224, 228, 235)),
+            dp(context, 12),
+        )
         val height = if (target.name == "Banner") dp(context, 180) else dp(context, 260)
         layoutParams = LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
@@ -1115,10 +1178,15 @@ private fun showDialog(dialog: Dialog, content: View, activity: Activity, widthR
         window.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
     }
     dialog.show()
-    dialog.window?.setLayout(
-        (activity.resources.displayMetrics.widthPixels * widthRatio).toInt(),
-        ViewGroup.LayoutParams.WRAP_CONTENT,
-    )
+    dialog.window?.let { window ->
+        window.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+        window.setDimAmount(0.46f)
+        window.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+        window.setLayout(
+            (activity.resources.displayMetrics.widthPixels * widthRatio).toInt(),
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        )
+    }
 }
 
 private fun scroll(card: LinearLayout, context: Context): ScrollView =
