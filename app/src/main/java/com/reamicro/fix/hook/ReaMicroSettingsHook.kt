@@ -2364,7 +2364,7 @@ class ReaMicroSettingsHook(
                             ActionRow(
                                 key = "dictionary_api_${config.id}",
                                 title = config.displayName.compactOnlineSourceLine(),
-                                subtitle = config.baseUrl,
+                                subtitle = aiApiSubtitle(config),
                                 trailing = if (dictionarySettings.apiId == config.id) "\u5f53\u524d" else null,
                                 onClick = {
                                     AiApiStore.setDictionaryApiId(context, config.id)
@@ -2405,6 +2405,7 @@ class ReaMicroSettingsHook(
                             key = "dictionary_preset_${preset.id}",
                             title = preset.name.compactOnlineSourceLine(),
                             subtitle = presetPromptPreview(preset.prompt),
+                            singleLineSubtitle = true,
                             trailing = if (dictionarySettings.presetId == preset.id) "\u5f53\u524d" else null,
                             onClick = {
                                 AiApiStore.setDictionaryPresetId(context, preset.id)
@@ -2493,7 +2494,7 @@ class ReaMicroSettingsHook(
                             ActionRow(
                                 key = "image_api_${config.id}",
                                 title = config.displayName.compactOnlineSourceLine(),
-                                subtitle = config.baseUrl,
+                                subtitle = aiApiSubtitle(config),
                                 trailing = if (imageSettings.apiId == config.id) "\u5f53\u524d" else null,
                                 onClick = {
                                     AiApiStore.setImageApiId(context, config.id)
@@ -2535,6 +2536,7 @@ class ReaMicroSettingsHook(
                             key = "image_${target.id}_preset_${preset.id}",
                             title = preset.name.compactOnlineSourceLine(),
                             subtitle = presetPromptPreview(preset.prompt),
+                            singleLineSubtitle = true,
                             trailing = if (selectedPresetId == preset.id) "\u5f53\u524d" else null,
                             onClick = {
                                 AiApiStore.setImagePresetId(context, target, preset.id)
@@ -4388,7 +4390,7 @@ class ReaMicroSettingsHook(
         val supporting = row.subtitle?.takeIf { it.isNotBlank() }?.let { subtitle ->
             composableLambda(row.key.hashCode() xor ACTION_SUPPORTING_KEY_MASK, FUNCTION2_CLASS) { args ->
                 val innerComposer = args?.getOrNull(0) ?: return@composableLambda targetUnit()
-                renderHostSupportingText(subtitle, innerComposer)
+                renderHostSupportingText(subtitle, innerComposer, row.singleLineSubtitle)
                 targetUnit()
             }
         }
@@ -4500,7 +4502,7 @@ class ReaMicroSettingsHook(
         )
     }
 
-    private fun renderHostSupportingText(text: String, composer: Any) {
+    private fun renderHostSupportingText(text: String, composer: Any, singleLine: Boolean = false) {
         method(TEXT_KT_CLASS, TEXT_METHOD, 22).invoke(
             null,
             text,
@@ -4518,14 +4520,14 @@ class ReaMicroSettingsHook(
             0L,
             0,
             false,
-            0,
-            0,
+            if (singleLine) 1 else 0,
+            if (singleLine) 1 else 0,
             null,
             typography(composer).method0("getBodyMedium"),
             composer,
             0,
             0,
-            TEXT_DEFAULT_MASK,
+            if (singleLine) TEXT_SINGLE_LINE_MASK else TEXT_DEFAULT_MASK,
         )
     }
 
@@ -5249,6 +5251,7 @@ class ReaMicroSettingsHook(
         val trailing: String? = null,
         val trailingContent: ((Any) -> Unit)? = null,
         val titleFontSelection: String? = null,
+        val singleLineSubtitle: Boolean = false,
         val onClick: (() -> Unit)? = null,
         val onLongClick: (() -> Unit)? = null,
     )
@@ -5544,6 +5547,7 @@ class ReaMicroSettingsHook(
         const val ACTION_TRAILING_KEY_MASK = 0x0F0F0F0F
         const val TEXT_DEFAULT_MASK = 131066
         const val TEXT_WITH_FONT_FAMILY_MASK = 130938
+        const val TEXT_SINGLE_LINE_MASK = 73722
         const val PRESET_PROMPT_PREVIEW_MAX_CHARS = 32
         const val FAMILY_SYSTEM = "system"
         const val FAMILY_SOURCE_HAN_SERIF = "serif"
