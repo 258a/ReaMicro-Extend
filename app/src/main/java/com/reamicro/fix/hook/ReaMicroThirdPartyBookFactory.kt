@@ -1,10 +1,48 @@
 package com.reamicro.fix.hook
 
 import com.reamicro.fix.association.model.BookSearchResult
+import com.reamicro.fix.association.model.ManualAssociationCandidate
 
 class ReaMicroThirdPartyBookFactory(
     private val classLoader: ClassLoader,
 ) {
+    fun create(candidate: ManualAssociationCandidate, coverFallback: String = ""): Any {
+        val cover = candidate.coverUrl.ifBlank { coverFallback }
+        val thirdPartyBookClass = classLoader.loadClass(THIRD_PARTY_BOOK_CLASS)
+        val constructor = thirdPartyBookClass.getConstructor(
+            String::class.java,
+            String::class.java,
+            String::class.java,
+            String::class.java,
+            String::class.java,
+            String::class.java,
+            String::class.java,
+            String::class.java,
+            String::class.java,
+            String::class.java,
+            String::class.java,
+            String::class.java,
+            String::class.java,
+            String::class.java,
+        )
+        return constructor.newInstance(
+            candidate.title,
+            candidate.author,
+            candidate.title,
+            "",
+            "",
+            candidate.intro,
+            cover,
+            "",
+            candidate.source.displayName,
+            "",
+            "",
+            "",
+            candidate.words,
+            candidate.status,
+        )
+    }
+
     fun create(result: BookSearchResult): Any {
         val thirdPartyBookClass = classLoader.loadClass(THIRD_PARTY_BOOK_CLASS)
         val constructor = thirdPartyBookClass.getConstructor(
