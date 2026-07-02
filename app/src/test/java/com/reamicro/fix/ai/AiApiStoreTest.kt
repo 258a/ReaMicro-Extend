@@ -1,6 +1,7 @@
 package com.reamicro.fix.ai
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -33,5 +34,29 @@ class AiApiStoreTest {
         val prompt = AiApiStore.renderDictionaryPrompt("\u89e3\u91ca {{text}}", "\u6625\u98ce")
 
         assertEquals("\u89e3\u91ca \u6625\u98ce", prompt)
+    }
+
+    @Test
+    fun dictionaryDisableThinkingAddsScopedReasoningEffort() {
+        val body = AiApiStore.buildDictionaryRequestBody(
+            config = AiApiConfig("api_1", "https://example.com", "key", "model"),
+            systemPrompt = "system",
+            userPrompt = "user",
+            includeReasoningEffort = true,
+        )
+
+        assertEquals("minimal", body.optString("reasoning_effort"))
+    }
+
+    @Test
+    fun dictionaryRequestCanSkipReasoningEffort() {
+        val body = AiApiStore.buildDictionaryRequestBody(
+            config = AiApiConfig("api_1", "https://example.com", "key", "model"),
+            systemPrompt = "system",
+            userPrompt = "user",
+            includeReasoningEffort = false,
+        )
+
+        assertFalse(body.has("reasoning_effort"))
     }
 }

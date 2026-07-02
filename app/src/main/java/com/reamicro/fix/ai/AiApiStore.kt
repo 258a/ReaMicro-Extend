@@ -5,6 +5,7 @@ import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
+import java.util.Collections
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -44,6 +45,7 @@ object AiApiStore {
     private const val READ_TIMEOUT_MS = 25_000
     private const val DICTIONARY_MAX_TOKENS = 300
     const val DEFAULT_DICTIONARY_PRESET_ID = "dictionary_short"
+    private val reasoningEffortUnsupportedApis = Collections.synchronizedSet(mutableSetOf<String>())
 
     val BUILTIN_DICTIONARY_PRESETS = listOf(
         AiDictionaryPreset(
@@ -329,6 +331,39 @@ object AiApiStore {
         } else {
             "\u4f60\u662f\u8bcd\u5178\u52a9\u624b\u3002"
         }
+        val includeReasoningEffort = disableThinking && config.id !in reasoningEffortUnsupportedApis
+        val body = buildDictionaryRequestBody(
+            config = config,
+            systemPrompt = systemPrompt,
+            userPrompt = renderDictionaryPrompt(preset.prompt, target),
+            includeReasoningEffort = includeReasoningEffort,
+        )
+        val first = requestChatCompletion(config.baseUrl, config.apiKey, body)
+        val response = if (includeReasoningEffort && first.isUnsupportedReasoningEffortError()) {
+            reasoningEffortUnsupportedApis.add(config.id)
+            requestChatCompletion(config.baseUrl, config.apiKey, JSONObject(body.toString()).apply {
+                remove("reasoning_effort")
+            })
+        } else {
+            first
+        }
+        if (!response.success) return response
+        val content = runCatching { extractAssistantContent(JSONObject(response.message)) }
+            .getOrDefault("")
+            .trim()
+        return if (content.isBlank()) {
+            AiApiTestResult(false, "\u672a\u83b7\u53d6\u5230\u8bcd\u5178\u7ed3\u679c")
+        } else {
+            AiApiTestResult(true, content)
+        }
+    }
+
+    internal fun buildDictionaryRequestBody(
+        config: AiApiConfig,
+        systemPrompt: String,
+        userPrompt: String,
+        includeReasoningEffort: Boolean,
+    ): JSONObject {
         val body = JSONObject()
             .put("model", config.model)
             .put(
@@ -342,22 +377,29 @@ object AiApiStore {
                     .put(
                         JSONObject()
                             .put("role", "user")
-                            .put("content", renderDictionaryPrompt(preset.prompt, target)),
+                            .put("content", userPrompt),
                     ),
             )
             .put("temperature", 0.2)
             .put("max_tokens", DICTIONARY_MAX_TOKENS)
             .put("stream", false)
-        val response = requestChatCompletion(config.baseUrl, config.apiKey, body)
-        if (!response.success) return response
-        val content = runCatching { extractAssistantContent(JSONObject(response.message)) }
-            .getOrDefault("")
-            .trim()
-        return if (content.isBlank()) {
-            AiApiTestResult(false, "\u672a\u83b7\u53d6\u5230\u8bcd\u5178\u7ed3\u679c")
-        } else {
-            AiApiTestResult(true, content)
+        if (includeReasoningEffort) {
+            body.put("reasoning_effort", "minimal")
         }
+        return body
+    }
+
+    private fun AiApiTestResult.isUnsupportedReasoningEffortError(): Boolean {
+        if (success) return false
+        val text = message.lowercase()
+        if (!text.contains("reasoning")) return false
+        return text.contains("reasoning_effort") ||
+            text.contains("unsupported") ||
+            text.contains("not supported") ||
+            text.contains("does not support") ||
+            text.contains("unknown") ||
+            text.contains("unrecognized") ||
+            text.contains("invalid")
     }
 
     fun maskedKey(apiKey: String): String {
