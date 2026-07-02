@@ -62,11 +62,17 @@ import com.reamicro.fix.settings.ModuleSettingsSnapshot
 import com.reamicro.fix.webdav.CacheDeleteStat
 import com.reamicro.fix.webdav.CleartextScope
 import com.reamicro.fix.webdav.CloudDownloadCancelledException
+import com.reamicro.fix.webdav.CloudBookRowExtendedDisplayContext
 import com.reamicro.fix.webdav.CancellableWebDavDownload
+import com.reamicro.fix.webdav.HomeSearchRenderContext
+import com.reamicro.fix.webdav.HomeSearchSection
+import com.reamicro.fix.webdav.ImportLocalLibraryRowContext
+import com.reamicro.fix.webdav.ImportUnauthRenderContext
 import com.reamicro.fix.webdav.NativeCloudDownload
 import com.reamicro.fix.webdav.OnlineCompletionDownloadCancelledException
 import com.reamicro.fix.webdav.OnlineCompletionDownloadTask
 import com.reamicro.fix.webdav.OnlineDownloadedChapter
+import com.reamicro.fix.webdav.SyncAuthCardRenderContext
 import com.reamicro.fix.webdav.WebDavBackupSnapshot
 import com.reamicro.fix.webdav.WebDavCredentials
 import com.reamicro.fix.webdav.WebDavHttpException
@@ -11096,39 +11102,6 @@ img{max-width:100%;max-height:100%;height:auto;}
         field.get(null)
     }.getOrNull()
 
-    private data class SyncAuthCardRenderContext(
-        val bookId: Long? = null,
-        val onSetupDefaultDir: Any? = null,
-        val onPick: Any? = null,
-        var webDavRendered: Boolean = false,
-        var nativeAuthRowsSeen: Int = 0,
-    )
-
-    private data class ImportUnauthRenderContext(
-        val expectedNativeRows: Int,
-        var renderedNativeRows: Int = 0,
-        var webDavRendered: Boolean = false,
-    )
-
-    private data class ImportLocalLibraryRowContext(
-        val navGraphScope: Any?,
-        val coroutineScope: Any?,
-        val sheetState: Any?,
-        val intentReceiver: Any?,
-    )
-
-    private data class HomeSearchRenderContext(
-        val sections: List<HomeSearchSection>,
-        val intentReceiver: Any,
-        var rendered: Boolean = false,
-    )
-
-    private data class HomeSearchSection(
-        val type: Int,
-        val title: String = "",
-        val results: List<*>,
-    )
-
     private data class OnlineHttpResponse(
         val url: String,
         val body: String,
@@ -11258,13 +11231,6 @@ img{max-width:100%;max-height:100%;height:auto;}
         val entries: List<LocalLibraryEntry>,
         val createdAtMs: Long,
         val complete: Boolean,
-    )
-
-    private data class CloudBookRowExtendedDisplayContext(
-        val updatedAt: Long,
-        val extensionLabel: String,
-        var textIndex: Int = 0,
-        var extensionSuppressed: Boolean = false,
     )
 
     private class WebDavBackButton(context: Context) : View(context) {
