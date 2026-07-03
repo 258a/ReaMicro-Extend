@@ -181,6 +181,10 @@ class XposedModuleSettings(
         putBoolean(ModuleSettings.KEY_ROTATION_REVERSE_ENABLED, enabled)
     }
 
+    fun setProfileBackgroundEnabled(enabled: Boolean) {
+        putBoolean(ModuleSettings.KEY_PROFILE_BACKGROUND_ENABLED, enabled)
+    }
+
     fun setAssociationSearchSourceEnabled(groupId: String, enabled: Boolean) {
         putBoolean(ModuleSettings.searchSourceKey(groupId), enabled)
     }
@@ -691,6 +695,10 @@ class XposedModuleSettings(
                 ModuleSettings.KEY_ROTATION_REVERSE_ENABLED,
                 ModuleSettings.DEFAULT_ROTATION_REVERSE_ENABLED,
             ),
+            profileBackgroundEnabled = prefs.getBoolean(
+                ModuleSettings.KEY_PROFILE_BACKGROUND_ENABLED,
+                ModuleSettings.DEFAULT_PROFILE_BACKGROUND_ENABLED,
+            ),
             associationSearchSources = readAssociationSearchSources(prefs),
         )
     }
@@ -1141,6 +1149,7 @@ class XposedModuleSettings(
             snapshot.rotationEnabled,
             snapshot.rotation,
             snapshot.rotationReverseEnabled,
+            snapshot.profileBackgroundEnabled,
             snapshot.associationSearchSources,
         ).joinToString("|")
         if (key == lastLogKey) return
@@ -1178,6 +1187,7 @@ class XposedModuleSettings(
                     "rotationEnabled=${snapshot.rotationEnabled}, " +
                     "rotation=${snapshot.rotation}, " +
                     "rotationReverse=${snapshot.rotationReverseEnabled}, " +
+                    "profileBackground=${snapshot.profileBackgroundEnabled}, " +
                     "sources=${snapshot.associationSearchSources}",
             )
         }

@@ -192,6 +192,24 @@ class ModuleSettingsTest {
     }
 
     @Test
+    fun moduleParentSwitchControlsProfileBackground() {
+        val disabledParent = ModuleSettingsSnapshot(
+            moduleEnabled = false,
+            profileBackgroundEnabled = true,
+        )
+        val enabledParent = disabledParent.copy(moduleEnabled = true)
+
+        assertFalse(disabledParent.canShowProfileBackground)
+        assertTrue(enabledParent.canShowProfileBackground)
+    }
+
+    @Test
+    fun profileBackgroundDefaultsOff() {
+        assertFalse(ModuleSettingsSnapshot().canShowProfileBackground)
+        assertFalse(ModuleSettingsSnapshot().profileBackgroundEnabled)
+    }
+
+    @Test
     fun legacyAccountParentSwitchNoLongerBlocksChildSwitches() {
         val snapshot = ModuleSettingsSnapshot(
             accountEnabled = false,

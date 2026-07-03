@@ -1074,6 +1074,20 @@ class ReaMicroSettingsHook(
             addLazyItem(lazyListScope, ROTATION_SWITCHES_ITEM_KEY) { itemComposer ->
                 renderHostSettingsCard(rotationRows, itemComposer)
             }
+            val profileBackgroundRows = listOf(
+                ToggleRow(
+                    key = ModuleSettings.KEY_PROFILE_BACKGROUND_ENABLED,
+                    title = "个人中心背景",
+                    checked = snapshot.profileBackgroundEnabled,
+                    onChanged = { checked, _ ->
+                        settings.setProfileBackgroundEnabled(checked)
+                        checked
+                    },
+                ),
+            )
+            addLazyItem(lazyListScope, PROFILE_BACKGROUND_SWITCHES_ITEM_KEY) { itemComposer ->
+                renderHostSettingsCard(profileBackgroundRows, itemComposer)
+            }
             targetUnit()
         }
         renderHostLazyColumn(innerPaddings, listContent, composer)
@@ -8089,6 +8103,7 @@ class ReaMicroSettingsHook(
         const val READER_HIGHLIGHT_BOOK_GROUPS_ITEM_KEY = 0x524D467A
         const val ABOUT_COMPLETION_ENTRY_ITEM_KEY = 0x524D467B
         const val ABOUT_COMPLETION_CONTENT_ITEM_KEY = 0x524D467C
+        const val PROFILE_BACKGROUND_SWITCHES_ITEM_KEY = 0x524D467D
         const val ACCOUNT_CREDENTIAL_DOCUMENT_REQUEST_CODE = 0x524D47
         const val ACCOUNT_DATA_DOCUMENT_REQUEST_CODE = 0x524D48
         const val ONLINE_SOURCE_DOCUMENT_REQUEST_CODE = 0x524D49
