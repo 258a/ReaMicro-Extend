@@ -3531,7 +3531,7 @@ class ReaderHook(
             setPadding(0, dp(6), dp(12), dp(6))
         }
         val model = TextView(activity).apply {
-            text = config.displayName
+            text = config.model
             textSize = 13f
             setTextColor(colors.secondaryText)
             maxLines = 1

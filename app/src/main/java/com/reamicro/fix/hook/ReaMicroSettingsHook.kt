@@ -3161,6 +3161,8 @@ class ReaMicroSettingsHook(
                 }
                 val apiKeyInput = settingsDialogInput(activity, "api_key", singleLine = true, colors = colors).apply {
                     inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                    typeface = Typeface.DEFAULT
+                    setHintTextColor(colors.body)
                     setText(existing?.apiKey.orEmpty())
                 }
                 val modelInput = settingsDialogInput(activity, "model", singleLine = true, colors = colors).apply {

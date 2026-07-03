@@ -294,7 +294,7 @@ class BookOverviewImageSelectionHook(
             var generatedBytes: ByteArray? = null
 
             card.addView(dialogTitle(activity, "生成${target.label}", colors))
-            card.addView(dialogMessage(activity, "当前模型：${config?.displayName ?: "未配置"}", colors))
+            card.addView(dialogMessage(activity, "当前模型：${config?.model?.takeIf { it.isNotBlank() } ?: "未配置"}", colors))
             card.addView(dialogMessage(activity, "参考图片：生成时自动读取当前封面并上传", colors))
 
             val prompt = editText(activity, "提示词内容", singleLine = false, colors = colors).apply {
