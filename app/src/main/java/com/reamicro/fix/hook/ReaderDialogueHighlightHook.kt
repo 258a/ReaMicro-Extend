@@ -97,7 +97,7 @@ class ReaderDialogueHighlightHook(
             val singleQuoteRanges = enabledRules
                 .filter { it.type == ReaderHighlightRuleType.SingleQuotePhrase }
                 .flatMap { findQuoteRanges(text, SINGLE_QUOTES) }
-            val ninePatchAnnotations = ArrayList<NinePatchAnnotation>()
+            val backgroundAnnotations = ArrayList<NinePatchAnnotation>()
             val rangeObjects = enabledRules.flatMap { rule ->
                 val ranges = findRanges(
                     text = text,
@@ -107,14 +107,19 @@ class ReaderDialogueHighlightHook(
                 )
                 if (ranges.isEmpty()) return@flatMap emptyList()
                 val highlightStyle = highlight.styleById(rule.styleIdForTheme(dark))
-                val style = createHighlightSpanStyle(highlightStyle, dark) ?: return@flatMap emptyList()
+                val highlightCss = highlightStyle.cssForTheme(dark)
                 val ninePatchPath = highlightStyle.ninePatchPathForTheme(dark).trim()
-                if (ninePatchPath.isNotBlank()) {
-                    val highlightCss = highlightStyle.cssForTheme(dark)
+                val hasCustomBackground = hasCustomHighlightBackground(ninePatchPath, highlightCss)
+                val style = createHighlightSpanStyle(
+                    style = highlightStyle,
+                    dark = dark,
+                    suppressBackground = hasCustomBackground,
+                ) ?: return@flatMap emptyList()
+                if (hasCustomBackground) {
                     val ninePatchSlice = highlightStyle.ninePatchSliceForTheme(dark)
                         .ifBlank { reedenNineSlice(highlightCss) }
                     ranges.forEach { range ->
-                        ninePatchAnnotations.add(NinePatchAnnotation(ninePatchPath, ninePatchSlice, highlightCss, range.first, range.last))
+                        backgroundAnnotations.add(NinePatchAnnotation(ninePatchPath, ninePatchSlice, highlightCss, range.first, range.last))
                     }
                 }
                 ranges.mapNotNull { range -> createAnnotatedRange(style, range.first, range.last) }
@@ -125,10 +130,10 @@ class ReaderDialogueHighlightHook(
                 addAll(originalSpanStyles.filterNotNull())
                 addAll(rangeObjects)
             }
-            val nextContent = if (ninePatchAnnotations.isEmpty()) {
+            val nextContent = if (backgroundAnnotations.isEmpty()) {
                 newAnnotatedString(content, nextSpanStyles)
             } else {
-                newAnnotatedStringWithNinePatchAnnotations(content, nextSpanStyles, ninePatchAnnotations)
+                newAnnotatedStringWithNinePatchAnnotations(content, nextSpanStyles, backgroundAnnotations)
             } ?: return
             field(contentDom.javaClass.name, "content").set(contentDom, nextContent)
             logApplied(text, rangeObjects.size)
@@ -275,10 +280,17 @@ class ReaderDialogueHighlightHook(
         }.getOrDefault(emptyList())
     }
 
-    private fun createHighlightSpanStyle(style: ReaderHighlightStyle, dark: Boolean): Any? {
+    private fun createHighlightSpanStyle(
+        style: ReaderHighlightStyle,
+        dark: Boolean,
+        suppressBackground: Boolean = false,
+    ): Any? {
         val css = parseCssStyle(style.cssForTheme(dark))
         val color = composeColor(css.color.ifBlank { style.colorForTheme(dark) })
-        val background = css.backgroundColor.takeIf { it.isNotBlank() }?.let(::composeColor)
+        val background = css.backgroundColor
+            .takeUnless { suppressBackground }
+            ?.takeIf { it.isNotBlank() }
+            ?.let(::composeColor)
         val fontSize = css.fontSize?.let(::composeSpTextUnit)
         val fontSelection = style.fontFamilyForTheme(dark).ifBlank { settings.fontSettings().globalFamily }
         val fontFamily = resolveFontFamily(fontSelection)
@@ -316,6 +328,15 @@ class ReaderDialogueHighlightHook(
             mask,
             null,
         )
+    }
+
+    private fun hasCustomHighlightBackground(path: String, css: String): Boolean =
+        path.isNotBlank() || parseCssColor(cssBackgroundValue(css).orEmpty()) != null
+
+    private fun cssBackgroundValue(css: String): String? {
+        if (css.isBlank()) return null
+        val values = cssProperties(css)
+        return values["background-color"].orEmpty().ifBlank { values["background"].orEmpty() }
     }
 
     private fun isNightMode(): Boolean {
@@ -712,13 +733,14 @@ class ReaderDialogueHighlightHook(
             val css = parts.getOrNull(2).orEmpty()
             val start = callNoArg(range, "getStart") as? Int ?: return@mapNotNull null
             val end = callNoArg(range, "getEnd") as? Int ?: return@mapNotNull null
-            if (path.isBlank() || end <= start) null else NinePatchRange(start, end, path, slice, css)
+            if (!hasCustomHighlightBackground(path, css) || end <= start) null else NinePatchRange(start, end, path, slice, css)
         }
     }
 
     private fun drawBehindModifier(baseModifier: Any?, state: NinePatchDrawState): Any? =
         runCatching {
-            val modifier = baseModifier ?: modifierInstance()
+            val base = baseModifier ?: modifierInstance() ?: return@runCatching null
+            val modifier = highlightTextPaddingModifier(base)
             cls(DRAW_MODIFIER_KT_CLASS).methods.firstOrNull {
                 it.name == "drawBehind" && it.parameterTypes.size == 2
             }?.invoke(null, modifier, function1Proxy("NinePatchDraw") {
@@ -729,15 +751,26 @@ class ReaderDialogueHighlightHook(
             logNinePatchDrawFailure("modifier", it)
         }.getOrNull()
 
+    private fun highlightTextPaddingModifier(baseModifier: Any): Any =
+        method(PADDING_KT_CLASS, PADDING_METHOD, 5).invoke(
+            null,
+            baseModifier,
+            0f,
+            udp(HIGHLIGHT_TEXT_VERTICAL_PADDING_DP),
+            0f,
+            udp(HIGHLIGHT_TEXT_VERTICAL_PADDING_DP),
+        )
+
     private fun drawNinePatchBackgrounds(drawScope: Any?, state: NinePatchDrawState) {
         val layout = state.textLayoutResult ?: return
         val canvas = nativeCanvas(drawScope) ?: return
         val density = activityProvider()?.resources?.displayMetrics?.density ?: 1f
+        val contentTopOffset = HIGHLIGHT_TEXT_VERTICAL_PADDING_DP * density
         state.ranges.forEach { range ->
-            val image = imageForNinePatch(range.path) ?: return@forEach
             val box = reedenBoxStyle(range.css, density)
-            val nineSlice = parseNineSlice(range.slice, image.bitmap.width, image.bitmap.height)
-            lineRects(layout, range.start, range.end, box).forEach { rect ->
+            val image = range.path.takeIf { it.isNotBlank() }?.let(::imageForNinePatch)
+            val nineSlice = image?.let { parseNineSlice(range.slice, it.bitmap.width, it.bitmap.height) }
+            lineRects(layout, range.start, range.end, box, contentTopOffset).forEach { rect ->
                 val saveCount = if (box.radiusPx > 0f) {
                     val path = Path().apply {
                         addRoundRect(RectF(rect), box.radiusPx, box.radiusPx, Path.Direction.CW)
@@ -748,13 +781,16 @@ class ReaderDialogueHighlightHook(
                 } else {
                     -1
                 }
-                if (nineSlice != null) {
-                    drawNineSlice(canvas, image.bitmap, nineSlice, rect)
-                } else if (image.bitmap.ninePatchChunk == null) {
-                    drawBitmapByBackgroundSize(canvas, image.bitmap, rect, box.backgroundSize)
-                } else {
-                    image.drawable.bounds = rect
-                    image.drawable.draw(canvas)
+                box.backgroundColor?.let { drawCssBackground(canvas, rect, box, it) }
+                if (image != null) {
+                    if (nineSlice != null) {
+                        drawNineSlice(canvas, image.bitmap, nineSlice, rect)
+                    } else if (image.bitmap.ninePatchChunk == null) {
+                        drawBitmapByBackgroundSize(canvas, image.bitmap, rect, box.backgroundSize)
+                    } else {
+                        image.drawable.bounds = rect
+                        image.drawable.draw(canvas)
+                    }
                 }
                 if (saveCount >= 0) canvas.restoreToCount(saveCount)
                 drawCssBorder(canvas, rect, box)
@@ -762,7 +798,7 @@ class ReaderDialogueHighlightHook(
         }
     }
 
-    private fun lineRects(layout: Any, start: Int, end: Int, box: ReedenBoxStyle): List<Rect> {
+    private fun lineRects(layout: Any, start: Int, end: Int, box: ReedenBoxStyle, contentTopOffset: Float): List<Rect> {
         val lineForOffset = layout.javaClass.methods.firstOrNull {
             it.name == "getLineForOffset" && it.parameterTypes.size == 1
         } ?: return emptyList()
@@ -780,9 +816,9 @@ class ReaderDialogueHighlightHook(
             val bottom = callFloat(layout, "getLineBottom", line) ?: charRect(layout, localStart)?.bottom ?: return@mapNotNull null
             Rect(
                 (left - box.paddingLeftPx - box.marginLeftPx).toInt(),
-                (top - box.paddingTopPx - box.marginTopPx).toInt(),
+                (top + contentTopOffset - box.paddingTopPx - box.marginTopPx).toInt(),
                 (right + box.paddingRightPx + box.marginRightPx).toInt(),
-                (bottom + box.paddingBottomPx + box.marginBottomPx).toInt(),
+                (bottom + contentTopOffset + box.paddingBottomPx + box.marginBottomPx).toInt(),
             )
         }
     }
@@ -919,6 +955,19 @@ class ReaderDialogueHighlightHook(
         }
     }
 
+    private fun drawCssBackground(canvas: android.graphics.Canvas, rect: Rect, box: ReedenBoxStyle, color: Int) {
+        if (rect.width() <= 0 || rect.height() <= 0) return
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            this.color = color
+        }
+        if (box.radiusPx > 0f) {
+            canvas.drawRoundRect(RectF(rect), box.radiusPx, box.radiusPx, paint)
+        } else {
+            canvas.drawRect(rect, paint)
+        }
+    }
+
     private fun reedenBoxStyle(css: String, density: Float): ReedenBoxStyle {
         val values = cssProperties(css)
         val padding = cssBoxEdges(values, "padding", density).scale(REEDEN_BOX_EDGE_SCALE)
@@ -929,6 +978,8 @@ class ReaderDialogueHighlightHook(
             ?: 0f
         val borderColor = parseCssColor(values["border-color"].orEmpty())
             ?: Regex("""rgba?\([^)]+\)|#[0-9a-fA-F]{6,8}""").find(border)?.value?.let(::parseCssColor)
+        val backgroundColor = parseCssColor(values["background-color"].orEmpty())
+            ?: parseCssColor(values["background"].orEmpty())
         return ReedenBoxStyle(
             paddingLeftPx = padding.left,
             paddingTopPx = padding.top,
@@ -938,6 +989,7 @@ class ReaderDialogueHighlightHook(
             marginTopPx = margin.top,
             marginRightPx = margin.right,
             marginBottomPx = margin.bottom,
+            backgroundColor = backgroundColor,
             borderWidthPx = borderWidth,
             borderColor = borderColor,
             radiusPx = values["border-radius"]?.let { cssSizePx(it, density) } ?: 0f,
@@ -1009,6 +1061,11 @@ class ReaderDialogueHighlightHook(
 
     private fun modifierInstance(): Any? =
         fieldObjectOrNull(MODIFIER_CLASS, "INSTANCE") ?: fieldObjectOrNull(MODIFIER_CLASS, "Companion")
+
+    private fun udp(value: Int): Float =
+        cls(UNIT_EXT_KT_CLASS).declaredMethods.first {
+            it.name == UDP_METHOD && it.parameterTypes.contentEquals(arrayOf(Int::class.javaPrimitiveType))
+        }.apply { isAccessible = true }.invoke(null, value) as Float
 
     private fun function1Proxy(name: String, block: (Array<Any?>?) -> Any?): Any {
         val functionClass = cls(FUNCTION1_CLASS)
@@ -1240,12 +1297,16 @@ class ReaderDialogueHighlightHook(
         const val TEXT_LAYOUT_RESULT_CLASS = "androidx.compose.ui.text.TextLayoutResult"
         const val TEXT_RANGE_CLASS = "androidx.compose.ui.text.TextRange"
         const val BASIC_TEXT_CLASS = "androidx.compose.foundation.text.BasicTextKt"
+        const val PADDING_KT_CLASS = "androidx.compose.foundation.layout.PaddingKt"
+        const val PADDING_METHOD = "padding-qDBjuR0"
         const val DRAW_MODIFIER_KT_CLASS = "androidx.compose.ui.draw.DrawModifierKt"
         const val ANDROID_CANVAS_KT_CLASS = "androidx.compose.ui.graphics.AndroidCanvas_androidKt"
         const val COLOR_KT_CLASS = "androidx.compose.ui.graphics.ColorKt"
         const val GEOMETRY_RECT_CLASS = "androidx.compose.ui.geometry.Rect"
         const val TEXT_UNIT_KT_CLASS = "androidx.compose.ui.unit.TextUnitKt"
         const val MODIFIER_CLASS = "androidx.compose.ui.Modifier"
+        const val UNIT_EXT_KT_CLASS = "app.zhendong.reamicro.arch.extensions.UnitExtKt"
+        const val UDP_METHOD = "getUdp"
         const val FUNCTION1_CLASS = "kotlin.jvm.functions.Function1"
         const val UNIT_CLASS = "kotlin.Unit"
         const val FONT_PROVIDER_CLASS = "org.epub.FontProvider"
@@ -1274,6 +1335,7 @@ class ReaderDialogueHighlightHook(
         const val BASIC_TEXT_DEFAULT_ON_TEXT_LAYOUT = 8
         const val MAX_REMEMBERED_NINE_PATCH_TEXTS = 128
         const val REEDEN_BOX_EDGE_SCALE = 0.78f
+        const val HIGHLIGHT_TEXT_VERTICAL_PADDING_DP = 4
         const val SELECTION_RECT_TOP_PADDING_DP = 4f
         const val SELECTION_RECT_BOTTOM_PADDING_DP = 1f
         const val NINE_PATCH_ANNOTATION_TAG = "reamicro.highlight.ninepatch"
@@ -1365,6 +1427,7 @@ class ReaderDialogueHighlightHook(
         val marginTopPx: Float,
         val marginRightPx: Float,
         val marginBottomPx: Float,
+        val backgroundColor: Int?,
         val borderWidthPx: Float,
         val borderColor: Int?,
         val radiusPx: Float,
