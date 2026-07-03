@@ -1,6 +1,7 @@
 package com.reamicro.fix.hook
 
 import android.app.Activity
+import android.content.res.Configuration
 import android.graphics.Color
 import com.reamicro.fix.settings.ReaderHighlightRule
 import com.reamicro.fix.settings.ReaderHighlightRuleType
@@ -59,6 +60,7 @@ class ReaderDialogueHighlightHook(
             val highlight = settings.highlightSettings()
             val enabledRules = highlight.rules.filter { it.enabled }
             if (enabledRules.isEmpty()) return
+            val dark = isNightMode()
             val protectedRanges = protectedStyledElementRanges(contentDom, text)
             val singleQuoteRanges = enabledRules
                 .filter { it.type == ReaderHighlightRuleType.SingleQuotePhrase }
@@ -71,7 +73,7 @@ class ReaderDialogueHighlightHook(
                     singleQuoteRanges = singleQuoteRanges,
                 )
                 if (ranges.isEmpty()) return@flatMap emptyList()
-                val style = createHighlightSpanStyle(highlight.styleById(rule.styleId)) ?: return@flatMap emptyList()
+                val style = createHighlightSpanStyle(highlight.styleById(rule.styleId), dark) ?: return@flatMap emptyList()
                 ranges.mapNotNull { range -> createAnnotatedRange(style, range.first, range.last) }
             }
             if (rangeObjects.isEmpty()) return
@@ -100,6 +102,8 @@ class ReaderDialogueHighlightHook(
                 findQuoteRanges(text, DOUBLE_QUOTES).flatMap { range -> subtractRanges(range, excluded) }
             }
             ReaderHighlightRuleType.SingleQuotePhrase -> findQuoteRanges(text, SINGLE_QUOTES)
+            ReaderHighlightRuleType.FixedText -> findFixedTextRanges(text, rule.pattern)
+            ReaderHighlightRuleType.Regex -> findRegexRanges(text, rule.pattern)
         }
 
     private fun protectedStyledElementRanges(contentDom: Any, renderedText: String): List<IntRange> {
@@ -200,35 +204,75 @@ class ReaderDialogueHighlightHook(
         return -1
     }
 
-    private fun createHighlightSpanStyle(style: ReaderHighlightStyle): Any? {
-        val css = parseCssStyle(style.css)
-        val color = composeColor(css.color.ifBlank { style.color })
-        val fontSelection = style.fontFamily.ifBlank { settings.fontSettings().globalFamily }
+    private fun findFixedTextRanges(text: String, pattern: String): List<IntRange> {
+        if (pattern.isBlank()) return emptyList()
+        val ranges = ArrayList<IntRange>()
+        var index = text.indexOf(pattern)
+        while (index >= 0) {
+            ranges.add(exclusiveRange(index, index + pattern.length))
+            index = text.indexOf(pattern, index + pattern.length)
+        }
+        return ranges
+    }
+
+    private fun findRegexRanges(text: String, pattern: String): List<IntRange> {
+        if (pattern.isBlank()) return emptyList()
+        return runCatching {
+            Regex(pattern).findAll(text)
+                .mapNotNull { match ->
+                    val start = match.range.first
+                    val end = match.range.last + 1
+                    if (end > start) exclusiveRange(start, end) else null
+                }
+                .toList()
+        }.getOrDefault(emptyList())
+    }
+
+    private fun createHighlightSpanStyle(style: ReaderHighlightStyle, dark: Boolean): Any? {
+        val css = parseCssStyle(style.cssForTheme(dark))
+        val color = composeColor(css.color.ifBlank { style.colorForTheme(dark) })
+        val background = css.backgroundColor.takeIf { it.isNotBlank() }?.let(::composeColor)
+        val fontSelection = style.fontFamilyForTheme(dark).ifBlank { settings.fontSettings().globalFamily }
         val fontFamily = resolveFontFamily(fontSelection)
+        val fontWeight = css.fontWeight?.let(::resolveFontWeight)
+        val fontStyle = css.fontStyle?.let(::resolveFontStyle)
+        val textDecoration = css.textDecoration?.let(::resolveTextDecoration)
         val constructor = cls(SPAN_STYLE_CLASS).declaredConstructors.firstOrNull { it.parameterTypes.size == 18 }
             ?: return null
         constructor.isAccessible = true
-        val mask = if (fontFamily != null) SPAN_STYLE_DEFAULT_MASK_EXCEPT_COLOR_AND_FONT else SPAN_STYLE_DEFAULT_MASK_EXCEPT_COLOR
+        var mask = SPAN_STYLE_DEFAULT_MASK_EXCEPT_COLOR
+        if (fontWeight != null) mask = mask and SPAN_STYLE_MASK_FONT_WEIGHT.inv()
+        if (fontStyle != null) mask = mask and SPAN_STYLE_MASK_FONT_STYLE.inv()
+        if (fontFamily != null) mask = mask and SPAN_STYLE_MASK_FONT_FAMILY.inv()
+        if (css.fontFeatureSettings.isNotBlank()) mask = mask and SPAN_STYLE_MASK_FONT_FEATURE.inv()
+        if (background != null) mask = mask and SPAN_STYLE_MASK_BACKGROUND.inv()
+        if (textDecoration != null) mask = mask and SPAN_STYLE_MASK_TEXT_DECORATION.inv()
         return constructor.newInstance(
             color,
             0L,
-            null,
-            null,
+            fontWeight,
+            fontStyle,
             null,
             fontFamily,
-            null,
+            css.fontFeatureSettings.ifBlank { null },
             0L,
             null,
             null,
             null,
-            0L,
-            null,
+            background ?: 0L,
+            textDecoration,
             null,
             null,
             null,
             mask,
             null,
         )
+    }
+
+    private fun isNightMode(): Boolean {
+        val context = activityProvider() ?: return false
+        return (context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+            Configuration.UI_MODE_NIGHT_YES
     }
 
     private fun parseCssStyle(css: String): CssStyle {
@@ -239,7 +283,64 @@ class ReaderDialogueHighlightHook(
                 if (index <= 0) null else part.substring(0, index).trim().lowercase() to part.substring(index + 1).trim()
             }
             .toMap()
-        return CssStyle(color = values["color"].orEmpty())
+        return CssStyle(
+            color = values["color"].orEmpty(),
+            backgroundColor = values["background-color"].orEmpty().ifBlank { values["background"].orEmpty() },
+            fontWeight = values["font-weight"]?.lowercase(),
+            fontStyle = values["font-style"]?.lowercase(),
+            fontFeatureSettings = values["font-feature-settings"].orEmpty(),
+            textDecoration = values["text-decoration"]?.lowercase(),
+        )
+    }
+
+    private fun resolveFontWeight(value: String): Any? {
+        val normalized = value.trim().lowercase()
+        val methodName = when (normalized) {
+            "bold", "bolder", "700" -> "getBold"
+            "normal", "400" -> "getNormal"
+            "100" -> "getW100"
+            "200" -> "getW200"
+            "300" -> "getW300"
+            "500" -> "getW500"
+            "600" -> "getW600"
+            "800" -> "getW800"
+            "900" -> "getW900"
+            else -> null
+        }
+        if (methodName != null) return fontWeight(methodName)
+        val weight = normalized.toIntOrNull()?.coerceIn(1, 1000) ?: return null
+        return cls(FONT_WEIGHT_CLASS).getDeclaredConstructor(Int::class.javaPrimitiveType)
+            .apply { isAccessible = true }
+            .newInstance(weight)
+    }
+
+    private fun resolveFontStyle(value: String): Any? {
+        val styleValue = when (value.trim().lowercase()) {
+            "italic", "oblique" -> FONT_STYLE_ITALIC
+            "normal" -> FONT_STYLE_NORMAL
+            else -> return null
+        }
+        return cls(FONT_STYLE_CLASS).declaredMethods.firstOrNull { method ->
+            method.name.contains("box") && method.parameterTypes.size == 1 &&
+                method.parameterTypes[0] == Int::class.javaPrimitiveType
+        }?.apply { isAccessible = true }?.invoke(null, styleValue)
+    }
+
+    private fun resolveTextDecoration(value: String): Any? {
+        val mask = value.split(Regex("\\s+"))
+            .fold(0) { current, part ->
+                when (part.trim().lowercase()) {
+                    "underline" -> current or TEXT_DECORATION_UNDERLINE
+                    "line-through", "linethrough" -> current or TEXT_DECORATION_LINE_THROUGH
+                    "none" -> current
+                    else -> current
+                }
+            }
+        if (mask == 0) return null
+        return cls(TEXT_DECORATION_CLASS)
+            .getDeclaredConstructor(Int::class.javaPrimitiveType)
+            .apply { isAccessible = true }
+            .newInstance(mask)
     }
 
     private fun composeColor(value: String): Long {
@@ -459,10 +560,21 @@ class ReaderDialogueHighlightHook(
         const val FONT_FAMILY_CLASS = "androidx.compose.ui.text.font.FontFamily"
         const val FONT_FAMILY_KT_CLASS = "androidx.compose.ui.text.font.FontFamilyKt"
         const val FONT_WEIGHT_CLASS = "androidx.compose.ui.text.font.FontWeight"
+        const val FONT_STYLE_CLASS = "androidx.compose.ui.text.font.FontStyle"
+        const val TEXT_DECORATION_CLASS = "androidx.compose.ui.text.style.TextDecoration"
         const val FAMILY_SYSTEM = "system"
         const val FAMILY_SOURCE_HAN_SERIF = "serif"
         const val SPAN_STYLE_DEFAULT_MASK_EXCEPT_COLOR = 65534
-        const val SPAN_STYLE_DEFAULT_MASK_EXCEPT_COLOR_AND_FONT = 65502
+        const val SPAN_STYLE_MASK_FONT_WEIGHT = 4
+        const val SPAN_STYLE_MASK_FONT_STYLE = 8
+        const val SPAN_STYLE_MASK_FONT_FAMILY = 32
+        const val SPAN_STYLE_MASK_FONT_FEATURE = 64
+        const val SPAN_STYLE_MASK_BACKGROUND = 2048
+        const val SPAN_STYLE_MASK_TEXT_DECORATION = 4096
+        const val FONT_STYLE_NORMAL = 0
+        const val FONT_STYLE_ITALIC = 1
+        const val TEXT_DECORATION_UNDERLINE = 1
+        const val TEXT_DECORATION_LINE_THROUGH = 2
         const val MARKUP_TEXT = "#text"
         val CONTENT_DOM_CLASS_CANDIDATES = listOf(
             "org.epub.html.node.ContentDom",
@@ -483,5 +595,10 @@ class ReaderDialogueHighlightHook(
 
     private data class CssStyle(
         val color: String = "",
+        val backgroundColor: String = "",
+        val fontWeight: String? = null,
+        val fontStyle: String? = null,
+        val fontFeatureSettings: String = "",
+        val textDecoration: String? = null,
     )
 }

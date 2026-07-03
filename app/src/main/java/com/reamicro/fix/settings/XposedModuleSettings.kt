@@ -246,8 +246,27 @@ class XposedModuleSettings(
         val current = highlightSettings()
         val next = current.styles
             .filterNot { it.id == style.id }
-            .plus(style.copy(color = normalizeHighlightColor(style.color)))
+            .plus(
+                style.copy(
+                    color = normalizeHighlightColor(style.color),
+                    darkColor = normalizeHighlightColor(style.darkColor.ifBlank { style.color }),
+                ),
+            )
         putString(ModuleSettings.KEY_READER_HIGHLIGHT_STYLES, encodeHighlightStyles(next))
+    }
+
+    fun removeReaderHighlightStyle(styleId: String) {
+        if (styleId == ModuleSettings.DEFAULT_READER_HIGHLIGHT_STYLE_ID) return
+        val current = highlightSettings()
+        val nextStyles = current.styles.filterNot { it.id == styleId }
+        val nextRules = current.rules.map { rule ->
+            if (rule.styleId == styleId) {
+                rule.copy(styleId = ModuleSettings.DEFAULT_READER_HIGHLIGHT_STYLE_ID)
+            } else {
+                rule
+            }
+        }
+        putHighlightSettings(nextStyles, nextRules)
     }
 
     fun setReaderHighlightRule(rule: ReaderHighlightRule) {
@@ -256,6 +275,20 @@ class XposedModuleSettings(
             .filterNot { it.id == rule.id }
             .plus(rule)
         putString(ModuleSettings.KEY_READER_HIGHLIGHT_RULES, encodeHighlightRules(next))
+    }
+
+    fun removeReaderHighlightRule(ruleId: String) {
+        if (ruleId == ModuleSettings.DEFAULT_READER_DOUBLE_QUOTE_RULE_ID ||
+            ruleId == ModuleSettings.DEFAULT_READER_SINGLE_QUOTE_RULE_ID
+        ) {
+            setReaderHighlightRuleEnabled(ruleId, false)
+            return
+        }
+        val current = highlightSettings()
+        putString(
+            ModuleSettings.KEY_READER_HIGHLIGHT_RULES,
+            encodeHighlightRules(current.rules.filterNot { it.id == ruleId }),
+        )
     }
 
     fun setReaderHighlightRuleEnabled(ruleId: String, enabled: Boolean) {
@@ -277,6 +310,20 @@ class XposedModuleSettings(
         cachedAtMs = 0L
         cachedFontSettings = null
         cachedFontSettingsAtMs = 0L
+        cachedDialogueHighlightSettings = null
+        cachedDialogueHighlightSettingsAtMs = 0L
+        cachedHighlightSettings = null
+        cachedHighlightSettingsAtMs = 0L
+        snapshot()
+    }
+
+    private fun putHighlightSettings(styles: List<ReaderHighlightStyle>, rules: List<ReaderHighlightRule>) {
+        prefs()?.edit()
+            ?.putString(ModuleSettings.KEY_READER_HIGHLIGHT_STYLES, encodeHighlightStyles(styles))
+            ?.putString(ModuleSettings.KEY_READER_HIGHLIGHT_RULES, encodeHighlightRules(rules))
+            ?.commit()
+        cachedSnapshot = null
+        cachedAtMs = 0L
         cachedDialogueHighlightSettings = null
         cachedDialogueHighlightSettingsAtMs = 0L
         cachedHighlightSettings = null
@@ -538,6 +585,13 @@ class XposedModuleSettings(
                             fontFamily = item.optString("fontFamily"),
                             css = item.optString("css"),
                             ninePatchPath = item.optString("ninePatchPath"),
+                            darkUsesLight = item.optBoolean("darkUsesLight", true),
+                            darkColor = normalizeHighlightColor(
+                                item.optString("darkColor").ifBlank { item.optString("color") },
+                            ),
+                            darkFontFamily = item.optString("darkFontFamily"),
+                            darkCss = item.optString("darkCss"),
+                            darkNinePatchPath = item.optString("darkNinePatchPath"),
                         ),
                     )
                 }
@@ -568,6 +622,7 @@ class XposedModuleSettings(
                             styleId = item.optString("styleId")
                                 .ifBlank { ModuleSettings.DEFAULT_READER_HIGHLIGHT_STYLE_ID },
                             enabled = item.optBoolean("enabled", true),
+                            pattern = item.optString("pattern"),
                         ),
                     )
                 }
@@ -587,7 +642,12 @@ class XposedModuleSettings(
                         .put("color", normalizeHighlightColor(style.color))
                         .put("fontFamily", style.fontFamily)
                         .put("css", style.css)
-                        .put("ninePatchPath", style.ninePatchPath),
+                        .put("ninePatchPath", style.ninePatchPath)
+                        .put("darkUsesLight", style.darkUsesLight)
+                        .put("darkColor", normalizeHighlightColor(style.darkColor.ifBlank { style.color }))
+                        .put("darkFontFamily", style.darkFontFamily)
+                        .put("darkCss", style.darkCss)
+                        .put("darkNinePatchPath", style.darkNinePatchPath),
                 )
             }
         }.toString()
@@ -601,7 +661,8 @@ class XposedModuleSettings(
                         .put("name", rule.name)
                         .put("type", rule.type.name)
                         .put("styleId", rule.styleId)
-                        .put("enabled", rule.enabled),
+                        .put("enabled", rule.enabled)
+                        .put("pattern", rule.pattern),
                 )
             }
         }.toString()

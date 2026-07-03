@@ -276,7 +276,24 @@ data class ReaderHighlightStyle(
     val fontFamily: String = "",
     val css: String = "",
     val ninePatchPath: String = "",
+    val darkUsesLight: Boolean = true,
+    val darkColor: String = "",
+    val darkFontFamily: String = "",
+    val darkCss: String = "",
+    val darkNinePatchPath: String = "",
 ) {
+    fun colorForTheme(dark: Boolean): String =
+        if (dark && !darkUsesLight) darkColor.ifBlank { color } else color
+
+    fun fontFamilyForTheme(dark: Boolean): String =
+        if (dark && !darkUsesLight) darkFontFamily.ifBlank { fontFamily } else fontFamily
+
+    fun cssForTheme(dark: Boolean): String =
+        if (dark && !darkUsesLight) darkCss.ifBlank { css } else css
+
+    fun ninePatchPathForTheme(dark: Boolean): String =
+        if (dark && !darkUsesLight) darkNinePatchPath.ifBlank { ninePatchPath } else ninePatchPath
+
     companion object {
         fun default(
             color: String = ModuleSettings.DEFAULT_READER_DIALOGUE_HIGHLIGHT_COLOR,
@@ -297,6 +314,7 @@ data class ReaderHighlightRule(
     val type: ReaderHighlightRuleType,
     val styleId: String = ModuleSettings.DEFAULT_READER_HIGHLIGHT_STYLE_ID,
     val enabled: Boolean = true,
+    val pattern: String = "",
 ) {
     companion object {
         fun defaults(): List<ReaderHighlightRule> =
@@ -318,4 +336,6 @@ data class ReaderHighlightRule(
 enum class ReaderHighlightRuleType {
     DoubleQuoteDialogue,
     SingleQuotePhrase,
+    FixedText,
+    Regex,
 }

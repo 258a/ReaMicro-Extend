@@ -59,6 +59,7 @@ import com.reamicro.fix.online.OnlineSourceEntry
 import com.reamicro.fix.online.OnlineSourceStore
 import com.reamicro.fix.settings.ModuleSettings
 import com.reamicro.fix.settings.ReaderHighlightRule
+import com.reamicro.fix.settings.ReaderHighlightRuleType
 import com.reamicro.fix.settings.ReaderHighlightStyle
 import com.reamicro.fix.settings.XposedModuleSettings
 import de.robv.android.xposed.XC_MethodHook
@@ -72,6 +73,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlin.system.exitProcess
+import org.json.JSONObject
 
 /**
  * Injects the module settings UI into the host About/Settings surface.
@@ -1091,14 +1093,14 @@ class ReaMicroSettingsHook(
             val rows = listOf(
                 ActionRow(
                     key = "reader_highlight_config",
-                    title = "\u9ad8\u4eae\u914d\u7f6e",
+                    title = "\u9ad8\u4eae\u6837\u5f0f",
                     subtitle = "${highlight.styles.size} \u4e2a\u6837\u5f0f",
                     singleLineSubtitle = true,
                     onClick = { openNestedInjectedRoute(InjectedRoute.ReaderHighlightConfigSettings) },
                 ),
                 ActionRow(
                     key = "reader_highlight_text",
-                    title = "\u9ad8\u4eae\u6587\u672c",
+                    title = "\u9ad8\u4eae\u89c4\u5219",
                     subtitle = "${highlight.rules.count { it.enabled }} / ${highlight.rules.size} \u6761\u89c4\u5219",
                     singleLineSubtitle = true,
                     onClick = { openNestedInjectedRoute(InjectedRoute.ReaderHighlightTextSettings) },
@@ -1116,15 +1118,31 @@ class ReaMicroSettingsHook(
         val listContent = functionProxy("ReaderHighlightConfigSettingsList", FUNCTION1_CLASS) { args ->
             val lazyListScope = args?.getOrNull(0) ?: return@functionProxy targetUnit()
             fontLibraryVersionValue()
-            val rows = settings.highlightSettings().styles.map { style ->
-                ActionRow(
-                    key = "reader_highlight_style_${style.id}",
-                    title = style.name,
-                    subtitle = highlightStyleSummary(style),
-                    trailing = style.color,
-                    singleLineSubtitle = true,
-                    onClick = { openReaderHighlightStyleDialog(style) },
+            val highlight = settings.highlightSettings()
+            val rows = buildList {
+                add(
+                    ActionRow(
+                        key = "reader_highlight_style_add",
+                        title = "\u6dfb\u52a0\u914d\u7f6e",
+                        subtitle = "\u65b0\u589e\u4e00\u7ec4\u53ef\u5206\u522b\u8bbe\u7f6e\u6d45\u8272\u548c\u6df1\u8272\u7684\u9ad8\u4eae\u6837\u5f0f",
+                        singleLineSubtitle = true,
+                        onClick = { openReaderHighlightStyleDialog(newReaderHighlightStyle()) },
+                        onLongClick = ::openReaderHighlightStyleImportPicker,
+                    ),
                 )
+                highlight.styles.forEach { style ->
+                    add(
+                        ActionRow(
+                            key = "reader_highlight_style_${style.id}",
+                            title = style.name,
+                            subtitle = highlightStyleSummary(style),
+                            trailing = style.color,
+                            singleLineSubtitle = true,
+                            onClick = { openReaderHighlightStyleDialog(style) },
+                            onLongClick = { exportReaderHighlightStyle(style) },
+                        ),
+                    )
+                }
             }
             addLazyItem(lazyListScope, READER_HIGHLIGHT_CONFIG_ITEM_KEY) { itemComposer ->
                 renderHostActionCard(rows, itemComposer)
@@ -1138,16 +1156,38 @@ class ReaMicroSettingsHook(
         val listContent = functionProxy("ReaderHighlightTextSettingsList", FUNCTION1_CLASS) { args ->
             val lazyListScope = args?.getOrNull(0) ?: return@functionProxy targetUnit()
             val highlight = settings.highlightSettings()
-            val rows = highlight.rules.map { rule ->
-                val style = highlight.styleById(rule.styleId)
-                ActionRow(
-                    key = "reader_highlight_rule_${rule.id}",
-                    title = rule.name,
-                    subtitle = "${highlightRuleTypeTitle(rule)} / ${style.name}",
-                    trailing = if (rule.enabled) "\u5df2\u542f\u7528" else "\u672a\u542f\u7528",
-                    singleLineSubtitle = true,
-                    onClick = { openReaderHighlightRuleDialog(rule) },
+            val rows = buildList {
+                add(
+                    ActionRow(
+                        key = "reader_highlight_rule_add",
+                        title = "\u6dfb\u52a0\u914d\u7f6e",
+                        subtitle = "\u65b0\u589e\u4e00\u6761\u56fa\u5b9a\u6587\u672c\u6216\u6b63\u5219\u9ad8\u4eae\u89c4\u5219",
+                        singleLineSubtitle = true,
+                        onClick = { openReaderHighlightRuleDialog(newReaderHighlightRule()) },
+                    ),
                 )
+                highlight.rules.forEach { rule ->
+                    val style = highlight.styleById(rule.styleId)
+                    add(
+                        ActionRow(
+                            key = "reader_highlight_rule_${rule.id}",
+                            title = rule.name,
+                            subtitle = "${highlightRuleSummary(rule)} / ${style.name}",
+                            trailingContent = { itemComposer ->
+                                renderHostActionSwitch(
+                                    key = "reader_highlight_rule_switch_${rule.id}",
+                                    checked = rule.enabled,
+                                    composer = itemComposer,
+                                ) { enabled ->
+                                    settings.setReaderHighlightRuleEnabled(rule.id, enabled)
+                                    setInjectedRouteState(currentInjectedRoute())
+                                }
+                            },
+                            singleLineSubtitle = true,
+                            onClick = { openReaderHighlightRuleDialog(rule) },
+                        ),
+                    )
+                }
             }
             addLazyItem(lazyListScope, READER_HIGHLIGHT_TEXT_ITEM_KEY) { itemComposer ->
                 renderHostActionCard(rows, itemComposer)
@@ -1192,39 +1232,129 @@ class ReaMicroSettingsHook(
                 val nameInput = settingsDialogInput(activity, "\u6837\u5f0f\u540d\u79f0", singleLine = true, colors = colors).apply {
                     setText(style.name)
                 }
-                val colorInput = settingsDialogInput(activity, "\u989c\u8272\uff0c\u4f8b\u5982 #FF9800", singleLine = true, colors = colors).apply {
+                val colorInput = settingsDialogInput(activity, "\u6d45\u8272\u989c\u8272\uff0c\u4f8b\u5982 #FF9800", singleLine = true, colors = colors).apply {
                     setText(style.color)
                 }
-                val fontInput = settingsDialogInput(activity, "\u5b57\u4f53\uff0c\u7559\u7a7a\u8ddf\u968f\u5168\u5c40", singleLine = true, colors = colors).apply {
-                    setText(style.fontFamily)
+                var lightFontSelection = style.fontFamily
+                lateinit var syncLightFontStatus: () -> Unit
+                val lightFontStatus = settingsDialogFontChoiceRow(activity, "", null, lightFontSelection, colors) {
+                    openSettingsFontSelectionDialog(
+                        activity = activity,
+                        title = "\u6d45\u8272\u5b57\u4f53",
+                        currentSelection = lightFontSelection,
+                        clearTitle = "\u8ddf\u968f\u5168\u5c40\u5b57\u4f53",
+                    ) { selection ->
+                        lightFontSelection = selection
+                        syncLightFontStatus.invoke()
+                    }
                 }
-                val cssInput = settingsDialogInput(activity, "CSS\uff08\u76ee\u524d\u652f\u6301 color\uff09", singleLine = false, colors = colors).apply {
+                val cssInput = settingsDialogInput(activity, "\u6d45\u8272 CSS\uff08\u652f\u6301 color/background/font-weight/font-style/text-decoration\uff09", singleLine = false, colors = colors).apply {
                     setText(style.css)
                     minLines = 2
                 }
-                val ninePatchInput = settingsDialogInput(activity, ".9.png \u8def\u5f84\uff08\u4fdd\u7559\u914d\u7f6e\uff09", singleLine = true, colors = colors).apply {
+                val ninePatchInput = settingsDialogInput(activity, "\u6d45\u8272 .9.png \u8def\u5f84\uff08\u4fdd\u7559\u914d\u7f6e\uff09", singleLine = true, colors = colors).apply {
                     setText(style.ninePatchPath)
                 }
+                var darkUsesLight = style.darkUsesLight
+                val darkToggleButton = settingsDialogButton(
+                    activity,
+                    if (darkUsesLight) "\u6df1\u8272\u5171\u7528\u6d45\u8272" else "\u6df1\u8272\u5355\u72ec\u914d\u7f6e",
+                    colors,
+                    SettingsDialogButtonRole.Neutral,
+                ).apply {
+                    layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ).apply { bottomMargin = settingsDp(activity, 10) }
+                }
+                val darkColorInput = settingsDialogInput(activity, "\u6df1\u8272\u989c\u8272\uff0c\u4f8b\u5982 #FFB74D", singleLine = true, colors = colors).apply {
+                    setText(style.darkColor.ifBlank { style.color })
+                }
+                var darkFontSelection = style.darkFontFamily
+                lateinit var syncDarkFontStatus: () -> Unit
+                val darkFontStatus = settingsDialogFontChoiceRow(activity, "", null, darkFontSelection, colors) {
+                    openSettingsFontSelectionDialog(
+                        activity = activity,
+                        title = "\u6df1\u8272\u5b57\u4f53",
+                        currentSelection = darkFontSelection,
+                        clearTitle = "\u8ddf\u968f\u6d45\u8272\u5b57\u4f53",
+                    ) { selection ->
+                        darkFontSelection = selection
+                        syncDarkFontStatus.invoke()
+                    }
+                }
+                val darkCssInput = settingsDialogInput(activity, "\u6df1\u8272 CSS\uff08\u652f\u6301 color/background/font-weight/font-style/text-decoration\uff09", singleLine = false, colors = colors).apply {
+                    setText(style.darkCss)
+                    minLines = 2
+                }
+                val darkNinePatchInput = settingsDialogInput(activity, "\u6df1\u8272 .9.png \u8def\u5f84\uff08\u4fdd\u7559\u914d\u7f6e\uff09", singleLine = true, colors = colors).apply {
+                    setText(style.darkNinePatchPath)
+                }
                 val finishButton = settingsDialogButton(activity, "\u5b8c\u6210", colors)
+                val deleteButton = settingsDialogButton(activity, "\u5220\u9664", colors, SettingsDialogButtonRole.Destructive)
                 val cancelButton = settingsDialogButton(activity, "\u53d6\u6d88", colors, SettingsDialogButtonRole.Neutral)
-                card.addView(settingsDialogTitle(activity, "\u9ad8\u4eae\u914d\u7f6e", colors))
+                fun syncDarkInputs() {
+                    val visibility = if (darkUsesLight) View.GONE else View.VISIBLE
+                    darkToggleButton.text = if (darkUsesLight) "\u6df1\u8272\u5171\u7528\u6d45\u8272" else "\u6df1\u8272\u5355\u72ec\u914d\u7f6e"
+                    darkColorInput.visibility = visibility
+                    darkFontStatus.visibility = visibility
+                    darkCssInput.visibility = visibility
+                    darkNinePatchInput.visibility = visibility
+                }
+                syncLightFontStatus = {
+                    lightFontStatus.text = "\u6d45\u8272\u5b57\u4f53\uff1a${dialogueHighlightFontSummary(lightFontSelection)}"
+                    lightFontStatus.typeface = androidTypefaceForFontSelection(lightFontSelection) ?: Typeface.DEFAULT
+                }
+                syncDarkFontStatus = {
+                    darkFontStatus.text = "\u6df1\u8272\u5b57\u4f53\uff1a" +
+                        if (darkFontSelection.isBlank()) "\u8ddf\u968f\u6d45\u8272\u5b57\u4f53" else displayFontName(darkFontSelection)
+                    darkFontStatus.typeface = androidTypefaceForFontSelection(darkFontSelection) ?: Typeface.DEFAULT
+                }
+                card.addView(settingsDialogTitle(activity, "\u9ad8\u4eae\u6837\u5f0f", colors))
                 card.addView(nameInput)
-                card.addView(settingsDialogHint(activity, "\u5b57\u4f53\u53ef\u586b\u5199\u5b57\u4f53\u5e93\u6587\u4ef6\u8def\u5f84\uff0c\u7559\u7a7a\u5219\u8ddf\u968f\u5168\u5c40\u5b57\u4f53\u3002", colors))
+                card.addView(settingsDialogHint(activity, "\u6df1\u8272\u9ed8\u8ba4\u5171\u7528\u6d45\u8272\u914d\u7f6e\uff1b\u5b57\u4f53\u4ece\u5b57\u4f53\u5e93\u9009\u62e9\uff0cCSS \u7528\u4e8e\u52a0\u7c97\u3001\u659c\u4f53\u3001\u4e0b\u5212\u7ebf\u7b49\u6837\u5f0f\u3002", colors))
                 card.addView(colorInput)
-                card.addView(fontInput)
+                syncLightFontStatus.invoke()
+                card.addView(lightFontStatus)
                 card.addView(cssInput)
                 card.addView(ninePatchInput)
-                card.addView(settingsDialogButtonRow(activity, listOf(finishButton, cancelButton)))
+                card.addView(darkToggleButton)
+                card.addView(darkColorInput)
+                syncDarkFontStatus.invoke()
+                card.addView(darkFontStatus)
+                card.addView(darkCssInput)
+                card.addView(darkNinePatchInput)
+                syncDarkInputs()
+                val buttons = if (style.id == ModuleSettings.DEFAULT_READER_HIGHLIGHT_STYLE_ID) {
+                    listOf(finishButton, cancelButton)
+                } else {
+                    listOf(deleteButton, finishButton, cancelButton)
+                }
+                card.addView(settingsDialogButtonRow(activity, buttons))
+                darkToggleButton.setOnClickListener {
+                    darkUsesLight = !darkUsesLight
+                    syncDarkInputs()
+                }
                 finishButton.setOnClickListener {
                     settings.setReaderHighlightStyle(
                         style.copy(
                             name = nameInput.text?.toString()?.trim().orEmpty().ifBlank { style.name },
                             color = colorInput.text?.toString()?.trim().orEmpty(),
-                            fontFamily = fontInput.text?.toString()?.trim().orEmpty(),
+                            fontFamily = lightFontSelection,
                             css = cssInput.text?.toString()?.trim().orEmpty(),
                             ninePatchPath = ninePatchInput.text?.toString()?.trim().orEmpty(),
+                            darkUsesLight = darkUsesLight,
+                            darkColor = darkColorInput.text?.toString()?.trim().orEmpty(),
+                            darkFontFamily = darkFontSelection,
+                            darkCss = darkCssInput.text?.toString()?.trim().orEmpty(),
+                            darkNinePatchPath = darkNinePatchInput.text?.toString()?.trim().orEmpty(),
                         ),
                     )
+                    setInjectedRouteState(currentInjectedRoute())
+                    dialog.dismiss()
+                }
+                deleteButton.setOnClickListener {
+                    settings.removeReaderHighlightStyle(style.id)
                     setInjectedRouteState(currentInjectedRoute())
                     dialog.dismiss()
                 }
@@ -1235,6 +1365,100 @@ class ReaMicroSettingsHook(
             }
         }
     }
+
+    private fun exportReaderHighlightStyle(style: ReaderHighlightStyle) {
+        val activity = activityProvider() ?: return
+        runCatching {
+            val fileName = "reamicro_highlight_style_${safeDownloadName(style.name)}_" +
+                SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date()) + ".json"
+            writeTextToDownloads(activity, fileName, readerHighlightStyleExportJson(style).toString(2))
+            showToast("\u5df2\u5bfc\u51fa\u9ad8\u4eae\u6837\u5f0f\uff1a$fileName")
+        }.onFailure {
+            showToast("\u5bfc\u51fa\u9ad8\u4eae\u6837\u5f0f\u5931\u8d25")
+            XposedBridge.log("$LOG_PREFIX export highlight style failed: ${it.stackTraceToString()}")
+        }
+    }
+
+    private fun openReaderHighlightStyleImportPicker() {
+        val activity = activityProvider() ?: return
+        runCatching {
+            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "application/json"
+                putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("application/json", "text/plain", "*/*"))
+            }
+            activity.startActivityForResult(intent, HIGHLIGHT_STYLE_DOCUMENT_REQUEST_CODE)
+        }.onFailure {
+            showToast("\u6253\u5f00\u9ad8\u4eae\u6837\u5f0f\u5bfc\u5165\u5931\u8d25")
+            XposedBridge.log("$LOG_PREFIX open highlight style import failed: ${it.stackTraceToString()}")
+        }
+    }
+
+    private fun importReaderHighlightStyleFromUri(activity: Activity, uri: Uri) {
+        runCatching {
+            val text = activity.contentResolver.openInputStream(uri)
+                ?.bufferedReader(Charsets.UTF_8)
+                ?.use { it.readText() }
+                ?: error("empty highlight style file")
+            val imported = readerHighlightStyleFromJson(JSONObject(text))
+            settings.setReaderHighlightStyle(imported)
+            setInjectedRouteState(currentInjectedRoute())
+            showToast("\u5df2\u5bfc\u5165\u9ad8\u4eae\u6837\u5f0f\uff1a${imported.name}")
+        }.onFailure {
+            showToast("\u5bfc\u5165\u9ad8\u4eae\u6837\u5f0f\u5931\u8d25")
+            XposedBridge.log("$LOG_PREFIX import highlight style failed: ${it.stackTraceToString()}")
+        }
+    }
+
+    private fun readerHighlightStyleExportJson(style: ReaderHighlightStyle): JSONObject =
+        JSONObject()
+            .put("type", "reader_highlight_style")
+            .put("version", 1)
+            .put("style", readerHighlightStyleJson(style))
+
+    private fun readerHighlightStyleJson(style: ReaderHighlightStyle): JSONObject =
+        JSONObject()
+            .put("id", style.id)
+            .put("name", style.name)
+            .put("color", style.color)
+            .put("fontFamily", style.fontFamily)
+            .put("css", style.css)
+            .put("ninePatchPath", style.ninePatchPath)
+            .put("darkUsesLight", style.darkUsesLight)
+            .put("darkColor", style.darkColor)
+            .put("darkFontFamily", style.darkFontFamily)
+            .put("darkCss", style.darkCss)
+            .put("darkNinePatchPath", style.darkNinePatchPath)
+
+    private fun readerHighlightStyleFromJson(root: JSONObject): ReaderHighlightStyle {
+        val item = root.optJSONObject("style") ?: root
+        val existingIds = settings.highlightSettings().styles.map { it.id }.toSet()
+        val rawId = item.optString("id").takeIf { it.isNotBlank() } ?: uniqueReaderHighlightId("style")
+        val id = if (rawId in existingIds || rawId == ModuleSettings.DEFAULT_READER_HIGHLIGHT_STYLE_ID) {
+            uniqueReaderHighlightId("style")
+        } else {
+            rawId
+        }
+        return ReaderHighlightStyle(
+            id = id,
+            name = item.optString("name").ifBlank { "\u5bfc\u5165\u9ad8\u4eae\u6837\u5f0f" },
+            color = item.optString("color").ifBlank { ModuleSettings.DEFAULT_READER_DIALOGUE_HIGHLIGHT_COLOR },
+            fontFamily = item.optString("fontFamily"),
+            css = item.optString("css"),
+            ninePatchPath = item.optString("ninePatchPath"),
+            darkUsesLight = item.optBoolean("darkUsesLight", true),
+            darkColor = item.optString("darkColor"),
+            darkFontFamily = item.optString("darkFontFamily"),
+            darkCss = item.optString("darkCss"),
+            darkNinePatchPath = item.optString("darkNinePatchPath"),
+        )
+    }
+
+    private fun safeDownloadName(value: String): String =
+        value.replace(Regex("[\\\\/:*?\"<>|\\p{Cntrl}]+"), "_")
+            .trim()
+            .take(80)
+            .ifBlank { "style" }
 
     private fun openReaderHighlightRuleDialog(rule: ReaderHighlightRule) {
         val activity = activityProvider() ?: return
@@ -1248,42 +1472,106 @@ class ReaMicroSettingsHook(
                 val nameInput = settingsDialogInput(activity, "\u89c4\u5219\u540d\u79f0", singleLine = true, colors = colors).apply {
                     setText(rule.name)
                 }
-                val styleInput = settingsDialogInput(activity, "\u6837\u5f0f ID", singleLine = true, colors = colors).apply {
-                    setText(rule.styleId)
+                val builtInRule = isDefaultReaderHighlightRule(rule.id)
+                var selectedType = if (builtInRule) {
+                    rule.type
+                } else {
+                    when (rule.type) {
+                        ReaderHighlightRuleType.FixedText,
+                        ReaderHighlightRuleType.Regex -> rule.type
+                        else -> ReaderHighlightRuleType.FixedText
+                    }
                 }
-                val enabledButton = settingsDialogButton(
+                var selectedStyleId = rule.styleId.ifBlank { ModuleSettings.DEFAULT_READER_HIGHLIGHT_STYLE_ID }
+                val typeStatus = settingsDialogStatus(activity, "\u7c7b\u578b\uff1a${highlightRuleTypeTitle(rule)}", colors)
+                val patternInput = settingsDialogInput(activity, "\u5339\u914d\u5185\u5bb9", singleLine = false, colors = colors).apply {
+                    setText(rule.pattern)
+                    minLines = 2
+                }
+                val styleStatus = settingsDialogStatus(
                     activity,
-                    if (rule.enabled) "\u7981\u7528" else "\u542f\u7528",
+                    "\u6837\u5f0f\uff1a${highlight.styleById(selectedStyleId).name}",
                     colors,
-                    SettingsDialogButtonRole.Neutral,
                 )
                 val finishButton = settingsDialogButton(activity, "\u5b8c\u6210", colors)
+                val deleteButton = settingsDialogButton(activity, "\u5220\u9664", colors, SettingsDialogButtonRole.Destructive)
                 val cancelButton = settingsDialogButton(activity, "\u53d6\u6d88", colors, SettingsDialogButtonRole.Neutral)
-                card.addView(settingsDialogTitle(activity, "\u9ad8\u4eae\u6587\u672c", colors))
+                fun syncTypeSelection() {
+                    typeStatus.text = "\u7c7b\u578b\uff1a${highlightRuleTypeTitle(rule.copy(type = selectedType))}"
+                    val needsPattern = selectedType == ReaderHighlightRuleType.FixedText ||
+                        selectedType == ReaderHighlightRuleType.Regex
+                    patternInput.visibility = if (needsPattern) View.VISIBLE else View.GONE
+                    patternInput.hint = when (selectedType) {
+                        ReaderHighlightRuleType.FixedText -> "\u56fa\u5b9a\u6587\u672c\uff0c\u4f8b\u5982\uff1a\u91cd\u8981"
+                        ReaderHighlightRuleType.Regex -> "\u6b63\u5219\u8868\u8fbe\u5f0f\uff0c\u4f8b\u5982\uff1a\\d{4}-\\d{2}-\\d{2}"
+                        else -> "\u5339\u914d\u5185\u5bb9"
+                    }
+                }
+                fun selectStyle(style: ReaderHighlightStyle) {
+                    selectedStyleId = style.id
+                    styleStatus.text = "\u6837\u5f0f\uff1a${style.name}"
+                }
+                card.addView(settingsDialogTitle(activity, "\u9ad8\u4eae\u89c4\u5219", colors))
                 card.addView(settingsDialogHint(activity, "${highlightRuleTypeTitle(rule)}\uff1a${highlightRuleDescription(rule)}", colors))
-                card.addView(nameInput)
-                card.addView(styleInput)
+                if (builtInRule) {
+                    card.addView(settingsDialogHint(activity, "\u5185\u7f6e\u89c4\u5219\u4ec5\u652f\u6301\u5207\u6362\u6837\u5f0f\uff0c\u5339\u914d\u6587\u672c\u7531\u6a21\u5757\u5185\u7f6e\u5904\u7406\u3002", colors))
+                } else {
+                    card.addView(nameInput)
+                    card.addView(typeStatus)
+                    card.addView(
+                        settingsDialogChoiceRow(activity, "\u56fa\u5b9a\u6587\u672c", colors) {
+                            selectedType = ReaderHighlightRuleType.FixedText
+                            syncTypeSelection()
+                        },
+                    )
+                    card.addView(
+                        settingsDialogChoiceRow(activity, "\u6b63\u5219", colors) {
+                            selectedType = ReaderHighlightRuleType.Regex
+                            syncTypeSelection()
+                        },
+                    )
+                    card.addView(patternInput)
+                    syncTypeSelection()
+                }
+                card.addView(styleStatus)
                 styles.forEach { style ->
                     card.addView(
                         settingsDialogChoiceRow(activity, "${style.name}  ${style.id}", colors) {
-                            styleInput.setText(style.id)
+                            selectStyle(style)
                         },
                     )
                 }
-                card.addView(settingsDialogButtonRow(activity, listOf(enabledButton, finishButton, cancelButton)))
-                enabledButton.setOnClickListener {
-                    settings.setReaderHighlightRule(rule.copy(enabled = !rule.enabled))
-                    setInjectedRouteState(currentInjectedRoute())
-                    dialog.dismiss()
+                val buttons = if (builtInRule) {
+                    listOf(finishButton, cancelButton)
+                } else {
+                    listOf(deleteButton, finishButton, cancelButton)
                 }
+                card.addView(settingsDialogButtonRow(activity, buttons))
                 finishButton.setOnClickListener {
                     settings.setReaderHighlightRule(
                         rule.copy(
-                            name = nameInput.text?.toString()?.trim().orEmpty().ifBlank { rule.name },
-                            styleId = styleInput.text?.toString()?.trim().orEmpty()
-                                .ifBlank { ModuleSettings.DEFAULT_READER_HIGHLIGHT_STYLE_ID },
+                            name = if (builtInRule) {
+                                rule.name
+                            } else {
+                                nameInput.text?.toString()?.trim().orEmpty().ifBlank { rule.name }
+                            },
+                            type = selectedType,
+                            styleId = selectedStyleId.ifBlank { ModuleSettings.DEFAULT_READER_HIGHLIGHT_STYLE_ID },
+                            pattern = if (
+                                selectedType == ReaderHighlightRuleType.FixedText ||
+                                selectedType == ReaderHighlightRuleType.Regex
+                            ) {
+                                patternInput.text?.toString()?.trim().orEmpty()
+                            } else {
+                                ""
+                            },
                         ),
                     )
+                    setInjectedRouteState(currentInjectedRoute())
+                    dialog.dismiss()
+                }
+                deleteButton.setOnClickListener {
+                    settings.removeReaderHighlightRule(rule.id)
                     setInjectedRouteState(currentInjectedRoute())
                     dialog.dismiss()
                 }
@@ -3105,6 +3393,126 @@ class ReaMicroSettingsHook(
             ).apply { bottomMargin = settingsDp(context, 8) }
         }
 
+    private fun addSettingsFontChoiceRows(
+        activity: Activity,
+        card: LinearLayout,
+        colors: SettingsDialogColors,
+        currentSelection: String,
+        clearTitle: String,
+        onSelected: (String) -> Unit,
+    ): List<View> {
+        val rows = mutableListOf<View>()
+        fun addRow(selection: String, title: String, subtitle: String? = null) {
+            val current = sameFontSelection(currentSelection, selection)
+            val row = settingsDialogFontChoiceRow(
+                context = activity,
+                title = if (current) "$title  \u5f53\u524d" else title,
+                subtitle = subtitle,
+                selection = selection,
+                colors = colors,
+            ) {
+                onSelected(selection)
+            }
+            rows.add(row)
+            card.addView(row)
+        }
+        addRow("", clearTitle)
+        builtinFontSelections().forEach { option ->
+            addRow(option.value, option.title, option.subtitle)
+        }
+        val files = listFontFiles()
+        files.forEach { file ->
+            addRow(file.absolutePath, displayFontName(file.absolutePath), file.name)
+        }
+        if (files.isEmpty()) {
+            val row = settingsDialogStatus(activity, "\u5b57\u4f53\u5e93\u6682\u65e0\u5b57\u4f53\uff0c\u53ef\u5148\u5728\u5b57\u4f53\u7ba1\u7406\u4e2d\u6dfb\u52a0\u3002", colors)
+            rows.add(row)
+            card.addView(row)
+        }
+        return rows
+    }
+
+    private fun openSettingsFontSelectionDialog(
+        activity: Activity,
+        title: String,
+        currentSelection: String,
+        clearTitle: String,
+        onSelected: (String) -> Unit,
+    ) {
+        runCatching {
+            val colors = SettingsDialogColors(activity)
+            val dialog = Dialog(activity)
+            val card = settingsDialogCard(activity, colors)
+            fun addRow(selection: String, rowTitle: String, subtitle: String? = null) {
+                val current = sameFontSelection(currentSelection, selection)
+                card.addView(
+                    settingsDialogFontChoiceRow(
+                        context = activity,
+                        title = if (current) "$rowTitle  \u5f53\u524d" else rowTitle,
+                        subtitle = subtitle,
+                        selection = selection,
+                        colors = colors,
+                    ) {
+                        onSelected(selection)
+                        dialog.dismiss()
+                    },
+                )
+            }
+            card.addView(settingsDialogTitle(activity, title, colors))
+            addRow("", clearTitle)
+            builtinFontSelections().forEach { option ->
+                addRow(option.value, option.title, option.subtitle)
+            }
+            val files = listFontFiles()
+            files.forEach { file ->
+                addRow(file.absolutePath, displayFontName(file.absolutePath), file.name)
+            }
+            if (files.isEmpty()) {
+                card.addView(settingsDialogHint(activity, "\u5b57\u4f53\u5e93\u6682\u65e0\u5b57\u4f53\uff0c\u53ef\u5148\u5728\u5b57\u4f53\u7ba1\u7406\u4e2d\u6dfb\u52a0\u3002", colors))
+            }
+            showSettingsDialog(dialog, settingsDialogScroll(activity, card), activity, 0.9f)
+        }.onFailure {
+            showToast("\u6253\u5f00\u5b57\u4f53\u9009\u62e9\u5931\u8d25")
+            XposedBridge.log("$LOG_PREFIX open settings font selection failed: ${it.stackTraceToString()}")
+        }
+    }
+
+    private fun settingsDialogFontChoiceRow(
+        context: Context,
+        title: String,
+        subtitle: String?,
+        selection: String,
+        colors: SettingsDialogColors,
+        onClick: () -> Unit,
+    ): TextView =
+        TextView(context).apply {
+            text = if (subtitle.isNullOrBlank()) title else "$title\n$subtitle"
+            textSize = 14f
+            setTextColor(colors.title)
+            typeface = androidTypefaceForFontSelection(selection) ?: Typeface.DEFAULT
+            setSingleLine(false)
+            setPadding(
+                settingsDp(context, 12),
+                settingsDp(context, 10),
+                settingsDp(context, 12),
+                settingsDp(context, 10),
+            )
+            background = settingsRoundedRect(colors.field, settingsDp(context, 12), colors.border)
+            setOnClickListener { onClick() }
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { bottomMargin = settingsDp(context, 8) }
+        }
+
+    private fun androidTypefaceForFontSelection(selection: String): Typeface? {
+        if (selection.isBlank()) return null
+        if (selection == FAMILY_SYSTEM) return Typeface.DEFAULT
+        val file = File(selection)
+        if (!file.isFile || !isFontFileName(file.name)) return null
+        return runCatching { Typeface.createFromFile(file) }.getOrNull()
+    }
+
     private fun settingsRoundedRect(fill: Int, radiusPx: Int, stroke: Int = Color.TRANSPARENT): GradientDrawable =
         GradientDrawable().apply {
             shape = GradientDrawable.RECTANGLE
@@ -4308,7 +4716,12 @@ class ReaMicroSettingsHook(
 
     private fun highlightStyleSummary(style: ReaderHighlightStyle): String =
         listOfNotNull(
-            dialogueHighlightColorSummary(style.color),
+            "\u6d45\u8272 ${dialogueHighlightColorSummary(style.color)}",
+            if (style.darkUsesLight) {
+                "\u6df1\u8272\u5171\u7528"
+            } else {
+                "\u6df1\u8272 ${dialogueHighlightColorSummary(style.darkColor.ifBlank { style.color })}"
+            },
             dialogueHighlightFontSummary(style.fontFamily),
             style.css.takeIf { it.isNotBlank() }?.let { "CSS" },
             style.ninePatchPath.takeIf { it.isNotBlank() }?.let { ".9.png" },
@@ -4316,15 +4729,62 @@ class ReaMicroSettingsHook(
 
     private fun highlightRuleTypeTitle(rule: ReaderHighlightRule): String =
         when (rule.type) {
-            com.reamicro.fix.settings.ReaderHighlightRuleType.DoubleQuoteDialogue -> "\u53cc\u5f15\u53f7\u5bf9\u8bdd"
-            com.reamicro.fix.settings.ReaderHighlightRuleType.SingleQuotePhrase -> "\u5355\u5f15\u53f7\u8bcd\u7ec4"
+            ReaderHighlightRuleType.DoubleQuoteDialogue -> "\u53cc\u5f15\u53f7\u5bf9\u8bdd"
+            ReaderHighlightRuleType.SingleQuotePhrase -> "\u5355\u5f15\u53f7\u8bcd\u7ec4"
+            ReaderHighlightRuleType.FixedText -> "\u56fa\u5b9a\u6587\u672c"
+            ReaderHighlightRuleType.Regex -> "\u6b63\u5219"
         }
 
     private fun highlightRuleDescription(rule: ReaderHighlightRule): String =
         when (rule.type) {
-            com.reamicro.fix.settings.ReaderHighlightRuleType.DoubleQuoteDialogue -> "\u5339\u914d\u540c\u6bb5\u5185\u7684\u201c\u2026\u201d\u300c\u2026\u300d\u300e\u2026\u300f\u548c \"...\""
-            com.reamicro.fix.settings.ReaderHighlightRuleType.SingleQuotePhrase -> "\u5339\u914d\u540c\u6bb5\u5185\u7684\u2018\u2026\u2019 \u548c '...'"
+            ReaderHighlightRuleType.DoubleQuoteDialogue -> "\u5339\u914d\u540c\u6bb5\u5185\u7684\u201c\u2026\u201d\u300c\u2026\u300d\u300e\u2026\u300f\u548c \"...\""
+            ReaderHighlightRuleType.SingleQuotePhrase -> "\u5339\u914d\u540c\u6bb5\u5185\u7684\u2018\u2026\u2019 \u548c '...'"
+            ReaderHighlightRuleType.FixedText -> "\u6309\u5b57\u9762\u91cf\u5339\u914d\u56fa\u5b9a\u6587\u672c"
+            ReaderHighlightRuleType.Regex -> "\u6309\u6b63\u5219\u8868\u8fbe\u5f0f\u5339\u914d\u6587\u672c"
         }
+
+    private fun highlightRuleSummary(rule: ReaderHighlightRule): String {
+        val base = highlightRuleTypeTitle(rule)
+        val pattern = rule.pattern.takeIf {
+            rule.type == ReaderHighlightRuleType.FixedText || rule.type == ReaderHighlightRuleType.Regex
+        }?.compactOnlineSourceLine()
+        return if (pattern.isNullOrBlank()) base else "$base: $pattern"
+    }
+
+    private fun newReaderHighlightStyle(): ReaderHighlightStyle {
+        val index = settings.highlightSettings().styles.size + 1
+        return ReaderHighlightStyle(
+            id = uniqueReaderHighlightId("style"),
+            name = "\u9ad8\u4eae\u6837\u5f0f $index",
+            color = ModuleSettings.DEFAULT_READER_DIALOGUE_HIGHLIGHT_COLOR,
+        )
+    }
+
+    private fun newReaderHighlightRule(): ReaderHighlightRule {
+        val index = settings.highlightSettings().rules.size + 1
+        return ReaderHighlightRule(
+            id = uniqueReaderHighlightId("rule"),
+            name = "\u9ad8\u4eae\u89c4\u5219 $index",
+            type = ReaderHighlightRuleType.FixedText,
+            styleId = ModuleSettings.DEFAULT_READER_HIGHLIGHT_STYLE_ID,
+        )
+    }
+
+    private fun uniqueReaderHighlightId(prefix: String): String {
+        val highlight = settings.highlightSettings()
+        val existing = highlight.styles.map { it.id }.toSet() + highlight.rules.map { it.id }.toSet()
+        var id = "${prefix}_${System.currentTimeMillis()}"
+        var suffix = 1
+        while (id in existing) {
+            id = "${prefix}_${System.currentTimeMillis()}_$suffix"
+            suffix++
+        }
+        return id
+    }
+
+    private fun isDefaultReaderHighlightRule(ruleId: String): Boolean =
+        ruleId == ModuleSettings.DEFAULT_READER_DOUBLE_QUOTE_RULE_ID ||
+            ruleId == ModuleSettings.DEFAULT_READER_SINGLE_QUOTE_RULE_ID
 
     private fun currentFontSelection(target: FontPickerTarget): String {
         val config = settings.fontSettings()
@@ -4516,6 +4976,7 @@ class ReaMicroSettingsHook(
                     val uri = intent.data ?: return
                     when (requestCode) {
                         FONT_DOCUMENT_REQUEST_CODE -> copyFontUriToLibrary(activity, uri)
+                        HIGHLIGHT_STYLE_DOCUMENT_REQUEST_CODE -> importReaderHighlightStyleFromUri(activity, uri)
                         ACCOUNT_CREDENTIAL_DOCUMENT_REQUEST_CODE -> importCredentialFromUri(activity, uri)
                         ACCOUNT_DATA_DOCUMENT_REQUEST_CODE -> importAccountDataFromUri(activity, uri)
                     }
@@ -4902,6 +5363,42 @@ class ReaMicroSettingsHook(
         val onCheckedChange = functionProxy("ModuleSwitch${row.key}", FUNCTION1_CLASS) { args ->
             val newValue = args?.getOrNull(0) as? Boolean ?: return@functionProxy targetUnit()
             updateRow(row.key, row.onChanged(newValue, ::updateRow))
+            targetUnit()
+        }
+        method(SWITCH_KT_CLASS, SWITCH_METHOD, 10).invoke(
+            null,
+            checked,
+            onCheckedChange,
+            switchModifier(),
+            null,
+            false,
+            switchColors(composer),
+            null,
+            composer,
+            0,
+            88,
+        )
+    }
+
+    private fun renderHostActionSwitch(
+        key: String,
+        checked: Boolean,
+        composer: Any,
+        onChanged: (Boolean) -> Unit,
+    ) {
+        val state = rememberBooleanState(composer, checked)
+        fun updateChecked(value: Boolean) {
+            state.javaClass.methods.firstOrNull { it.name == "setValue" && it.parameterTypes.size == 1 }
+                ?.invoke(state, value)
+        }
+        val rememberedChecked = state.method0("getValue") as? Boolean ?: checked
+        if (rememberedChecked != checked) {
+            updateChecked(checked)
+        }
+        val onCheckedChange = functionProxy("ActionSwitch$key", FUNCTION1_CLASS) { args ->
+            val newValue = args?.getOrNull(0) as? Boolean ?: return@functionProxy targetUnit()
+            updateChecked(newValue)
+            onChanged(newValue)
             targetUnit()
         }
         method(SWITCH_KT_CLASS, SWITCH_METHOD, 10).invoke(
@@ -5603,8 +6100,8 @@ class ReaMicroSettingsHook(
         object AssociationCompletionSettings : InjectedRoute("\u5173\u8054\u8865\u5168")
         object ReaderCompletionSettings : InjectedRoute("\u9605\u8bfb\u8865\u5168")
         object ReaderHighlightSettings : InjectedRoute(READER_HIGHLIGHT_SETTINGS_TITLE)
-        object ReaderHighlightConfigSettings : InjectedRoute("\u9ad8\u4eae\u914d\u7f6e")
-        object ReaderHighlightTextSettings : InjectedRoute("\u9ad8\u4eae\u6587\u672c")
+        object ReaderHighlightConfigSettings : InjectedRoute("\u9ad8\u4eae\u6837\u5f0f")
+        object ReaderHighlightTextSettings : InjectedRoute("\u9ad8\u4eae\u89c4\u5219")
         object ReaderHighlightColorPicker : InjectedRoute("\u5bf9\u8bdd\u989c\u8272")
         object CloudCompletionSettings : InjectedRoute("\u4e91\u76d8\u8865\u5168")
         object RotationCompletionSettings : InjectedRoute("\u65cb\u8f6c\u8865\u5168")
@@ -5870,6 +6367,7 @@ class ReaMicroSettingsHook(
         const val ACCOUNT_CREDENTIAL_DOCUMENT_REQUEST_CODE = 0x524D47
         const val ACCOUNT_DATA_DOCUMENT_REQUEST_CODE = 0x524D48
         const val ONLINE_SOURCE_DOCUMENT_REQUEST_CODE = 0x524D49
+        const val HIGHLIGHT_STYLE_DOCUMENT_REQUEST_CODE = 0x524D4A
         const val ACCOUNT_RESTART_DELAY_MS = 1_400L
         const val ACCOUNT_RESTART_KILL_DELAY_MS = 250L
         const val ACCOUNT_RESTART_COMMAND_DELAY_SECONDS = "0.8"
