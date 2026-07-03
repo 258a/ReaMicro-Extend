@@ -1219,7 +1219,7 @@ class ReaMicroSettingsHook(
                             key = "reader_highlight_book_${group.bookKey.hashCode()}",
                             title = group.bookTitle,
                             subtitle = group.subtitle,
-                            trailing = "\u672c\u4e66",
+                            trailing = "\u5355\u4e66",
                             singleLineSubtitle = true,
                             onClick = {
                                 openNestedInjectedRoute(
