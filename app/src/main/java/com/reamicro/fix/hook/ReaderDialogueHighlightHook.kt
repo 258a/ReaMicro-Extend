@@ -59,8 +59,17 @@ class ReaderDialogueHighlightHook(
             val highlight = settings.highlightSettings()
             val enabledRules = highlight.rules.filter { it.enabled }
             if (enabledRules.isEmpty()) return
+            val protectedRanges = protectedStyledElementRanges(contentDom, text)
+            val singleQuoteRanges = enabledRules
+                .filter { it.type == ReaderHighlightRuleType.SingleQuotePhrase }
+                .flatMap { findQuoteRanges(text, SINGLE_QUOTES) }
             val rangeObjects = enabledRules.flatMap { rule ->
-                val ranges = findRanges(text, rule)
+                val ranges = findRanges(
+                    text = text,
+                    rule = rule,
+                    protectedRanges = protectedRanges,
+                    singleQuoteRanges = singleQuoteRanges,
+                )
                 if (ranges.isEmpty()) return@flatMap emptyList()
                 val style = createHighlightSpanStyle(highlight.styleById(rule.styleId)) ?: return@flatMap emptyList()
                 ranges.mapNotNull { range -> createAnnotatedRange(style, range.first, range.last) }
@@ -79,11 +88,86 @@ class ReaderDialogueHighlightHook(
         }
     }
 
-    private fun findRanges(text: String, rule: ReaderHighlightRule): List<IntRange> =
+    private fun findRanges(
+        text: String,
+        rule: ReaderHighlightRule,
+        protectedRanges: List<IntRange>,
+        singleQuoteRanges: List<IntRange>,
+    ): List<IntRange> =
         when (rule.type) {
-            ReaderHighlightRuleType.DoubleQuoteDialogue -> findQuoteRanges(text, DOUBLE_QUOTES)
+            ReaderHighlightRuleType.DoubleQuoteDialogue -> {
+                val excluded = protectedRanges + singleQuoteRanges
+                findQuoteRanges(text, DOUBLE_QUOTES).flatMap { range -> subtractRanges(range, excluded) }
+            }
             ReaderHighlightRuleType.SingleQuotePhrase -> findQuoteRanges(text, SINGLE_QUOTES)
         }
+
+    private fun protectedStyledElementRanges(contentDom: Any, renderedText: String): List<IntRange> {
+        val children = callNoArg(contentDom, "getChildren") as? List<*> ?: return emptyList()
+        val ranges = ArrayList<IntRange>()
+        val text = StringBuilder(renderedText.length)
+        children.filterNotNull().forEach { child ->
+            appendNodeTextRanges(child, text, ranges)
+        }
+        if (text.length != renderedText.length || text.toString() != renderedText) {
+            logProtectedRangeMismatch(text.length, renderedText.length)
+            return emptyList()
+        }
+        return ranges
+    }
+
+    private fun appendNodeTextRanges(node: Any, text: StringBuilder, ranges: MutableList<IntRange>) {
+        val tag = callNoArg(node, "getTag")?.toString().orEmpty()
+        val children = callNoArg(node, "getChildren") as? List<*>
+        if (children.isNullOrEmpty()) {
+            text.append(callNoArg(node, "getText")?.toString().orEmpty())
+            return
+        }
+        val start = text.length
+        children.filterNotNull().forEach { child ->
+            appendNodeTextRanges(child, text, ranges)
+        }
+        val end = text.length
+        if (end > start && shouldProtectStyledElement(node, tag)) {
+            ranges.add(exclusiveRange(start, end))
+        }
+    }
+
+    private fun shouldProtectStyledElement(node: Any, tag: String): Boolean {
+        if (tag.isBlank() || tag == MARKUP_TEXT) return false
+        val isNonStyleSpan = runCatching {
+            node.javaClass.methods.firstOrNull {
+                it.name == "isNonStyleSpan" && it.parameterTypes.isEmpty()
+            }?.invoke(node) as? Boolean
+        }.getOrNull() == true
+        if (isNonStyleSpan) return false
+        if (tag in UNPROTECTED_INLINE_TAGS) return false
+        return true
+    }
+
+    private fun subtractRanges(source: IntRange, exclusions: List<IntRange>): List<IntRange> {
+        val normalized = exclusions
+            .mapNotNull { overlap(source, it) }
+            .sortedBy { it.first }
+        if (normalized.isEmpty()) return listOf(source)
+        val result = ArrayList<IntRange>()
+        var cursor = source.first
+        normalized.forEach { excluded ->
+            if (excluded.first > cursor) result.add(exclusiveRange(cursor, excluded.first))
+            cursor = maxOf(cursor, excluded.last)
+        }
+        if (cursor < source.last) result.add(exclusiveRange(cursor, source.last))
+        return result.filter { it.last > it.first }
+    }
+
+    private fun overlap(left: IntRange, right: IntRange): IntRange? {
+        val start = maxOf(left.first, right.first)
+        val end = minOf(left.last, right.last)
+        return if (end > start) exclusiveRange(start, end) else null
+    }
+
+    private fun exclusiveRange(start: Int, endExclusive: Int): IntRange =
+        start..endExclusive
 
     private fun findQuoteRanges(text: String, quotes: Map<Char, Char>): List<IntRange> {
         val ranges = ArrayList<IntRange>()
@@ -298,6 +382,13 @@ class ReaderDialogueHighlightHook(
         XposedBridge.log("$LOG_PREFIX dialogue highlight applied ranges=$count text=${text.take(24)}")
     }
 
+    private fun logProtectedRangeMismatch(mappedLength: Int, renderedLength: Int) {
+        val key = "protected-range-mismatch|$mappedLength|$renderedLength"
+        if (key == lastAppliedLogKey) return
+        lastAppliedLogKey = key
+        XposedBridge.log("$LOG_PREFIX dialogue highlight protected ranges skipped mapped=$mappedLength rendered=$renderedLength")
+    }
+
     private fun cls(className: String): Class<*> =
         XposedHelpers.findClass(className, classLoader)
 
@@ -372,10 +463,12 @@ class ReaderDialogueHighlightHook(
         const val FAMILY_SOURCE_HAN_SERIF = "serif"
         const val SPAN_STYLE_DEFAULT_MASK_EXCEPT_COLOR = 65534
         const val SPAN_STYLE_DEFAULT_MASK_EXCEPT_COLOR_AND_FONT = 65502
+        const val MARKUP_TEXT = "#text"
         val CONTENT_DOM_CLASS_CANDIDATES = listOf(
             "org.epub.html.node.ContentDom",
             "app.zhendong.epub.node.ContentDom",
         )
+        val UNPROTECTED_INLINE_TAGS = emptySet<String>()
         val DOUBLE_QUOTES = mapOf(
             '\u201c' to '\u201d',
             '\u300c' to '\u300d',
