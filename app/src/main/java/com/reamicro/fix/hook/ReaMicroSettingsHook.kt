@@ -118,6 +118,7 @@ class ReaMicroSettingsHook(
     @Volatile private var onlineSourceVersionUiState: Any? = null
     @Volatile private var aiApiVersionUiState: Any? = null
     @Volatile private var readerHighlightVersionUiState: Any? = null
+    @Volatile private var profileBackgroundVersionUiState: Any? = null
     @Volatile private var pendingDeleteFontUiState: Any? = null
     @Volatile private var lastFontImportToken: String = ""
     @Volatile private var lastFontImportAtMs: Long = 0L
@@ -1543,6 +1544,7 @@ class ReaMicroSettingsHook(
     private fun renderProfileBackgroundSettingsContent(innerPaddings: Any, composer: Any) {
         val listContent = functionProxy("ProfileBackgroundSettingsList", FUNCTION1_CLASS) { args ->
             val lazyListScope = args?.getOrNull(0) ?: return@functionProxy targetUnit()
+            profileBackgroundVersionValue()
             val snapshot = settings.snapshot()
             val switchRows = listOf(
                 ToggleRow(
@@ -1551,6 +1553,7 @@ class ReaMicroSettingsHook(
                     checked = snapshot.profileBackgroundEnabled,
                     onChanged = { checked, _ ->
                         settings.setProfileBackgroundEnabled(checked)
+                        bumpProfileBackgroundVersion()
                         checked
                     },
                 ),
@@ -1560,6 +1563,7 @@ class ReaMicroSettingsHook(
                     checked = snapshot.profileBackgroundUseImage,
                     onChanged = { checked, _ ->
                         settings.setProfileBackgroundUseImage(checked)
+                        bumpProfileBackgroundVersion()
                         checked
                     },
                 ),
@@ -1621,7 +1625,7 @@ class ReaMicroSettingsHook(
                     card.addView(profileBackgroundColorOptionRow(activity, option, current, colors) {
                         settings.setProfileBackgroundColor(option.value)
                         dialog.dismiss()
-                        refreshCurrentInjectedRoute()
+                        bumpProfileBackgroundVersion()
                     })
                 }
                 val actions = settingsDialogActions(activity)
@@ -1654,7 +1658,7 @@ class ReaMicroSettingsHook(
                         val option = PROFILE_BACKGROUND_CROP_POSITION_OPTIONS.getOrNull(which) ?: return@setSingleChoiceItems
                         settings.setProfileBackgroundCropPosition(option.value)
                         dialog.dismiss()
-                        refreshCurrentInjectedRoute()
+                        bumpProfileBackgroundVersion()
                     }
                     .setNegativeButton("\u5173\u95ed", null)
                     .show()
@@ -2372,7 +2376,7 @@ class ReaMicroSettingsHook(
             settings.setProfileBackgroundImage(target.absolutePath)
             settings.setProfileBackgroundUseImage(true)
             showToast("\u5df2\u9009\u62e9\u80cc\u666f\u56fe\u7247\uff1a${target.name}")
-            refreshCurrentInjectedRoute()
+            bumpProfileBackgroundVersion()
         }.onFailure {
             showToast(it.message ?: "\u9009\u62e9\u80cc\u666f\u56fe\u7247\u5931\u8d25")
             XposedBridge.log("$LOG_PREFIX import profile background image failed: ${it.stackTraceToString()}")
@@ -7296,6 +7300,22 @@ class ReaMicroSettingsHook(
 
     private fun bumpReaderHighlightVersion() {
         val state = readerHighlightVersionState()
+        val value = (state.method0("getValue") as? Number)?.toInt() ?: 0
+        state.javaClass.methods
+            .firstOrNull { it.name == "setValue" && it.parameterTypes.size == 1 }
+            ?.invoke(state, value + 1)
+    }
+
+    private fun profileBackgroundVersionState(): Any {
+        profileBackgroundVersionUiState?.let { return it }
+        return mutableState(0).also { profileBackgroundVersionUiState = it }
+    }
+
+    private fun profileBackgroundVersionValue(): Int =
+        (profileBackgroundVersionState().method0("getValue") as? Number)?.toInt() ?: 0
+
+    private fun bumpProfileBackgroundVersion() {
+        val state = profileBackgroundVersionState()
         val value = (state.method0("getValue") as? Number)?.toInt() ?: 0
         state.javaClass.methods
             .firstOrNull { it.name == "setValue" && it.parameterTypes.size == 1 }
