@@ -255,20 +255,20 @@ class XposedModuleSettings(
 
     fun setReaderHighlightStyle(style: ReaderHighlightStyle) {
         val current = highlightSettings()
-        val next = current.styles
-            .filterNot { it.id == style.id }
-            .plus(
-                style.copy(
-                    color = normalizeHighlightColor(style.color),
-                    darkUsesLight = true,
-                    darkColor = "",
-                    css = sanitizeHighlightCss(style.css),
-                    darkFontFamily = "",
-                    darkCss = "",
-                    darkNinePatchPath = "",
-                    darkNinePatchSlice = "",
-                ),
-            )
+        val sanitized = style.copy(
+            color = normalizeHighlightColor(style.color),
+            darkUsesLight = true,
+            darkColor = "",
+            css = sanitizeHighlightCss(style.css),
+            darkFontFamily = "",
+            darkCss = "",
+            darkNinePatchPath = "",
+            darkNinePatchSlice = "",
+        )
+        val isExisting = current.styles.any { it.id == style.id }
+        val remaining = current.styles.filterNot { it.id == style.id }
+        // 修改已有样式：置顶（新修改的在最上面）；新增/导入样式：追加到末尾（新导入的在最下面）。
+        val next = if (isExisting) listOf(sanitized) + remaining else remaining + sanitized
         putString(ModuleSettings.KEY_READER_HIGHLIGHT_STYLES, encodeHighlightStyles(next))
         notifyReaderHighlightChanged("highlight-style")
     }

@@ -1,4 +1,4 @@
-﻿package com.reamicro.fix.hook
+package com.reamicro.fix.hook
 
 import android.app.Activity
 import android.app.Dialog
@@ -97,6 +97,7 @@ import java.net.URI
 import java.net.URL
 import java.net.URLDecoder
 import java.net.URLEncoder
+import java.nio.charset.Charset
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.UUID
@@ -4880,10 +4881,9 @@ class WebDavDriveHook(
             return OnlineSearchGroup(source, query, emptyList(), "源缺少 searchUrl")
         }
         return runCatching {
-            val requestUrl = buildOnlineSearchUrl(source, query)
-            if (requestUrl.isBlank()) error("暂不支持脚本型 searchUrl")
+            val request = buildOnlineSearchRequest(source, query)
             val response = OnlineConcurrentRateLimiter.withLimitBlocking(source) {
-                requestOnlineSearch(source, requestUrl)
+                requestOnlineSearch(source, request)
             }
             val parsedResults = parseOnlineSearchResults(source, query, response)
                 .distinctBy { "${it.name}|${it.author}|${it.detailUrl}" }
@@ -4988,6 +4988,62 @@ class WebDavDriveHook(
         }.getOrDefault(result)
     }
 
+    private data class OnlineSearchRequest(
+        val url: String,
+        val method: String = "GET",
+        val body: String? = null,
+        val charset: String = "UTF-8",
+        val headers: Map<String, String> = emptyMap(),
+    )
+
+    private fun buildOnlineSearchRequest(source: OnlineSourceEntry, query: String): OnlineSearchRequest {
+        val text = source.searchUrl.trim()
+        val raw = if (text.startsWith("@js:", ignoreCase = true) || text.startsWith("<js>", ignoreCase = true)) {
+            text
+        } else {
+            text.lineSequence().map { it.trim() }.firstOrNull { it.isNotBlank() }.orEmpty()
+        }
+        if (raw.startsWith("@js:", ignoreCase = true) || raw.startsWith("<js>", ignoreCase = true)) {
+            val url = buildOnlineSearchUrlFromJs(source, raw, query)
+            if (url.isBlank()) error("暂不支持脚本型 searchUrl")
+            return OnlineSearchRequest(url)
+        }
+        // 解析 legado options block：url,{"method":"POST","body":"searchkey={{key}}","charset":"gbk","headers":{...}}
+        val splitIdx = indexOfOptionsBlock(raw)
+        val urlPart = if (splitIdx < 0) raw else raw.substring(0, splitIdx).trim()
+        val optionsJson = if (splitIdx < 0) null else raw.substring(splitIdx).trim().removePrefix(",").trim()
+        val options = parseOptionsJson(optionsJson)
+        val charset = options.optString("charset", "UTF-8").ifBlank { "UTF-8" }
+        val method = options.optString("method", "GET").ifBlank { "GET" }.uppercase()
+        val bodyTemplate = options.optString("body", "").orEmpty()
+        val resolvedUrl = applyOnlineTemplate(urlPart, null, sourceBaseUrl(source), query, encodeQuery = true, encodeCharset = charset)
+        val url = resolveOnlineUrl(sourceBaseUrl(source), resolvedUrl)
+        val body = if (bodyTemplate.isNotBlank()) {
+            applyOnlineTemplate(bodyTemplate, null, sourceBaseUrl(source), query, encodeQuery = true, encodeCharset = charset)
+        } else null
+        val headers = runCatching { options.optJSONObject("headers") }.getOrNull()?.let { h ->
+            h.keys().asSequence().associateWith { h.optString(it, "") }
+        } ?: emptyMap()
+        return OnlineSearchRequest(url, method, body, charset, headers)
+    }
+
+    // 定位 legado searchUrl 中 options block 的起始逗号位置（",{" 之前）。
+    private fun indexOfOptionsBlock(raw: String): Int {
+        // 避免误匹配 URL 自身的查询参数；legado options 块以 ",{" 或 ", {" 开头且是合法 JSON 对象。
+        val candidates = listOf(",{", ", {")
+        for (sep in candidates) {
+            val idx = raw.indexOf(sep)
+            if (idx > 0) {
+                val candidate = raw.substring(idx).removePrefix(",").trim()
+                if (candidate.startsWith("{") && candidate.endsWith("}")) return idx
+            }
+        }
+        return -1
+    }
+
+    private fun parseOptionsJson(raw: String?): JSONObject =
+        if (raw.isNullOrBlank()) JSONObject() else runCatching { JSONObject(raw) }.getOrDefault(JSONObject())
+
     private fun buildOnlineSearchUrl(source: OnlineSourceEntry, query: String): String {
         val text = source.searchUrl.trim()
         val raw = if (text.startsWith("@js:", ignoreCase = true) || text.startsWith("<js>", ignoreCase = true)) {
@@ -5016,29 +5072,47 @@ class WebDavDriveHook(
         )
     }
 
-    private fun requestOnlineSearch(source: OnlineSourceEntry, requestUrl: String): OnlineHttpResponse {
+    private fun requestOnlineSearch(source: OnlineSourceEntry, requestUrl: String): OnlineHttpResponse =
+        requestOnlineSearch(source, OnlineSearchRequest(url = requestUrl))
+
+    private fun requestOnlineSearch(source: OnlineSourceEntry, request: OnlineSearchRequest): OnlineHttpResponse {
+        val requestUrl = request.url
         if (requestUrl.startsWith("data:", ignoreCase = true)) {
             return OnlineHttpResponse(requestUrl, onlineDataUrlStringResponse(requestUrl))
         }
+        val charset = runCatching { Charset.forName(request.charset) }.getOrDefault(Charsets.UTF_8)
+        val isPost = request.method == "POST" && request.body != null
         return withOnlineCleartextAllowed(requestUrl) {
             fun execute(authRetried: Boolean): OnlineHttpResponse {
                 val connection = (URL(requestUrl).openConnection() as HttpURLConnection).apply {
-                    requestMethod = "GET"
+                    requestMethod = if (isPost) "POST" else "GET"
                     connectTimeout = onlineConnectTimeoutMillis(source)
                     readTimeout = onlineReadTimeoutMillis(source)
                     setRequestProperty("User-Agent", "Mozilla/5.0 ReaMicro-Extend/online-source")
                     setRequestProperty("Accept", "application/json,text/html,application/xhtml+xml,*/*")
+                    if (isPost) {
+                        setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
+                    }
                     parseOnlineHeaders(source.header).forEach { (name, value) ->
+                        if (name.isNotBlank() && value.isNotBlank()) setRequestProperty(name, value)
+                    }
+                    request.headers.forEach { (name, value) ->
                         if (name.isNotBlank() && value.isNotBlank()) setRequestProperty(name, value)
                     }
                     OnlineSourceAuth.requestHeaders(currentApplicationContext() ?: currentContext(), source).forEach { (name, value) ->
                         if (name.isNotBlank() && value.isNotBlank()) setRequestProperty(name, value)
                     }
+                    if (isPost) {
+                        doOutput = true
+                        val bodyBytes = request.body!!.toByteArray(charset)
+                        setRequestProperty("Content-Length", bodyBytes.size.toString())
+                        outputStream.use { it.write(bodyBytes) }
+                    }
                 }
                 try {
                     val code = connection.responseCode
                     val stream = if (code in 200..299) connection.inputStream else connection.errorStream
-                    val body = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
+                    val body = stream?.bufferedReader(charset)?.use { it.readText() }.orEmpty()
                     if (code in 200..299) return OnlineHttpResponse(connection.url.toString(), body)
                     if ((code == 401 || code == 403) && !authRetried && source.hasLoginConfig) {
                         val login = OnlineSourceAuth.loginWithSavedCredentials(currentApplicationContext() ?: currentContext(), source)
@@ -5503,13 +5577,14 @@ class WebDavDriveHook(
         query: String?,
         page: Int = 1,
         encodeQuery: Boolean = false,
+        encodeCharset: String = "UTF-8",
     ): String {
         var text = raw
             .replace("{{(page-1)*10}}", ((page - 1) * 10).toString())
             .replace("{{(page - 1) * 10}}", ((page - 1) * 10).toString())
             .replace("{{page}}", page.toString())
         if (query != null) {
-            val key = if (encodeQuery) URLEncoder.encode(query, "UTF-8") else query
+            val key = if (encodeQuery) URLEncoder.encode(query, encodeCharset) else query
             listOf("{{key}}", "{{keyword}}", "{{searchKey}}", "{key}", "{keyword}", "%s").forEach { token ->
                 text = text.replace(token, key, ignoreCase = true)
             }
@@ -5526,7 +5601,11 @@ class WebDavDriveHook(
                 expr.startsWith("$") || expr.startsWith(".") -> onlineJsonString(node, expr)
                 expr.equals("page", ignoreCase = true) -> page.toString()
                 expr.equals("key", ignoreCase = true) || expr.equals("keyword", ignoreCase = true) ->
-                    query?.let { if (encodeQuery) URLEncoder.encode(it, "UTF-8") else it }.orEmpty()
+                    query?.let { if (encodeQuery) URLEncoder.encode(it, encodeCharset) else it }.orEmpty()
+                // legado JS：java.put('var', key) —— 存变量并原地返回 key，等价于直接用搜索词
+                Regex("""^java\.put\(\s*['"][^'"]*['"]\s*,\s*(key|keyword|searchKey)\s*\)$""", RegexOption.IGNORE_CASE)
+                    .matchEntire(expr) != null ->
+                    query?.let { if (encodeQuery) URLEncoder.encode(it, encodeCharset) else it }.orEmpty()
                 else -> ""
             }
         }

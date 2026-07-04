@@ -355,7 +355,7 @@ class BookOverviewImageSelectionHook(
                         generateImage(
                             config = api,
                             prompt = renderImagePrompt(template, context.book),
-                            referenceDataUrl = loadReferenceImageDataUrl(context.book),
+                            referenceBytes = loadReferenceImageBytes(context.book),
                             requestedSize = size.text?.toString().orEmpty().trim(),
                             target = target,
                         )
@@ -444,12 +444,28 @@ class BookOverviewImageSelectionHook(
     private fun generateImage(
         config: AiApiConfig,
         prompt: String,
-        referenceDataUrl: String?,
+        referenceBytes: ByteArray?,
         requestedSize: String,
         target: ImageTarget,
     ): ByteArray {
         val sizes = imageSizeCandidates(requestedSize, target)
+        val referenceDataUrl = referenceBytes?.let { bytes ->
+            val mime = imageExtensionAndMime(bytes).second
+            "data:$mime;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
+        }
+        val isGptImage = config.model.contains("gpt-image", ignoreCase = true)
         var lastError: Throwable? = null
+        // gpt-image 系列且有参考图：优先走 /images/edits + multipart 上传参考图。
+        if (isGptImage && referenceBytes != null) {
+            for (size in sizes) {
+                val normalizedSize = normalizeImageSize(size)
+                val bytes = runCatching {
+                    requestImageEditsMultipart(config, prompt, normalizedSize, referenceBytes)
+                }.onFailure { lastError = it }.getOrNull()
+                if (bytes != null) return bytes
+            }
+        }
+        // 其余模型 / gpt-image 无参考图 / edits 失败：回退到 generations 兼容逻辑。
         for (size in sizes) {
             imageRequestBodies(config.model, prompt, size, referenceDataUrl).forEach { body ->
                 val bytes = runCatching {
@@ -531,6 +547,99 @@ class BookOverviewImageSelectionHook(
             extractImageBytes(json) ?: error("生图接口返回中没有图片数据")
         } finally {
             connection.disconnect()
+        }
+    }
+
+    // gpt-image 系列参考图编辑：走 /v1/images/edits + multipart/form-data 上传 image 文件字段。
+    private fun requestImageEditsMultipart(
+        config: AiApiConfig,
+        prompt: String,
+        size: String,
+        referenceBytes: ByteArray,
+    ): ByteArray {
+        val (ext, mime) = imageExtensionAndMime(referenceBytes)
+        val boundary = "reamicro-${System.currentTimeMillis()}"
+        val parts = mutableListOf<Pair<String, ByteArray?>>()
+        parts += "model" to config.model.toByteArray(Charsets.UTF_8)
+        parts += "prompt" to prompt.toByteArray(Charsets.UTF_8)
+        parts += "n" to "1".toByteArray(Charsets.UTF_8)
+        if (size.isNotBlank()) parts += "size" to size.toByteArray(Charsets.UTF_8)
+        parts += "response_format" to "b64_json".toByteArray(Charsets.UTF_8)
+        val bodyBytes = buildMultipartBytes(boundary, parts, "image", "reference.$ext", mime, referenceBytes)
+
+        val connection = (URL(imageEditsUrl(config.baseUrl)).openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            connectTimeout = CONNECT_TIMEOUT_MS
+            readTimeout = IMAGE_READ_TIMEOUT_MS
+            doOutput = true
+            setRequestProperty("Authorization", "Bearer ${config.apiKey.trim()}")
+            setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
+            setRequestProperty("Accept", "application/json,image/*")
+            setRequestProperty("User-Agent", USER_AGENT)
+        }
+        return try {
+            connection.outputStream.use { it.write(bodyBytes) }
+            val code = connection.responseCode
+            val stream = if (code in 200..299) connection.inputStream else connection.errorStream
+            val payload = stream?.use { readLimited(it, MAX_AI_RESPONSE_BYTES) } ?: ByteArray(0)
+            if (code !in 200..299) {
+                val text = payload.toString(Charsets.UTF_8)
+                error("HTTP $code: ${extractApiError(text).ifBlank { text.take(180) }}")
+            }
+            val contentType = connection.contentType.orEmpty()
+            if (contentType.startsWith("image/", ignoreCase = true) && isImageBytes(payload)) {
+                return payload
+            }
+            val text = payload.toString(Charsets.UTF_8)
+            val json = runCatching { JSONObject(text) }.getOrElse {
+                error("生图(edits)接口未返回有效 JSON")
+            }
+            extractImageBytes(json) ?: error("生图(edits)接口返回中没有图片数据")
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun buildMultipartBytes(
+        boundary: String,
+        fields: List<Pair<String, ByteArray?>>,
+        fileFieldName: String,
+        fileName: String,
+        fileMime: String,
+        fileBytes: ByteArray,
+    ): ByteArray {
+        val crlf = "\r\n"
+        val out = java.io.ByteArrayOutputStream()
+        fun writeFormField(name: String, value: ByteArray) {
+            out.write("--$boundary$crlf".toByteArray(Charsets.UTF_8))
+            out.write("Content-Disposition: form-data; name=\"$name\"$crlf$crlf".toByteArray(Charsets.UTF_8))
+            out.write(value)
+            out.write(crlf.toByteArray(Charsets.UTF_8))
+        }
+        fields.forEach { (name, value) ->
+            if (value != null) writeFormField(name, value)
+        }
+        // 文件字段
+        out.write("--$boundary$crlf".toByteArray(Charsets.UTF_8))
+        out.write("Content-Disposition: form-data; name=\"$fileFieldName\"; filename=\"$fileName\"$crlf".toByteArray(Charsets.UTF_8))
+        out.write("Content-Type: $fileMime$crlf$crlf".toByteArray(Charsets.UTF_8))
+        out.write(fileBytes)
+        out.write(crlf.toByteArray(Charsets.UTF_8))
+        out.write("--$boundary--$crlf".toByteArray(Charsets.UTF_8))
+        return out.toByteArray()
+    }
+
+    private fun imageEditsUrl(baseUrl: String): String {
+        val base = baseUrl.trim().trimEnd('/')
+        return when {
+            base.endsWith("/images/edits", ignoreCase = true) -> base
+            base.endsWith("/images/generations", ignoreCase = true) ->
+                base.removeSuffix("/images/generations") + "/images/edits"
+            base.endsWith("/chat/completions", ignoreCase = true) ->
+                base.removeSuffix("/chat/completions") + "/images/edits"
+            base.endsWith("/v1", ignoreCase = true) || isVersionedApiBaseUrl(base) -> "$base/images/edits"
+            base.isBlank() -> error("Base URL 为空")
+            else -> "$base/v1/images/edits"
         }
     }
 
@@ -717,7 +826,14 @@ class BookOverviewImageSelectionHook(
     }
 
     private fun updatePreview(imageView: ImageView, bytes: ByteArray) {
-        val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        // 先只读尺寸，按目标预览宽度降采样，避免在 UI 线程解码超大图卡死。
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        val target = imageView.resources.displayMetrics.widthPixels
+        var sample = 1
+        while (bounds.outWidth / sample > target * 2) sample *= 2
+        val options = BitmapFactory.Options().apply { inSampleSize = sample }
+        val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
             ?: error("图片无法预览")
         imageView.setImageBitmap(bitmap)
         imageView.visibility = View.VISIBLE
