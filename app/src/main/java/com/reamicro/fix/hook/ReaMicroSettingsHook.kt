@@ -1837,6 +1837,8 @@ class ReaMicroSettingsHook(
                 isSupportedReaderHighlightBackgroundSize(value)
             "border" ->
                 readerHighlightCssSizeRegex.containsMatchIn(value) || readerHighlightCssColorRegex.containsMatchIn(value)
+            "font-size" ->
+                isReaderHighlightFontSizeValue(value)
             "border-width", "border-radius",
             "padding-left", "padding-top", "padding-right", "padding-bottom",
             "margin-left", "margin-top", "margin-right", "margin-bottom" ->
@@ -1854,6 +1856,9 @@ class ReaMicroSettingsHook(
 
     private fun isReaderHighlightCssSizeValue(value: String): Boolean =
         value.trim().matches(Regex("""\d+(?:\.\d+)?(?:px|dp|em|rem)?""", RegexOption.IGNORE_CASE))
+
+    private fun isReaderHighlightFontSizeValue(value: String): Boolean =
+        value.trim().matches(Regex("""\d+(?:\.\d+)?\s*(?:px|sp|em|rem|pt)?""", RegexOption.IGNORE_CASE))
 
     private fun isReaderHighlightCssBoxValue(value: String): Boolean {
         val parts = value.trim().split(Regex("\\s+")).filter { it.isNotBlank() }

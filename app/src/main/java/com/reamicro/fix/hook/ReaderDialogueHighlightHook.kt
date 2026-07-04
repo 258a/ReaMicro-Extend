@@ -318,17 +318,19 @@ class ReaderDialogueHighlightHook(
         val css = parseCssStyle(style.cssForTheme(dark))
         val color = composeColor(css.color.ifBlank { style.colorForTheme(dark) })
         val background = css.backgroundColor.takeIf { it.isNotBlank() }?.let(::composeColor)
+        val fontSize = parseCssFontSize(css.fontSize)
         val fontSelection = style.fontFamilyForTheme(dark).ifBlank { settings.fontSettings().globalFamily }
         val fontFamily = resolveFontFamily(fontSelection)
         val constructor = cls(SPAN_STYLE_CLASS).declaredConstructors.firstOrNull { it.parameterTypes.size == 18 }
             ?: return null
         constructor.isAccessible = true
         var mask = SPAN_STYLE_DEFAULT_MASK_EXCEPT_COLOR
+        if (fontSize != null) mask = mask and SPAN_STYLE_MASK_FONT_SIZE.inv()
         if (fontFamily != null) mask = mask and SPAN_STYLE_MASK_FONT_FAMILY.inv()
         if (background != null) mask = mask and SPAN_STYLE_MASK_BACKGROUND.inv()
         return constructor.newInstance(
             color,
-            0L,
+            fontSize ?: 0L,
             null,
             null,
             null,
@@ -365,8 +367,40 @@ class ReaderDialogueHighlightHook(
         return CssStyle(
             color = values["color"].orEmpty(),
             backgroundColor = values["background-color"].orEmpty().ifBlank { values["background"].orEmpty() },
+            fontSize = values["font-size"].orEmpty(),
         )
     }
+
+    // 解析高亮 CSS 的 font-size，返回打包后的 Compose TextUnit（sp 或 em），null 表示不设置。
+    // - px/sp/纯数字/pt 按绝对 sp 处理
+    // - em/rem 按倍数处理，相对当前正文字号缩放（如 0.6em = 0.6 倍）
+    private fun parseCssFontSize(value: String): Long? {
+        val trimmed = value.trim().lowercase()
+        if (trimmed.isBlank()) return null
+        val match = Regex("""^(-?\d+(?:\.\d+)?)\s*(px|sp|em|rem|pt)?$""").find(trimmed) ?: return null
+        val number = match.groupValues[1].toFloatOrNull() ?: return null
+        if (number <= 0f) return null
+        return when (val unit = match.groupValues[2]) {
+            "em", "rem" -> packEmTextUnit(number.coerceIn(0.1f, 10f))
+            else -> {
+                val sp = if (unit == "pt") number * 96f / 72f else number
+                packSpTextUnit(sp.coerceIn(1f, 200f))
+            }
+        }
+    }
+
+    private fun packSpTextUnit(sp: Float): Long? = packTextUnit("getSp", sp)
+
+    private fun packEmTextUnit(em: Float): Long? = packTextUnit("getEm", em)
+
+    private fun packTextUnit(methodName: String, amount: Float): Long? =
+        runCatching {
+            cls(TEXT_UNIT_KT_CLASS).declaredMethods.firstOrNull { method ->
+                method.name == methodName &&
+                    method.parameterTypes.size == 1 &&
+                    method.parameterTypes[0] == Float::class.javaPrimitiveType
+            }?.apply { isAccessible = true }?.invoke(null, amount) as? Long
+        }.getOrNull()
 
     private fun composeColor(value: String): Long {
         val argb = parseAndroidColor(value) ?: Color.parseColor(DEFAULT_DIALOGUE_COLOR)
@@ -1430,6 +1464,7 @@ class ReaderDialogueHighlightHook(
         const val DRAW_MODIFIER_KT_CLASS = ReaMicroHostCompat.ReaderHighlight.DRAW_MODIFIER_KT_CLASS
         const val ANDROID_CANVAS_KT_CLASS = ReaMicroHostCompat.ReaderHighlight.ANDROID_CANVAS_KT_CLASS
         const val COLOR_KT_CLASS = ReaMicroHostCompat.ReaderHighlight.COLOR_KT_CLASS
+        const val TEXT_UNIT_KT_CLASS = "androidx.compose.ui.unit.TextUnitKt"
         const val MODIFIER_CLASS = ReaMicroHostCompat.ReaderHighlight.MODIFIER_CLASS
         const val FUNCTION1_CLASS = "kotlin.jvm.functions.Function1"
         const val UNIT_CLASS = "kotlin.Unit"
@@ -1440,6 +1475,7 @@ class ReaderDialogueHighlightHook(
         const val FAMILY_SYSTEM = "system"
         const val FAMILY_SOURCE_HAN_SERIF = "serif"
         const val SPAN_STYLE_DEFAULT_MASK_EXCEPT_COLOR = 65534
+        const val SPAN_STYLE_MASK_FONT_SIZE = 2
         const val SPAN_STYLE_MASK_FONT_FAMILY = 32
         const val SPAN_STYLE_MASK_BACKGROUND = 2048
         const val JUSTIFY_TEXT_DEFAULT_MODIFIER = 2
@@ -1472,6 +1508,7 @@ class ReaderDialogueHighlightHook(
     private data class CssStyle(
         val color: String = "",
         val backgroundColor: String = "",
+        val fontSize: String = "",
     )
 
     private data class NinePatchAnnotation(

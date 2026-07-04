@@ -768,6 +768,8 @@ class XposedModuleSettings(
                 isSupportedHighlightBackgroundSize(value)
             "border" ->
                 highlightCssSizeRegex.containsMatchIn(value) || highlightCssColorRegex.containsMatchIn(value)
+            "font-size" ->
+                isHighlightFontSizeValue(value)
             "border-width", "border-radius",
             "padding-left", "padding-top", "padding-right", "padding-bottom",
             "margin-left", "margin-top", "margin-right", "margin-bottom" ->
@@ -788,6 +790,9 @@ class XposedModuleSettings(
 
     private fun isHighlightCssSizeValue(value: String): Boolean =
         value.trim().matches(Regex("""\d+(?:\.\d+)?(?:px|dp|em|rem)?""", RegexOption.IGNORE_CASE))
+
+    private fun isHighlightFontSizeValue(value: String): Boolean =
+        value.trim().matches(Regex("""\d+(?:\.\d+)?\s*(?:px|sp|em|rem|pt)?""", RegexOption.IGNORE_CASE))
 
     private fun isHighlightCssBoxValue(value: String): Boolean {
         val parts = value.trim().split(Regex("\\s+")).filter { it.isNotBlank() }
