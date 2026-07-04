@@ -457,6 +457,10 @@ class ReaMicroSettingsHook(
     private fun currentInjectedRoute(): InjectedRoute? =
         injectedRouteUiState?.let(::routeStateValue) ?: injectedRouteStack.lastOrNull()
 
+    private fun refreshCurrentInjectedRoute() {
+        currentInjectedRoute()?.let { route -> setInjectedRouteState(route) }
+    }
+
     private fun navigateBackFromInjectedRoute() {
         val navGraphScope = currentSettingsNavGraphScope
         val stack = injectedRouteStack
@@ -545,6 +549,7 @@ class ReaMicroSettingsHook(
                 is InjectedRoute.ReaderBookOnlyHighlightRules -> renderReaderBookOnlyHighlightRulesContent(currentRoute, innerPaddings, innerComposer)
                 is InjectedRoute.ReaderBookGlobalHighlightRules -> renderReaderBookGlobalHighlightRulesContent(currentRoute, innerPaddings, innerComposer)
                 InjectedRoute.ReaderHighlightColorPicker -> renderReaderHighlightColorPickerContent(innerPaddings, innerComposer)
+                InjectedRoute.ProfileBackgroundSettings -> renderProfileBackgroundSettingsContent(innerPaddings, innerComposer)
                 InjectedRoute.CloudCompletionSettings -> renderCloudCompletionSettingsContent(innerPaddings, innerComposer)
                 InjectedRoute.RotationCompletionSettings -> renderRotationCompletionSettingsContent(innerPaddings, innerComposer)
                 InjectedRoute.AccountSwitch -> renderAccountSwitchContent(innerPaddings, innerComposer)
@@ -745,353 +750,21 @@ class ReaMicroSettingsHook(
                     composer = itemComposer,
                 )
             }
-            return@functionProxy targetUnit()
-            val associationExpandedState = associationExpandedState(snapshot.associationEnabled)
-            val readerExpandedState = readerExpandedState(snapshot.readerEnabled)
-            val fontExpandedState = fontExpandedState(snapshot.fontEnabled)
-            val accountExpandedState = accountExpandedState(snapshot.accountEnabled)
-            val cloudExpandedState = cloudExpandedState(snapshot.cloudEnabled)
-            val rotationExpandedState = rotationExpandedState(snapshot.rotationEnabled)
-            val associationRows = buildList {
-                add(
-                    ToggleRow(
-                        key = ModuleSettings.KEY_ASSOCIATION_ENABLED,
-                        title = "关联补全",
-                        checked = snapshot.associationEnabled,
-                        checkedProvider = { booleanStateValue(associationExpandedState) },
-                        onChanged = { checked, _ ->
-                            settings.setAssociationEnabled(checked)
-                            setBooleanState(associationExpandedState, checked)
-                            checked
-                        },
-                    ),
-                )
-                add(
-                    ToggleRow(
-                        key = ModuleSettings.KEY_ASSOCIATION_MANUAL_EDIT_ENABLED,
-                        title = "手动编辑",
-                        checked = snapshot.associationManualEditEnabled,
-                        visibleProvider = {
-                            booleanStateValue(associationExpandedState) && hasManualEditFeature()
-                        },
-                        onChanged = { checked, _ ->
-                            settings.setAssociationManualEditEnabled(checked)
-                            checked
-                        },
-                    ),
-                )
-                visibleAssociationSearchSourceGroups().forEach { group ->
-                    add(
-                        ToggleRow(
-                            key = ModuleSettings.searchSourceKey(group.id),
-                            title = group.title,
-                            checked = snapshot.isSearchSourceGroupEnabled(group.id),
-                            visibleProvider = { booleanStateValue(associationExpandedState) },
-                            onChanged = { checked, updateRow ->
-                                setAssociationSearchSourceEnabled(
-                                    group.id,
-                                    checked,
-                                ) { value ->
-                                    updateRow(ModuleSettings.searchSourceKey(group.id), value)
-                                }
-                            },
-                        ),
-                    )
-                }
-            }
-            addLazyItem(lazyListScope, ASSOCIATION_SWITCHES_ITEM_KEY) { itemComposer ->
-                renderHostSettingsCard(associationRows, itemComposer)
-            }
-            addLazyItem(lazyListScope, READER_SWITCHES_ITEM_KEY) { itemComposer ->
-                val readerRows = listOf(
-                    ToggleRow(
-                        key = ModuleSettings.KEY_READER_ENABLED,
-                        title = "\u9605\u8bfb\u8865\u5168",
-                        checked = snapshot.readerEnabled,
-                        checkedProvider = { booleanStateValue(readerExpandedState) },
-                        onChanged = { checked, _ ->
-                            settings.setReaderEnabled(checked)
-                            setBooleanState(readerExpandedState, checked)
-                            checked
-                        },
-                    ),
-                    ToggleRow(
-                        key = ModuleSettings.KEY_READER_AUTO_PAGE_ENABLED,
-                        title = "\u81ea\u52a8\u9605\u8bfb",
-                        checked = snapshot.readerAutoPageEnabled,
-                        visibleProvider = { booleanStateValue(readerExpandedState) },
-                        onChanged = { checked, _ ->
-                            settings.setReaderAutoPageEnabled(checked)
-                            checked
-                        },
-                    ),
-                    ToggleRow(
-                        key = ModuleSettings.KEY_READER_OVERWRITE_CHECK_ENABLED,
-                        title = "\u8986\u76d6\u68c0\u67e5",
-                        checked = snapshot.readerOverwriteCheckEnabled,
-                        visibleProvider = { booleanStateValue(readerExpandedState) },
-                        onChanged = { checked, _ ->
-                            settings.setReaderOverwriteCheckEnabled(checked)
-                            checked
-                        },
-                    ),
-                    ToggleRow(
-                        key = ModuleSettings.KEY_EDIT_FILE_ENABLED,
-                        title = "\u6587\u4ef6\u7f16\u8f91",
-                        checked = snapshot.editFileEnabled,
-                        visibleProvider = { booleanStateValue(readerExpandedState) },
-                        onChanged = { checked, _ ->
-                            settings.setEditFileEnabled(checked)
-                            checked
-                        },
-                    ),
-                    ToggleRow(
-                        key = ModuleSettings.KEY_READER_EDIT_OVERWRITE_ENABLED,
-                        title = "\u7f16\u8f91\u8986\u5199",
-                        checked = snapshot.readerEditOverwriteEnabled,
-                        visibleProvider = { booleanStateValue(readerExpandedState) },
-                        onChanged = { checked, _ ->
-                            settings.setReaderEditOverwriteEnabled(checked)
-                            checked
-                        },
-                    ),
-                    ToggleRow(
-                        key = ModuleSettings.KEY_READER_DICTIONARY_ENABLED,
-                        title = "\u8bcd\u5178\u91ca\u4e49",
-                        checked = snapshot.readerDictionaryEnabled,
-                        visibleProvider = { booleanStateValue(readerExpandedState) },
-                        onChanged = { checked, _ ->
-                            settings.setReaderDictionaryEnabled(checked)
-                            checked
-                        },
-                    ),
-                )
-                renderHostSettingsCard(
-                    readerRows,
-                    itemComposer,
-                )
-            }
-            addLazyItem(lazyListScope, FONT_SWITCHES_ITEM_KEY) { itemComposer ->
-                val fontRows = listOf(
-                    ToggleRow(
-                        key = ModuleSettings.KEY_FONT_ENABLED,
-                        title = "\u5b57\u4f53\u8865\u5168",
-                        checked = snapshot.fontEnabled,
-                        checkedProvider = { booleanStateValue(fontExpandedState) },
-                        onChanged = { checked, _ ->
-                            settings.setFontEnabled(checked)
-                            setBooleanState(fontExpandedState, checked)
-                            checked
-                        },
-                    ),
-                    ToggleRow(
-                        key = ModuleSettings.KEY_FONT_SETTINGS_ENABLED,
-                        title = "\u5b57\u4f53\u8bbe\u7f6e",
-                        checked = snapshot.fontSettingsEnabled,
-                        visibleProvider = { booleanStateValue(fontExpandedState) },
-                        onChanged = { checked, _ ->
-                            settings.setFontSettingsEnabled(checked)
-                            checked
-                        },
-                    ),
-                )
-                renderHostSettingsCard(
-                    fontRows,
-                    itemComposer,
-                )
-            }
-            addLazyItem(lazyListScope, CLOUD_SWITCHES_ITEM_KEY) { itemComposer ->
-                val cloudRows = listOf(
-                    ToggleRow(
-                        key = ModuleSettings.KEY_CLOUD_ENABLED,
-                        title = "\u4e91\u76d8\u8865\u5168",
-                        checked = snapshot.cloudEnabled,
-                        checkedProvider = { booleanStateValue(cloudExpandedState) },
-                        onChanged = { checked, _ ->
-                            settings.setCloudEnabled(checked)
-                            setBooleanState(cloudExpandedState, checked)
-                            checked
-                        },
-                    ),
-                    ToggleRow(
-                        key = ModuleSettings.KEY_CLOUD_WEBDAV_ENABLED,
-                        title = "WebDAV",
-                        checked = snapshot.cloudWebDavEnabled,
-                        visibleProvider = { booleanStateValue(cloudExpandedState) },
-                        onChanged = { checked, _ ->
-                            settings.setCloudWebDavEnabled(checked)
-                            checked
-                        },
-                    ),
-                    ToggleRow(
-                        key = ModuleSettings.KEY_CLOUD_LOCAL_LIBRARY_ENABLED,
-                        title = "\u672c\u5730\u4e66\u5e93",
-                        checked = snapshot.cloudLocalLibraryEnabled,
-                        visibleProvider = { booleanStateValue(cloudExpandedState) },
-                        onChanged = { checked, _ ->
-                            settings.setCloudLocalLibraryEnabled(checked)
-                            checked
-                        },
-                    ),
-                    ToggleRow(
-                        key = ModuleSettings.KEY_CLOUD_EXTENDED_DISPLAY_ENABLED,
-                        title = "\u6269\u5c55\u663e\u793a",
-                        checked = snapshot.cloudExtendedDisplayEnabled,
-                        visibleProvider = { booleanStateValue(cloudExpandedState) },
-                        onChanged = { checked, _ ->
-                            settings.setCloudExtendedDisplayEnabled(checked)
-                            checked
-                        },
-                    ),
-                    ToggleRow(
-                        key = ModuleSettings.KEY_CLOUD_DOWNLOAD_CANCEL_ENABLED,
-                        title = "\u5141\u8bb8\u53d6\u6d88",
-                        checked = snapshot.cloudDownloadCancelEnabled,
-                        visibleProvider = { booleanStateValue(cloudExpandedState) },
-                        onChanged = { checked, _ ->
-                            settings.setCloudDownloadCancelEnabled(checked)
-                            checked
-                        },
-                    ),
-                )
-                renderHostSettingsCard(
-                    cloudRows,
-                    itemComposer,
-                )
-            }
-            addLazyItem(lazyListScope, ACCOUNT_COMPLETION_SWITCHES_ITEM_KEY) { itemComposer ->
-                val accountRows = listOf(
-                    ToggleRow(
-                        key = ModuleSettings.KEY_ACCOUNT_ENABLED,
-                        title = "\u8d26\u53f7\u8865\u5168",
-                        checked = snapshot.accountEnabled,
-                        checkedProvider = { booleanStateValue(accountExpandedState) },
-                        onChanged = { checked, _ ->
-                            settings.setAccountEnabled(checked)
-                            setBooleanState(accountExpandedState, checked)
-                            checked
-                        },
-                    ),
-                    ToggleRow(
-                        key = ModuleSettings.KEY_ACCOUNT_EXPORT_ENABLED,
-                        title = "\u5bfc\u51fa\u8865\u5168",
-                        checked = snapshot.accountExportEnabled,
-                        visibleProvider = { booleanStateValue(accountExpandedState) },
-                        onChanged = { checked, _ ->
-                            settings.setAccountExportEnabled(checked)
-                            checked
-                        },
-                    ),
-                    ToggleRow(
-                        key = ModuleSettings.KEY_ACCOUNT_CACHE_CLEANUP_ENABLED,
-                        title = "\u7f13\u5b58\u6e05\u7406",
-                        checked = snapshot.accountCacheCleanupEnabled,
-                        visibleProvider = { booleanStateValue(accountExpandedState) },
-                        onChanged = { checked, _ ->
-                            settings.setAccountCacheCleanupEnabled(checked)
-                            checked
-                        },
-                    ),
-                )
-                renderHostSettingsCard(accountRows, itemComposer)
-            }
-            val rotationState = RotationUiState.fromActivityOrientation(
-                activityProvider()?.requestedOrientation,
-                snapshot.rotationReverseEnabled,
-            ) ?: rotationUiState ?: RotationUiState.from(snapshot)
-            val rotationRows = buildList {
-                add(
-                    ToggleRow(
-                        key = ModuleSettings.KEY_ROTATION_ENABLED,
-                        title = "\u65cb\u8f6c\u8865\u5168",
-                        checked = snapshot.rotationEnabled,
-                        checkedProvider = { booleanStateValue(rotationExpandedState) },
-                        onChanged = { checked, updateRow ->
-                            setBooleanState(rotationExpandedState, checked)
-                            setRotationEnabled(checked, rotationState, updateRow)
-                        },
-                    ),
-                )
-                    add(
-                        ToggleRow(
-                            key = ModuleSettings.KEY_ROTATION_AUTO_ENABLED,
-                            title = "\u81ea\u52a8\u65cb\u8f6c",
-                            checked = rotationState.autoEnabled,
-                            checkedProvider = { currentRotationDisplayState().autoEnabled },
-                            visibleProvider = { booleanStateValue(rotationExpandedState) },
-                            syncWithSnapshot = true,
-                            onChanged = { checked, updateRow ->
-                                setRotationBaseEnabled(ModuleSettings.KEY_ROTATION_AUTO_ENABLED, checked, updateRow)
-                            },
-                        ),
-                    )
-                    add(
-                        ToggleRow(
-                            key = ModuleSettings.KEY_ROTATION_PORTRAIT_LOCK_ENABLED,
-                            title = "\u7ad6\u5411\u9501\u5b9a",
-                            checked = rotationState.portraitLockEnabled,
-                            checkedProvider = { currentRotationDisplayState().portraitLockEnabled },
-                            visibleProvider = { booleanStateValue(rotationExpandedState) },
-                            syncWithSnapshot = true,
-                            onChanged = { checked, updateRow ->
-                                setRotationBaseEnabled(ModuleSettings.KEY_ROTATION_PORTRAIT_LOCK_ENABLED, checked, updateRow)
-                            },
-                        ),
-                    )
-                    add(
-                        ToggleRow(
-                            key = ModuleSettings.KEY_ROTATION_LANDSCAPE_LOCK_ENABLED,
-                            title = "\u6a2a\u5411\u9501\u5b9a",
-                            checked = rotationState.landscapeLockEnabled,
-                            checkedProvider = { currentRotationDisplayState().landscapeLockEnabled },
-                            visibleProvider = { booleanStateValue(rotationExpandedState) },
-                            syncWithSnapshot = true,
-                            onChanged = { checked, updateRow ->
-                                setRotationBaseEnabled(ModuleSettings.KEY_ROTATION_LANDSCAPE_LOCK_ENABLED, checked, updateRow)
-                            },
-                        ),
-                    )
-                    add(
-                        ToggleRow(
-                            key = ModuleSettings.KEY_ROTATION_REVERSE_ENABLED,
-                            title = "\u53cd\u5411\u65cb\u8f6c",
-                            checked = rotationState.reverseEnabled,
-                            checkedProvider = { currentRotationDisplayState().reverseEnabled },
-                            visibleProvider = { booleanStateValue(rotationExpandedState) },
-                            syncWithSnapshot = true,
-                            onChanged = { checked, updateRow ->
-                                suppressRotationSnapshotSync()
-                                val nextState = currentRotationUiState().copy(reverseEnabled = checked)
-                                rotationUiState = nextState
-                                updateRow(ModuleSettings.KEY_ROTATION_REVERSE_ENABLED, checked)
-                                settings.setRotationReverseEnabled(checked)
-                                applyCurrentRotation()
-                                checked
-                            },
-                        ),
-                    )
-            }
-            addLazyItem(lazyListScope, ROTATION_SWITCHES_ITEM_KEY) { itemComposer ->
-                renderHostSettingsCard(rotationRows, itemComposer)
-            }
-            val profileBackgroundRows = listOf(
-                ToggleRow(
-                    key = ModuleSettings.KEY_PROFILE_BACKGROUND_ENABLED,
-                    title = "个人中心背景",
-                    checked = snapshot.profileBackgroundEnabled,
-                    onChanged = { checked, _ ->
-                        settings.setProfileBackgroundEnabled(checked)
-                        checked
-                    },
-                ),
-            )
             addLazyItem(lazyListScope, PROFILE_BACKGROUND_SWITCHES_ITEM_KEY) { itemComposer ->
-                renderHostSettingsCard(profileBackgroundRows, itemComposer)
+                renderNestedSettingsEntry(
+                    title = "\u4e2a\u4eba\u4e2d\u5fc3\u80cc\u666f",
+                    callbackName = "OpenProfileBackgroundSettings",
+                    route = InjectedRoute.ProfileBackgroundSettings,
+                    composer = itemComposer,
+                )
             }
-            targetUnit()
+            return@functionProxy targetUnit()
         }
         renderHostLazyColumn(innerPaddings, listContent, composer)
     }
+
+    private fun profileBackgroundColorSummary(value: String): String =
+        PROFILE_BACKGROUND_COLOR_OPTIONS.firstOrNull { it.value.equals(value, ignoreCase = true) }?.title ?: value
 
     private fun completionEntryRow(key: String, title: String, enabled: Boolean, route: InjectedRoute): ActionRow =
         ActionRow(
@@ -1863,6 +1536,163 @@ class ReaMicroSettingsHook(
         renderHostLazyColumn(innerPaddings, listContent, composer)
     }
 
+    private fun renderProfileBackgroundSettingsContent(innerPaddings: Any, composer: Any) {
+        val listContent = functionProxy("ProfileBackgroundSettingsList", FUNCTION1_CLASS) { args ->
+            val lazyListScope = args?.getOrNull(0) ?: return@functionProxy targetUnit()
+            val snapshot = settings.snapshot()
+            val switchRows = listOf(
+                ToggleRow(
+                    key = ModuleSettings.KEY_PROFILE_BACKGROUND_ENABLED,
+                    title = "\u542f\u7528\u4e2a\u4eba\u4e2d\u5fc3\u80cc\u666f",
+                    checked = snapshot.profileBackgroundEnabled,
+                    onChanged = { checked, _ ->
+                        settings.setProfileBackgroundEnabled(checked)
+                        checked
+                    },
+                ),
+                ToggleRow(
+                    key = ModuleSettings.KEY_PROFILE_BACKGROUND_USE_IMAGE,
+                    title = "\u4f7f\u7528\u56fe\u7247\u80cc\u666f",
+                    checked = snapshot.profileBackgroundUseImage,
+                    onChanged = { checked, _ ->
+                        settings.setProfileBackgroundUseImage(checked)
+                        checked
+                    },
+                ),
+            )
+            addLazyItem(lazyListScope, PROFILE_BACKGROUND_SWITCHES_ITEM_KEY) { itemComposer ->
+                renderHostSettingsCard(switchRows, itemComposer)
+            }
+            val colorRows = listOf(
+                ActionRow(
+                    key = "profile_background_color_entry",
+                    title = "\u80cc\u666f\u989c\u8272",
+                    subtitle = profileBackgroundColorSummary(snapshot.profileBackgroundColor),
+                    singleLineSubtitle = true,
+                    onClick = { openProfileBackgroundColorDialog() },
+                ),
+            )
+            addLazyItem(lazyListScope, PROFILE_BACKGROUND_COLOR_PICKER_ITEM_KEY) { itemComposer ->
+                renderHostActionCard(colorRows, itemComposer)
+            }
+            val imageSubtitle = if (snapshot.profileBackgroundImage.isBlank()) {
+                "\u672a\u9009\u62e9"
+            } else {
+                snapshot.profileBackgroundImage.substringAfterLast('/')
+            }
+            val imageRows = listOf(
+                ActionRow(
+                    key = "profile_background_image_entry",
+                    title = "\u80cc\u666f\u56fe\u7247",
+                    subtitle = imageSubtitle,
+                    singleLineSubtitle = true,
+                    onClick = { openProfileBackgroundImagePicker() },
+                ),
+            )
+            addLazyItem(lazyListScope, PROFILE_BACKGROUND_COLOR_PICKER_ITEM_KEY + 1) { itemComposer ->
+                renderHostActionCard(imageRows, itemComposer)
+            }
+            targetUnit()
+        }
+        renderHostLazyColumn(innerPaddings, listContent, composer)
+    }
+
+    private fun openProfileBackgroundColorDialog() {
+        val activity = activityProvider() ?: return
+        activity.runOnUiThread {
+            runCatching {
+                val colors = SettingsDialogColors(activity)
+                val dialog = Dialog(activity)
+                val card = settingsDialogCard(activity, colors)
+                card.addView(settingsDialogTitle(activity, "\u80cc\u666f\u989c\u8272", colors))
+                val current = settings.snapshot().profileBackgroundColor
+                PROFILE_BACKGROUND_COLOR_OPTIONS.forEach { option ->
+                    card.addView(profileBackgroundColorOptionRow(activity, option, current, colors) {
+                        settings.setProfileBackgroundColor(option.value)
+                        dialog.dismiss()
+                        refreshCurrentInjectedRoute()
+                    })
+                }
+                val actions = settingsDialogActions(activity)
+                actions.addView(
+                    settingsDialogButton(activity, "\u5173\u95ed", colors, SettingsDialogButtonRole.Neutral).apply {
+                        setOnClickListener { dialog.dismiss() }
+                    },
+                )
+                card.addView(actions)
+                dialog.setContentView(card)
+                dialog.show()
+            }.onFailure {
+                XposedBridge.log("ReaMicro LSP profile background dialog failed: ${it.stackTraceToString()}")
+            }
+        }
+    }
+
+    private fun profileBackgroundColorOptionRow(
+        activity: Activity,
+        option: HighlightColorOption,
+        current: String,
+        colors: SettingsDialogColors,
+        onClick: () -> Unit,
+    ): LinearLayout =
+        LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(
+                settingsDp(activity, 4),
+                settingsDp(activity, 8),
+                settingsDp(activity, 4),
+                settingsDp(activity, 8),
+            )
+            background = settingsRoundedRect(colors.field, settingsDp(activity, 12), colors.border)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { bottomMargin = settingsDp(activity, 8) }
+
+            val swatch = View(activity).apply {
+                background = settingsRoundedRect(parseRgb(option.value), settingsDp(activity, 8), 0)
+                layoutParams = LinearLayout.LayoutParams(settingsDp(activity, 28), settingsDp(activity, 28)).apply {
+                    rightMargin = settingsDp(activity, 12)
+                }
+            }
+            addView(swatch)
+
+            val title = TextView(activity).apply {
+                text = option.title
+                textSize = 14f
+                setTextColor(colors.title)
+                includeFontPadding = false
+                layoutParams = LinearLayout.LayoutParams(
+                    0,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    1f,
+                )
+            }
+            addView(title)
+
+            val selected = option.value.equals(current, ignoreCase = true)
+            val trailing = TextView(activity).apply {
+                text = if (selected) "\u5f53\u524d" else "\u9009\u62e9"
+                textSize = 13f
+                setTextColor(if (selected) colors.primaryText else colors.body)
+                includeFontPadding = false
+                setPadding(settingsDp(activity, 6), 0, settingsDp(activity, 6), 0)
+            }
+            addView(trailing)
+
+            setOnClickListener { onClick() }
+        }
+
+    private fun parseRgb(hex: String): Int {
+        val normalized = hex.trim().removePrefix("#")
+        return when (normalized.length) {
+            8 -> normalized.toLong(16).toInt()
+            6 -> (0xFF shl 24) or normalized.toInt(16)
+            else -> Color.GRAY
+        }
+    }
+
     private fun openReaderHighlightStyleDialog(style: ReaderHighlightStyle) {
         val activity = activityProvider() ?: return
         activity.runOnUiThread {
@@ -2481,6 +2311,50 @@ class ReaMicroSettingsHook(
             showToast(it.message ?: "\u9009\u62e9\u56fe\u7247\u5931\u8d25")
             XposedBridge.log("$LOG_PREFIX import highlight image failed: ${it.stackTraceToString()}")
         }
+    }
+
+    private fun openProfileBackgroundImagePicker() {
+        val activity = activityProvider() ?: return
+        runCatching {
+            val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
+                type = "image/*"
+                addCategory(Intent.CATEGORY_OPENABLE)
+            }
+            val chooser = Intent.createChooser(intent, "\u9009\u62e9\u80cc\u666f\u56fe\u7247").apply {
+                putExtra(Intent.EXTRA_INITIAL_INTENTS, arrayOf(intent))
+            }
+            activity.startActivityForResult(chooser, PROFILE_BACKGROUND_IMAGE_DOCUMENT_REQUEST_CODE)
+        }.onFailure {
+            showToast("\u6253\u5f00\u80cc\u666f\u56fe\u7247\u9009\u62e9\u5931\u8d25")
+            XposedBridge.log("$LOG_PREFIX open profile background image picker failed: ${it.stackTraceToString()}")
+        }
+    }
+
+    private fun importProfileBackgroundImageFromUri(activity: Activity, uri: Uri) {
+        runCatching {
+            val target = copyProfileBackgroundImageUri(activity, uri)
+            settings.setProfileBackgroundImage(target.absolutePath)
+            settings.setProfileBackgroundUseImage(true)
+            showToast("\u5df2\u9009\u62e9\u80cc\u666f\u56fe\u7247\uff1a${target.name}")
+            refreshCurrentInjectedRoute()
+        }.onFailure {
+            showToast(it.message ?: "\u9009\u62e9\u80cc\u666f\u56fe\u7247\u5931\u8d25")
+            XposedBridge.log("$LOG_PREFIX import profile background image failed: ${it.stackTraceToString()}")
+        }
+    }
+
+    private fun copyProfileBackgroundImageUri(activity: Activity, uri: Uri): File {
+        val rawName = queryDisplayName(activity, uri) ?: uri.lastPathSegment.orEmpty()
+        val extension = rawName.substringAfterLast('.', "png").lowercase()
+        val safeExt = if (extension.matches(Regex("^[a-z0-9]{1,8}$"))) extension else "png"
+        val displayName = "profile_background_${System.currentTimeMillis()}.$safeExt"
+        val targetDir = File(activity.filesDir, "profile_background").apply { mkdirs() }
+        targetDir.listFiles()?.forEach { it.delete() }
+        val target = File(targetDir, displayName)
+        activity.contentResolver.openInputStream(uri)?.use { input ->
+            target.outputStream().buffered().use { output -> input.copyTo(output) }
+        } ?: error("\u65e0\u6cd5\u8bfb\u53d6\u80cc\u666f\u56fe\u7247")
+        return target
     }
 
     private fun importReaderHighlightStyleFromUri(activity: Activity, uri: Uri) {
@@ -6460,6 +6334,7 @@ class ReaMicroSettingsHook(
                         FONT_DOCUMENT_REQUEST_CODE -> copyFontUriToLibrary(activity, uri)
                         HIGHLIGHT_STYLE_DOCUMENT_REQUEST_CODE -> importReaderHighlightStyleFromUri(activity, uri)
                         HIGHLIGHT_NINE_PATCH_DOCUMENT_REQUEST_CODE -> importHighlightNinePatchFromUri(activity, uri)
+                        PROFILE_BACKGROUND_IMAGE_DOCUMENT_REQUEST_CODE -> importProfileBackgroundImageFromUri(activity, uri)
                         ACCOUNT_CREDENTIAL_DOCUMENT_REQUEST_CODE -> importCredentialFromUri(activity, uri)
                         ACCOUNT_DATA_DOCUMENT_REQUEST_CODE -> importAccountDataFromUri(activity, uri)
                     }
@@ -7780,6 +7655,7 @@ class ReaMicroSettingsHook(
         data class ReaderBookOnlyHighlightRules(val bookKey: String, val bookTitle: String) : InjectedRoute("\u5355\u4e66\u9ad8\u4eae\u89c4\u5219")
         data class ReaderBookGlobalHighlightRules(val bookKey: String, val bookTitle: String) : InjectedRoute("\u8ddf\u968f\u5168\u5c40")
         object ReaderHighlightColorPicker : InjectedRoute("\u5bf9\u8bdd\u989c\u8272")
+        object ProfileBackgroundSettings : InjectedRoute("\u4e2a\u4eba\u4e2d\u5fc3\u80cc\u666f")
         object CloudCompletionSettings : InjectedRoute("\u4e91\u76d8\u8865\u5168")
         object RotationCompletionSettings : InjectedRoute("\u65cb\u8f6c\u8865\u5168")
         object AccountSwitch : InjectedRoute(ACCOUNT_SWITCH_TITLE)
@@ -7806,6 +7682,7 @@ class ReaMicroSettingsHook(
         InjectedRoute.AiConfigSettings,
         InjectedRoute.FontSettings,
         InjectedRoute.AboutCompletion,
+        InjectedRoute.ProfileBackgroundSettings,
     )
 
     private val READER_CHILD_ROUTES = setOf(
@@ -8104,11 +7981,13 @@ class ReaMicroSettingsHook(
         const val ABOUT_COMPLETION_ENTRY_ITEM_KEY = 0x524D467B
         const val ABOUT_COMPLETION_CONTENT_ITEM_KEY = 0x524D467C
         const val PROFILE_BACKGROUND_SWITCHES_ITEM_KEY = 0x524D467D
+        const val PROFILE_BACKGROUND_COLOR_PICKER_ITEM_KEY = 0x524D467E
         const val ACCOUNT_CREDENTIAL_DOCUMENT_REQUEST_CODE = 0x524D47
         const val ACCOUNT_DATA_DOCUMENT_REQUEST_CODE = 0x524D48
         const val ONLINE_SOURCE_DOCUMENT_REQUEST_CODE = 0x524D49
         const val HIGHLIGHT_STYLE_DOCUMENT_REQUEST_CODE = 0x524D4A
         const val HIGHLIGHT_NINE_PATCH_DOCUMENT_REQUEST_CODE = 0x524D4B
+        const val PROFILE_BACKGROUND_IMAGE_DOCUMENT_REQUEST_CODE = 0x524D4C
         const val ACCOUNT_RESTART_DELAY_MS = 1_400L
         const val ACCOUNT_RESTART_KILL_DELAY_MS = 250L
         const val ACCOUNT_RESTART_COMMAND_DELAY_SECONDS = "0.8"
@@ -8148,6 +8027,15 @@ class ReaMicroSettingsHook(
             HighlightColorOption("#2563EB", "\u84dd\u8272"),
             HighlightColorOption("#9333EA", "\u7d2b\u8272"),
             HighlightColorOption("#DC2626", "\u7ea2\u8272"),
+        )
+        val PROFILE_BACKGROUND_COLOR_OPTIONS = listOf(
+            HighlightColorOption("#80000000", "\u534a\u900f\u660e\u9ed1"),
+            HighlightColorOption("#FF000000", "\u7eaf\u9ed1"),
+            HighlightColorOption("#FFFFFFFF", "\u7eaf\u767d"),
+            HighlightColorOption("#808B8B8B", "\u7070\u7070"),
+            HighlightColorOption("#FF1F2937", "\u6df1\u773c\u773c"),
+            HighlightColorOption("#FF0F172A", "\u591c\u7a7a\u84dd"),
+            HighlightColorOption("#FF6B7280", "\u77f3\u677f\u7070"),
         )
         const val YOUSHU_LOGIN_URL = "https://m.youshu.me/login.php"
         const val YOUSHU_FAST_LOGIN_VERIFY_ATTEMPTS = 1

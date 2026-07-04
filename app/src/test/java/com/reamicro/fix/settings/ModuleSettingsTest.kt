@@ -210,6 +210,25 @@ class ModuleSettingsTest {
     }
 
     @Test
+    fun profileBackgroundDefaultColorMatchesSpec() {
+        assertEquals(
+            ModuleSettings.DEFAULT_PROFILE_BACKGROUND_COLOR,
+            ModuleSettingsSnapshot().profileBackgroundColor,
+        )
+    }
+
+    @Test
+    fun profileBackgroundColorIsCarriedThroughSnapshot() {
+        val snapshot = ModuleSettingsSnapshot(
+            moduleEnabled = true,
+            profileBackgroundEnabled = true,
+            profileBackgroundColor = "#FF1F2937",
+        )
+        assertEquals("#FF1F2937", snapshot.profileBackgroundColor)
+        assertTrue(snapshot.canShowProfileBackground)
+    }
+
+    @Test
     fun legacyAccountParentSwitchNoLongerBlocksChildSwitches() {
         val snapshot = ModuleSettingsSnapshot(
             accountEnabled = false,

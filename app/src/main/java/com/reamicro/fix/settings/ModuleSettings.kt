@@ -40,6 +40,9 @@ object ModuleSettings {
     const val KEY_ROTATION_LANDSCAPE_LOCK_ENABLED = "rotation_landscape_lock_enabled"
     const val KEY_ROTATION_REVERSE_ENABLED = "rotation_reverse_enabled"
     const val KEY_PROFILE_BACKGROUND_ENABLED = "profile_background_enabled"
+    const val KEY_PROFILE_BACKGROUND_COLOR = "profile_background_color"
+    const val KEY_PROFILE_BACKGROUND_USE_IMAGE = "profile_background_use_image"
+    const val KEY_PROFILE_BACKGROUND_IMAGE = "profile_background_image"
 
     private const val KEY_ASSOCIATION_SOURCE_PREFIX = "association_source_"
     private const val KEY_ONLINE_SOURCE_PREFIX = "online_source_"
@@ -80,6 +83,9 @@ object ModuleSettings {
     const val DEFAULT_ROTATION_LANDSCAPE_LOCK_ENABLED = false
     const val DEFAULT_ROTATION_REVERSE_ENABLED = false
     const val DEFAULT_PROFILE_BACKGROUND_ENABLED = false
+    const val DEFAULT_PROFILE_BACKGROUND_COLOR = "#80000000"
+    const val DEFAULT_PROFILE_BACKGROUND_USE_IMAGE = false
+    const val DEFAULT_PROFILE_BACKGROUND_IMAGE = ""
     val ROTATION_BASE_KEYS = setOf(
         KEY_ROTATION_AUTO_ENABLED,
         KEY_ROTATION_PORTRAIT_LOCK_ENABLED,
@@ -178,6 +184,9 @@ data class ModuleSettingsSnapshot(
     val rotation: RotationSelection = RotationSelection(),
     val rotationReverseEnabled: Boolean = ModuleSettings.DEFAULT_ROTATION_REVERSE_ENABLED,
     val profileBackgroundEnabled: Boolean = ModuleSettings.DEFAULT_PROFILE_BACKGROUND_ENABLED,
+    val profileBackgroundColor: String = ModuleSettings.DEFAULT_PROFILE_BACKGROUND_COLOR,
+    val profileBackgroundUseImage: Boolean = ModuleSettings.DEFAULT_PROFILE_BACKGROUND_USE_IMAGE,
+    val profileBackgroundImage: String = ModuleSettings.DEFAULT_PROFILE_BACKGROUND_IMAGE,
     val associationSearchSources: Map<String, Boolean> = ModuleSettings.defaultAssociationSearchSources(),
 ) {
     val canRunAssociation: Boolean

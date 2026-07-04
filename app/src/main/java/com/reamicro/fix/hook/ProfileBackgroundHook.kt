@@ -1,241 +1,887 @@
 package com.reamicro.fix.hook
 
 import android.app.Activity
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.BitmapShader
+import android.graphics.Shader
 import com.reamicro.fix.settings.ModuleSettingsSnapshot
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
+import java.io.File
 import java.lang.reflect.Method
-import java.lang.reflect.Proxy
 
 /**
- * Stage 1: take over the Profile screen toolbar (个人中心顶栏) and paint a solid
- * background strip behind it. The gear icon is not redrawn yet; instead the whole
- * strip stays clickable and reuses the host's [onSettings] callback so tapping it
- * still opens settings. The background image variant is a later stage.
+ * Stage 4: paints a configurable solid color OR image over the
+ * "avatar top banner" region of the Profile screen (个人中心头像上方色块)
+ * without touching the host's toolbar icons, avatars, or click behaviour.
+ *
+ * Mechanism: the host's ProfileScreen.lambda$0$1 ("ProfileScreen.kt:48"
+ * anonymous content lambda) sets a thread-local flag while it executes.
+ *
+ * Color mode: ColorScheme.getSurfaceContainerHigh is intercepted while the
+ * flag is set so the host's `Modifier.background(surfaceContainerHigh)` call
+ * at ProfileScreen.kt:51 paints our configured color.
+ *
+ * Image mode: BackgroundKt.background-bw27NRU$default (the colour-background
+ * factory invoked at ProfileScreen.kt:51) is intercepted while the flag is
+ * set; the original Modifier argument is re-routed through Brush-based
+ * background$default with a BitmapShader brush built from the user's
+ * configured image file. The result is patched in afterHookedMethod so the
+ * host's downstream Modifier chain receives a brush-painted Modifier instead
+ * of the colour-painted one.
+ *
+ * All other UI elements (gear/back icons in the toolbar, avatars, lists) keep
+ * their own colour sources and are untouched.
  */
 class ProfileBackgroundHook(
     private val classLoader: ClassLoader,
     private val activityProvider: () -> Activity?,
     private val settingsProvider: () -> ModuleSettingsSnapshot = { ModuleSettingsSnapshot() },
 ) {
+    private val inProfileLambda = ThreadLocal<Boolean>()
+    private val backgroundCallCount = ThreadLocal<Int>()
+    private val fillMaxSizeCallCount = ThreadLocal<Int>()
     private val methodCache = HashMap<String, Method>()
+    private var cachedBitmap: Bitmap? = null
+    private var cachedImagePath: String? = null
+    private var cachedHeaderBitmap: Bitmap? = null
+    private var cachedHeaderBitmapKey: String? = null
+    @Volatile private var cachedColorScheme: Any? = null
 
     fun install() {
+        installProfileScreenLambdaHook()
+        installColorHook()
+        installFillMaxSizeHook()
+        installBackgroundFactoryHook()
+        installProfileDividerHook()
+    }
+
+    private fun installProfileDividerHook() {
         runCatching {
-            val target = method(PROFILE_TOOLBAR_CLASS, PROFILE_TOOLBAR_METHOD, 3)
+            val dividerClass = XposedHelpers.findClass(DIVIDER_KT_CLASS, classLoader)
+            val target = dividerClass.declaredMethods.firstOrNull { m ->
+                m.name == SIMPLE_DIVIDER_METHOD && m.parameterTypes.size == 5
+            } ?: run {
+                XposedBridge.log("$LOG_PREFIX SimpleDivider not found")
+                return
+            }
+            XposedBridge.hookMethod(
+                target,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        if (inProfileLambda.get() != true) return
+                        if (!settingsProvider().canShowProfileBackground) return
+                        // Suppress the divider draw -- it is the white horizontal
+                        // rule that the host paints across the screen between the
+                        // avatar-top region and the lower content (ProfileScreen.kt:119).
+                        param.result = null
+                    }
+                },
+            )
+            XposedBridge.log("$LOG_PREFIX SimpleDivider hook installed")
+        }.onFailure {
+            XposedBridge.log("$LOG_PREFIX failed to hook SimpleDivider: ${it.stackTraceToString()}")
+        }
+    }
+
+    private fun installProfileScreenLambdaHook() {
+        runCatching {
+            val target = findProfileScreenLambdaMethod() ?: run {
+                XposedBridge.log("$LOG_PREFIX ProfileScreen\$lambda\$0\$1 not found")
+                return
+            }
             XposedBridge.hookMethod(
                 target,
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         if (!settingsProvider().canShowProfileBackground) return
-                        val onSettings = param.args?.getOrNull(0) ?: return
-                        val composer = param.args?.getOrNull(1) ?: return
-                        runCatching {
-                            renderProfileToolbar(onSettings, composer)
-                            param.result = null
-                        }.onFailure {
-                            XposedBridge.log(
-                                "$LOG_PREFIX render failed, falling back to original: " +
-                                    it.stackTraceToString(),
-                            )
-                        }
+                        cacheColorSchemeFromArgs(param.args)
+                        inProfileLambda.set(true)
+                        backgroundCallCount.set(0)
+                        fillMaxSizeCallCount.set(0)
+                    }
+
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        inProfileLambda.set(false)
+                        backgroundCallCount.remove()
+                        fillMaxSizeCallCount.remove()
                     }
                 },
             )
-            XposedBridge.log("$LOG_PREFIX ProfileToolbar hook installed")
+            XposedBridge.log("$LOG_PREFIX ProfileScreen lambda hook installed")
         }.onFailure {
-            XposedBridge.log("$LOG_PREFIX failed to hook ProfileToolbar: ${it.stackTraceToString()}")
+            XposedBridge.log("$LOG_PREFIX failed to hook ProfileScreen lambda: ${it.stackTraceToString()}")
         }
     }
 
-    private fun renderProfileToolbar(onSettings: Any, composer: Any) {
-        val background = backgroundModifier()
-        val content = composableLambda(PROFILE_BG_CONTENT_KEY, FUNCTION3_CLASS) { args ->
-            val innerComposer = args?.getOrNull(1) ?: return@composableLambda targetUnit()
-            renderClickableArea(onSettings, innerComposer)
-            targetUnit()
+    private fun installColorHook() {
+        runCatching {
+            val colorSchemeClass = XposedHelpers.findClass(COLOR_SCHEME_CLASS, classLoader)
+            val target = colorSchemeClass.declaredMethods.firstOrNull { method ->
+                method.name == SURFACE_CONTAINER_HIGH_METHOD && method.parameterTypes.isEmpty()
+            } ?: run {
+                XposedBridge.log("$LOG_PREFIX $SURFACE_CONTAINER_HIGH_METHOD not found")
+                return
+            }
+            XposedBridge.hookMethod(
+                target,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        if (inProfileLambda.get() != true) return
+                        // Cache the ColorScheme instance the host is currently
+                        // using so we can resolve Theme.getBackgroundAuto later
+                        // (used by verticalGradientHostFadeBrush when the image
+                        // mode is on). In color mode we also override the
+                        // returned colour to the user's configured ARGB.
+                        cachedColorScheme = param.thisObject
+                        val snapshot = settingsProvider()
+                        if (!snapshot.canShowProfileBackground) return
+                        if (snapshot.profileBackgroundUseImage) return
+                        val argb = parseArgb(snapshot.profileBackgroundColor)
+                        param.result = colorLongFromArgb(argb)
+                    }
+                },
+            )
+            XposedBridge.log("$LOG_PREFIX ColorScheme.$SURFACE_CONTAINER_HIGH_METHOD hook installed")
+        }.onFailure {
+            XposedBridge.log("$LOG_PREFIX failed to hook ColorScheme: ${it.stackTraceToString()}")
         }
-        method(COLUMN_KT_CLASS, COLUMN_METHOD, 7).invoke(
-            null,
-            background,
-            arrangementTop(),
-            alignmentStart(),
-            content,
-            composer,
-            0,
-            0,
-        )
     }
 
-    private fun backgroundModifier(): Any {
-        val filled = method(SIZE_KT_CLASS, FILL_MAX_WIDTH_DEFAULT_METHOD, 4)
-            .invoke(null, modifierInstance(), 0f, 1, null)
-        val sized = method(SIZE_KT_CLASS, HEIGHT_METHOD, 2)
-            .invoke(null, filled, udp(TOOLBAR_HEIGHT_DP))
-        return method(BACKGROUND_KT_CLASS, BACKGROUND_DEFAULT_METHOD, 5)
-            .invoke(null, sized, colorFromArgb(BACKGROUND_ARGB), null, 2, null)
-    }
-
-    private fun renderClickableArea(onSettings: Any, composer: Any) {
-        val base = method(SIZE_KT_CLASS, FILL_MAX_WIDTH_DEFAULT_METHOD, 4)
-            .invoke(null, modifierInstance(), 0f, 1, null)
-        val modifier = method(CLICKABLE_KT_CLASS, CLICKABLE_DEFAULT_METHOD, 9).invoke(
-            null,
-            base,
-            null,
-            null,
-            false,
-            null,
-            null,
-            functionProxy("ProfileBackgroundClick", FUNCTION0_CLASS) {
-                runCatching { onSettings.method0("invoke") }
-                targetUnit()
-            },
-            28,
-            null,
-        )
-        val content = composableLambda(PROFILE_BG_AREA_KEY, FUNCTION3_CLASS) { args ->
-            args?.getOrNull(1) ?: return@composableLambda targetUnit()
-            targetUnit()
+    private fun installBackgroundFactoryHook() {
+        runCatching {
+            val backgroundKtClass = XposedHelpers.findClass(BACKGROUND_KT_CLASS, classLoader)
+            val target = backgroundKtClass.declaredMethods.firstOrNull { method ->
+                method.name == COLOR_BACKGROUND_DEFAULT_METHOD && method.parameterTypes.size == 5
+            } ?: run {
+                XposedBridge.log("$LOG_PREFIX $COLOR_BACKGROUND_DEFAULT_METHOD not found")
+                return
+            }
+            XposedBridge.hookMethod(
+                target,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        if (inProfileLambda.get() != true) return
+                        val snapshot = settingsProvider()
+                        if (!snapshot.canShowProfileBackground) return
+                        if (!snapshot.profileBackgroundUseImage) return
+                        val path = snapshot.profileBackgroundImage
+                        if (path.isBlank()) return
+                        // Inside ProfileScreen's content lambda, the host calls
+                        // background-bw27NRU$default at least twice: once for the
+                        // avatar-top banner (ProfileScreen.kt:51) and once for a
+                        // rounded card further down (ProfileScreen.kt:87). Only
+                        // the first call corresponds to the avatar-top region, so
+                        // count calls per lambda entry and patch only the first.
+                        val count = (backgroundCallCount.get() ?: 0) + 1
+                        backgroundCallCount.set(count)
+                        if (count != 1) return
+                        val modifier = param.args?.getOrNull(0) ?: return
+                        // The root fillMaxSize hook paints one continuous
+                        // top-header image. Skip this host colour background so
+                        // the lower profile header does not hard-switch between
+                        // two separately painted image layers.
+                        param.result = modifier
+                    }
+                },
+            )
+            XposedBridge.log("$LOG_PREFIX BackgroundKt.$COLOR_BACKGROUND_DEFAULT_METHOD hook installed")
+        }.onFailure {
+            XposedBridge.log("$LOG_PREFIX failed to hook BackgroundKt: ${it.stackTraceToString()}")
         }
-        method(COLUMN_KT_CLASS, COLUMN_METHOD, 7).invoke(
-            null,
-            modifier,
-            arrangementTop(),
-            alignmentStart(),
-            content,
-            composer,
-            0,
-            0,
-        )
     }
 
-    private fun colorFromArgb(argb: Int): Long =
-        cls(COLOR_KT_CLASS).declaredMethods.first {
-            it.name == COLOR_METHOD &&
-                it.parameterTypes.size == 1 &&
-                it.parameterTypes[0] == Int::class.javaPrimitiveType
-        }.apply { isAccessible = true }.invoke(null, argb) as Long
+    private fun findProfileScreenLambdaMethod(): Method? {
+        val profileScreenClass = XposedHelpers.findClass(PROFILE_SCREEN_CLASS, classLoader)
+        return profileScreenClass.declaredMethods.firstOrNull { method ->
+            method.name == "ProfileScreen\$lambda\$0\$1"
+        }
+    }
 
-    private fun composableLambda(key: Int, functionClassName: String, block: (Array<Any?>?) -> Any?): Any =
-        method(COMPOSABLE_LAMBDA_KT_CLASS, COMPOSABLE_LAMBDA_METHOD, 3).invoke(
-            null,
-            key,
-            true,
-            functionProxy("Composable$key", functionClassName, block),
-        )
+    private fun cacheColorSchemeFromArgs(args: Array<Any?>?) {
+        val composerClass = runCatching { XposedHelpers.findClass(COMPOSER_CLASS, classLoader) }.getOrNull() ?: return
+        args
+            ?.firstOrNull { arg -> arg != null && composerClass.isInstance(arg) }
+            ?.let { composer ->
+                materialColorScheme(composer)?.let { scheme ->
+                    cachedColorScheme = scheme
+                }
+            }
+    }
 
-    private fun functionProxy(name: String, functionClassName: String, block: (Array<Any?>?) -> Any?): Any {
-        val functionClass = cls(functionClassName)
-        return Proxy.newProxyInstance(classLoader, arrayOf(functionClass)) { proxy, proxyMethod, args ->
-            when (proxyMethod.name) {
-                "invoke" -> runCatching {
-                    block(args)
-                }.onFailure {
-                    XposedBridge.log("$LOG_PREFIX failed in $name callback: ${it.stackTraceToString()}")
-                }.getOrElse { targetUnit() }
-                "toString" -> "ReaMicro$name"
-                "hashCode" -> System.identityHashCode(proxy)
-                "equals" -> proxy === args?.getOrNull(0)
-                else -> null
+    private fun installFillMaxSizeHook() {
+        runCatching {
+            val sizeKtClass = XposedHelpers.findClass(SIZE_KT_CLASS, classLoader)
+            val target = sizeKtClass.declaredMethods.firstOrNull { method ->
+                method.name == FILL_MAX_SIZE_DEFAULT_METHOD && method.parameterTypes.size == 4
+            } ?: run {
+                XposedBridge.log("$LOG_PREFIX $FILL_MAX_SIZE_DEFAULT_METHOD not found")
+                return
+            }
+            XposedBridge.hookMethod(
+                target,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        if (inProfileLambda.get() != true) return
+                        val snapshot = settingsProvider()
+                        if (!snapshot.canShowProfileBackground) return
+                        if (!snapshot.profileBackgroundUseImage) return
+                        val path = snapshot.profileBackgroundImage
+                        if (path.isBlank()) return
+                        val count = (fillMaxSizeCallCount.get() ?: 0) + 1
+                        fillMaxSizeCallCount.set(count)
+                        if (count != 1) return
+                        val originalModifier = param.result ?: return
+                        val bitmap = loadBitmap(path) ?: return
+                        val imageBrush = headerBitmapShaderBrush(path, bitmap) ?: return
+                        val fadeBrush = verticalGradientHeaderFadeBrush(
+                            hostBackgroundArgb() ?: profileBackgroundPageFallbackArgb(),
+                        )
+                        var patchedModifier = invokeBrushBackground(originalModifier, imageBrush, null) ?: return
+                        if (fadeBrush != null) {
+                            patchedModifier = invokeBrushBackground(patchedModifier, fadeBrush, null) ?: patchedModifier
+                        }
+                        param.result = patchedModifier
+                    }
+                },
+            )
+            XposedBridge.log("$LOG_PREFIX SizeKt.$FILL_MAX_SIZE_DEFAULT_METHOD hook installed")
+        }.onFailure {
+            XposedBridge.log("$LOG_PREFIX failed to hook fillMaxSize: ${it.stackTraceToString()}")
+        }
+    }
+
+    private fun bottomEdgeAverageColor(bitmap: Bitmap): Int {
+        // Average the bottom ~5% rows (after downscaling) so a single row of
+        // oddly-coloured pixels doesn't dominate the slab colour.
+        val downscale = 0.25f
+        val smallW = (bitmap.width * downscale).toInt().coerceAtLeast(1)
+        val smallH = (bitmap.height * downscale).toInt().coerceAtLeast(1)
+        val small = Bitmap.createScaledBitmap(bitmap, smallW, smallH, true)
+        val sampleRows = (smallH * 0.05f).toInt().coerceAtLeast(1)
+        val startRow = (smallH - sampleRows).coerceAtLeast(0)
+        var a = 0; var r = 0; var g = 0; var b = 0
+        var count = 0
+        for (y in startRow until smallH) {
+            for (x in 0 until smallW) {
+                val p = small.getPixel(x, y)
+                a += (p ushr 24) and 0xff
+                r += (p ushr 16) and 0xff
+                g += (p ushr 8) and 0xff
+                b += p and 0xff
+                count++
             }
         }
+        if (count == 0) return 0xFF808080.toInt()
+        return ((a / count) shl 24) or ((r / count) shl 16) or ((g / count) shl 8) or (b / count)
     }
 
-    private fun cls(className: String): Class<*> =
-        XposedHelpers.findClass(className, classLoader)
-
-    private fun method(className: String, methodName: String, parameterCount: Int): Method {
-        val cacheKey = "$className#$methodName/$parameterCount"
-        return synchronized(methodCache) {
-            methodCache.getOrPut(cacheKey) {
-                cls(className).declaredMethods.firstOrNull {
-                    it.name == methodName && it.parameterTypes.size == parameterCount
-                }?.apply { isAccessible = true }
-                    ?: error("$className.$methodName/$parameterCount not found")
-            }
+    private fun verticalGradientBottomEdgeBrush(bitmap: Bitmap, bottomArgb: Int): Any? = runCatching {
+        val activity = activityProvider() ?: return@runCatching null
+        val brushCompanionClass = XposedHelpers.findClass(BRUSH_COMPANION_CLASS, classLoader)
+            .getDeclaredField("Companion").apply { isAccessible = true }.get(null)
+        val companionClass = XposedHelpers.findClass("$BRUSH_COMPANION_CLASS\$Companion", classLoader)
+        val gradientMethod = companionClass.declaredMethods.firstOrNull { m ->
+            m.name == VERTICAL_GRADIENT_DEFAULT_METHOD && m.parameterTypes.size == 7
+        }?.apply { isAccessible = true } ?: run {
+            XposedBridge.log("$LOG_PREFIX $VERTICAL_GRADIENT_DEFAULT_METHOD not found")
+            return@runCatching null
         }
+        val colorClass = XposedHelpers.findClass(COLOR_CLASS, classLoader)
+        val boxMethod = colorClass.getDeclaredMethod(COLOR_BOX_METHOD, java.lang.Long.TYPE).apply { isAccessible = true }
+        // The avatar-top banner (ProfileScreen.kt:51) renders the user image
+        // at fit-to-width from y=0 down to y=imageBottomY. Above that line the
+        // banner itself is what the user sees; below it we want a clean fade
+        // from the image's bottom-edge colour into the host's page background.
+        // So the gradient does NOT start at y=0 -- it starts at imageBottomY.
+        // Above imageBottomY the gradient contributes nothing (the banner
+        // paints there). Below imageBottomY we fade from opaque image-bottom
+        // colour at the top of the band to fully transparent (same RGB) at the
+        // page bottom, letting the host's own page background show through.
+        val opaque = boxMethod.invoke(null, colorLongFromArgb(bottomArgb or 0xFF000000.toInt()))
+        val transparent = boxMethod.invoke(null, colorLongFromArgb(bottomArgb and 0x00FFFFFF.toInt()))
+        val colors = java.util.ArrayList<Any>(2).apply {
+            add(opaque)
+            add(transparent)
+        }
+        // Fit-to-width scaling matches banner hook: scale = screenWidth / bitmapW,
+        // so scaledImageHeight = scale * bitmapH.
+        val screenPx = activity.resources.displayMetrics.widthPixels
+        val screenHeight = activity.resources.displayMetrics.heightPixels.toFloat()
+        val imageBottomY = (screenPx.toFloat() / bitmap.width.coerceAtLeast(1)) * bitmap.height
+        val startY = imageBottomY.coerceIn(0f, screenHeight)
+        gradientMethod.invoke(
+            null,
+            brushCompanionClass,
+            colors,
+            startY,
+            screenHeight,
+            0,
+            0,
+            null,
+        )
+    }.getOrElse {
+        XposedBridge.log("$LOG_PREFIX verticalGradientBottomEdgeBrush failed: ${it.stackTraceToString()}")
+        null
     }
 
-    private fun staticObject(className: String, fieldName: String): Any {
-        val clazz = cls(className)
-        return runCatching {
-            clazz.getDeclaredField(fieldName).apply { isAccessible = true }.get(null)
-        }.recoverCatching {
-            clazz.getField("Companion").apply { isAccessible = true }.get(null)
-        }.recoverCatching {
-            cls("$className\$Companion").getDeclaredField("\$\$INSTANCE")
-                .apply { isAccessible = true }
-                .get(null)
-        }.getOrThrow()
+    private fun loadBitmap(path: String): Bitmap? {
+        if (cachedImagePath == path && cachedBitmap != null) return cachedBitmap
+        val file = File(path)
+        if (!file.isFile) {
+            XposedBridge.log("$LOG_PREFIX image file not found: $path")
+            return null
+        }
+        val bitmap = runCatching {
+            BitmapFactory.decodeFile(path)
+        }.getOrElse {
+            XposedBridge.log("$LOG_PREFIX decode image failed: ${it.stackTraceToString()}")
+            return null
+        }
+        cachedBitmap = bitmap
+        cachedImagePath = path
+        return bitmap
     }
 
-    private fun modifierInstance(): Any =
-        staticObject(MODIFIER_CLASS, "INSTANCE")
-
-    private fun arrangementTop(): Any =
-        staticObject(ARRANGEMENT_CLASS, "INSTANCE").method0("getTop")
-
-    private fun alignmentStart(): Any =
-        staticObject(ALIGNMENT_CLASS, "INSTANCE").method0("getStart")
-
-    private fun udp(value: Int): Float =
-        cls(UNIT_EXT_KT_CLASS).declaredMethods.first {
-            it.name == UDP_METHOD && it.parameterTypes.contentEquals(arrayOf(Int::class.javaPrimitiveType))
-        }.invoke(null, value) as Float
-
-    private fun targetUnit(): Any? = runCatching {
-        val unitClass = cls("kotlin.Unit")
-        unitClass.getDeclaredField("INSTANCE").apply { isAccessible = true }.get(null)
-    }.recoverCatching {
-        cls("kotlin.Unit").getField("Companion").apply { isAccessible = true }.get(null)
-    }.recoverCatching {
-        cls("kotlin.Unit\$Companion").getDeclaredField("\$\$INSTANCE")
-            .apply { isAccessible = true }
-            .get(null)
+    private fun bitmapShaderBrush(bitmap: Bitmap): Any? = runCatching {
+        val activity = activityProvider() ?: return@runCatching null
+        val matrix = android.graphics.Matrix()
+        val screenW = activity.resources.displayMetrics.widthPixels
+        val bw = bitmap.width.toFloat().coerceAtLeast(1f)
+        // Fit-to-width: scale so the image's width matches the screen width.
+        // Vertical direction uses the same scale, so portrait images extend
+        // downward (potentially beyond the screen), landscape images only
+        // occupy the top band of the page. Width is always preserved.
+        val scale = screenW / bw
+        matrix.setScale(scale, scale)
+        // DECAL on API 31+ so pixels beyond the image rectangle render as
+        // fully transparent -- crucial: this prevents the CLAMP edge-stretch
+        // band from leaking through the layers above/below the image's
+        // natural height, which was the visible "stretched" area the user
+        // reported. Below API 31 we fall back to CLAMP (the visibility is
+        // best-effort; modern devices are API 31+).
+        val tileMode = if (android.os.Build.VERSION.SDK_INT >= 31) {
+            Shader.TileMode.DECAL
+        } else {
+            Shader.TileMode.CLAMP
+        }
+        val shader = BitmapShader(bitmap, tileMode, tileMode).apply {
+            setLocalMatrix(matrix)
+        }
+        val brushKtClass = XposedHelpers.findClass(BRUSH_KT_CLASS, classLoader)
+        val factory = brushKtClass.declaredMethods.firstOrNull { m ->
+            m.name == SHADER_BRUSH_METHOD && m.parameterTypes.size == 1 &&
+                m.parameterTypes[0] == Shader::class.java
+        }?.apply { isAccessible = true } ?: return@runCatching null
+        factory.invoke(null, shader)
     }.getOrNull()
 
-    private fun Any.method0(name: String): Any =
-        javaClass.methods.first {
-            it.parameterTypes.isEmpty() && (it.name == name || it.name.startsWith("$name-"))
-        }.invoke(this)
+    private fun headerBitmapShaderBrush(path: String, bitmap: Bitmap): Any? = runCatching {
+        val activity = activityProvider() ?: return@runCatching null
+        val density = activity.resources.displayMetrics.density.coerceAtLeast(1f)
+        val screenW = activity.resources.displayMetrics.widthPixels.coerceAtLeast(1)
+        val headerH = (PROFILE_BACKGROUND_HEADER_HEIGHT_DP * density).toInt().coerceAtLeast(1)
+        val key = "$path|$screenW|$headerH"
+        val headerBitmap = if (cachedHeaderBitmapKey == key && cachedHeaderBitmap != null) {
+            cachedHeaderBitmap!!
+        } else {
+            Bitmap.createBitmap(screenW, headerH, Bitmap.Config.ARGB_8888).also { target ->
+                val canvas = android.graphics.Canvas(target)
+                val paint = android.graphics.Paint(
+                    android.graphics.Paint.ANTI_ALIAS_FLAG or android.graphics.Paint.FILTER_BITMAP_FLAG,
+                )
+                val scale = maxOf(
+                    screenW.toFloat() / bitmap.width.toFloat().coerceAtLeast(1f),
+                    headerH.toFloat() / bitmap.height.toFloat().coerceAtLeast(1f),
+                )
+                val scaledW = bitmap.width * scale
+                val scaledH = bitmap.height * scale
+                val left = (screenW - scaledW) / 2f
+                val top = 0f
+                canvas.drawBitmap(
+                    bitmap,
+                    null,
+                    android.graphics.RectF(left, top, left + scaledW, top + scaledH),
+                    paint,
+                )
+                cachedHeaderBitmap = target
+                cachedHeaderBitmapKey = key
+            }
+        }
+        val tileMode = if (android.os.Build.VERSION.SDK_INT >= 31) {
+            Shader.TileMode.DECAL
+        } else {
+            Shader.TileMode.CLAMP
+        }
+        val shader = BitmapShader(headerBitmap, tileMode, tileMode)
+        val brushKtClass = XposedHelpers.findClass(BRUSH_KT_CLASS, classLoader)
+        val factory = brushKtClass.declaredMethods.firstOrNull { m ->
+            m.name == SHADER_BRUSH_METHOD && m.parameterTypes.size == 1 &&
+                m.parameterTypes[0] == Shader::class.java
+        }?.apply { isAccessible = true } ?: return@runCatching null
+        factory.invoke(null, shader)
+    }.getOrElse {
+        XposedBridge.log("$LOG_PREFIX headerBitmapShaderBrush failed: ${it.stackTraceToString()}")
+        null
+    }
+
+    private fun verticalGradientFadeToWhiteBrush(bitmap: Bitmap): Any? = runCatching {
+        val activity = activityProvider() ?: return@runCatching null
+        val brushCompanionClass = XposedHelpers.findClass(BRUSH_COMPANION_CLASS, classLoader)
+            .getDeclaredField("Companion").apply { isAccessible = true }.get(null)
+        val companionClass = XposedHelpers.findClass("$BRUSH_COMPANION_CLASS\$Companion", classLoader)
+        val gradientMethod = companionClass.declaredMethods.firstOrNull { m ->
+            m.name == VERTICAL_GRADIENT_DEFAULT_METHOD && m.parameterTypes.size == 7
+        }?.apply { isAccessible = true } ?: run {
+            XposedBridge.log("$LOG_PREFIX $VERTICAL_GRADIENT_DEFAULT_METHOD not found")
+            return@runCatching null
+        }
+        val colorClass = XposedHelpers.findClass(COLOR_CLASS, classLoader)
+        val boxMethod = colorClass.getDeclaredMethod(COLOR_BOX_METHOD, java.lang.Long.TYPE).apply { isAccessible = true }
+        // Two stops: transparent at the image's bottom edge (so the upper
+        // region shows the user image 1:1) fading to ~80% opaque white at the
+        // page bottom so the lower content area is a soft wash and any CLAMP
+        // stretch band below the image's natural height gets masked.
+        val top = boxMethod.invoke(null, colorLongFromArgb(0x00FFFFFF))
+        val bottom = boxMethod.invoke(null, colorLongFromArgb(0xCCFFFFFF.toInt()))
+        val colors = java.util.ArrayList<Any>(2).apply {
+            add(top)
+            add(bottom)
+        }
+        // startY = where the image's natural height ends at fit-to-width scale
+        // (so we don't waste gradient range above that -- the image is 100%
+        // visible up to that line). endY = page bottom.
+        val screenW = activity.resources.displayMetrics.widthPixels
+        val screenHeight = activity.resources.displayMetrics.heightPixels.toFloat()
+        val imageBottomY = (screenW.toFloat() / bitmap.width.coerceAtLeast(1)) * bitmap.height
+        val startY = imageBottomY.coerceIn(0f, screenHeight)
+        gradientMethod.invoke(
+            null,
+            brushCompanionClass,
+            colors,
+            startY,
+            screenHeight,
+            0,
+            0,
+            null,
+        )
+    }.getOrElse {
+        XposedBridge.log("$LOG_PREFIX verticalGradientFadeToWhiteBrush failed: ${it.stackTraceToString()}")
+        null
+    }
+
+    private fun verticalGradientWhiteFadeBrush(): Any? = runCatching {
+        verticalGradientHostFadeBrush(0xFFFFFFFF.toInt())
+    }.getOrNull()
+
+    private fun hostBackgroundArgb(): Int? = runCatching {
+        // Resolve the host's page background colour the same way the host does
+        // at ProfileScreen.kt:87: ThemeKt.getBackgroundAuto(ColorScheme).
+        // The ProfileScreen lambda hook eagerly caches MaterialTheme's
+        // ColorScheme before fillMaxSize is patched, so first render and
+        // return-from-settings render use the same target background.
+        val scheme = cachedColorScheme ?: return@runCatching null
+        val themeKtClass = XposedHelpers.findClass(THEME_KT_CLASS, classLoader)
+        val method = themeKtClass.declaredMethods.firstOrNull { m ->
+            m.name == THEME_GET_BACKGROUND_AUTO_METHOD && m.parameterTypes.size == 1
+        }?.apply { isAccessible = true } ?: return@runCatching null
+        val colorLong = method.invoke(null, scheme) as Long
+        colorLongToArgb(colorLong)
+    }.getOrNull()
+
+    private fun materialColorScheme(composer: Any): Any? = runCatching {
+        val materialThemeClass = XposedHelpers.findClass(MATERIAL_THEME_CLASS, classLoader)
+        val materialTheme = staticObject(materialThemeClass, "INSTANCE")
+        val stable = materialThemeClass.getDeclaredField("\$stable").apply { isAccessible = true }.getInt(null)
+        materialThemeClass.declaredMethods.firstOrNull { method ->
+            method.name == "getColorScheme" && method.parameterTypes.size == 2
+        }?.apply { isAccessible = true }?.invoke(materialTheme, composer, stable)
+    }.getOrElse {
+        XposedBridge.log("$LOG_PREFIX failed to cache MaterialTheme colorScheme: ${it.stackTraceToString()}")
+        null
+    }
+
+    private fun profileBackgroundPageFallbackArgb(): Int {
+        val activity = activityProvider() ?: return PROFILE_BACKGROUND_DARK_PAGE_ARGB_FALLBACK
+        val nightMode = activity.resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK
+        return if (nightMode == android.content.res.Configuration.UI_MODE_NIGHT_YES) {
+            PROFILE_BACKGROUND_DARK_PAGE_ARGB_FALLBACK
+        } else {
+            PROFILE_BACKGROUND_LIGHT_PAGE_ARGB_FALLBACK
+        }
+    }
+
+    private fun colorLongToArgb(colorLong: Long): Int {
+        // Compose Color is packed as ulong with ARGB. Aside from the high
+        // 32 bits being alpha-red-green-blue, the layout matches (0xAARRGGBB)
+        // when narrowed to int.
+        return colorLong.toInt()
+    }
+
+    private fun verticalGradientBannerOverlayBrush(backgroundArgb: Int): Any? = runCatching {
+        val activity = activityProvider() ?: return@runCatching null
+        val brushCompanionClass = XposedHelpers.findClass(BRUSH_COMPANION_CLASS, classLoader)
+            .getDeclaredField("Companion").apply { isAccessible = true }.get(null)
+        val companionClass = XposedHelpers.findClass("$BRUSH_COMPANION_CLASS\$Companion", classLoader)
+        val gradientMethod = companionClass.declaredMethods.firstOrNull { m ->
+            m.name == VERTICAL_GRADIENT_DEFAULT_METHOD && m.parameterTypes.size == 7
+        }?.apply { isAccessible = true } ?: run {
+            XposedBridge.log("$LOG_PREFIX $VERTICAL_GRADIENT_DEFAULT_METHOD not found")
+            return@runCatching null
+        }
+        val colorClass = XposedHelpers.findClass(COLOR_CLASS, classLoader)
+        val boxMethod = colorClass.getDeclaredMethod(COLOR_BOX_METHOD, java.lang.Long.TYPE).apply { isAccessible = true }
+        fun boxedColor(argb: Int): Any =
+            boxMethod.invoke(null, colorLongFromArgb(argb)) ?: error("Color.box returned null")
+
+        val colors = java.util.ArrayList<Any>(4).apply {
+            add(boxedColor(0x66000000))
+            add(boxedColor(0x20000000))
+            add(boxedColor(argbWithAlpha(backgroundArgb, 0xCC)))
+            add(boxedColor(argbWithAlpha(backgroundArgb, 0xFF)))
+        }
+        val density = activity.resources.displayMetrics.density.coerceAtLeast(1f)
+        val screenWidth = activity.resources.displayMetrics.widthPixels.toFloat()
+        val fadeHeight = (screenWidth * PROFILE_BACKGROUND_BANNER_FADE_WIDTH_RATIO)
+            .coerceIn(
+                PROFILE_BACKGROUND_BANNER_FADE_MIN_DP * density,
+                PROFILE_BACKGROUND_BANNER_FADE_MAX_DP * density,
+            )
+        gradientMethod.invoke(
+            null,
+            brushCompanionClass,
+            colors,
+            0f,
+            fadeHeight,
+            0,
+            0,
+            null,
+        )
+    }.getOrElse {
+        XposedBridge.log("$LOG_PREFIX verticalGradientBannerOverlayBrush failed: ${it.stackTraceToString()}")
+        null
+    }
+
+    private fun verticalGradientHeaderFadeBrush(backgroundArgb: Int): Any? = runCatching {
+        val activity = activityProvider() ?: return@runCatching null
+        val brushCompanionClass = XposedHelpers.findClass(BRUSH_COMPANION_CLASS, classLoader)
+            .getDeclaredField("Companion").apply { isAccessible = true }.get(null)
+        val companionClass = XposedHelpers.findClass("$BRUSH_COMPANION_CLASS\$Companion", classLoader)
+        val gradientMethod = companionClass.declaredMethods.firstOrNull { m ->
+            m.name == VERTICAL_GRADIENT_DEFAULT_METHOD && m.parameterTypes.size == 7
+        }?.apply { isAccessible = true } ?: run {
+            XposedBridge.log("$LOG_PREFIX $VERTICAL_GRADIENT_DEFAULT_METHOD not found")
+            return@runCatching null
+        }
+        val colorClass = XposedHelpers.findClass(COLOR_CLASS, classLoader)
+        val boxMethod = colorClass.getDeclaredMethod(COLOR_BOX_METHOD, java.lang.Long.TYPE).apply { isAccessible = true }
+        fun boxedColor(argb: Int): Any =
+            boxMethod.invoke(null, colorLongFromArgb(argb)) ?: error("Color.box returned null")
+
+        val colors = java.util.ArrayList<Any>(4).apply {
+            add(boxedColor(0x66000000))
+            add(boxedColor(0x22000000))
+            add(boxedColor(argbWithAlpha(backgroundArgb, 0x88)))
+            add(boxedColor(argbWithAlpha(backgroundArgb, 0xFF)))
+        }
+        val density = activity.resources.displayMetrics.density.coerceAtLeast(1f)
+        val fadeHeight = (PROFILE_BACKGROUND_HEADER_HEIGHT_DP * density).coerceAtLeast(1f)
+        gradientMethod.invoke(
+            null,
+            brushCompanionClass,
+            colors,
+            0f,
+            fadeHeight,
+            0,
+            0,
+            null,
+        )
+    }.getOrElse {
+        XposedBridge.log("$LOG_PREFIX verticalGradientHeaderFadeBrush failed: ${it.stackTraceToString()}")
+        null
+    }
+
+    private fun verticalGradientHostFadeBrush(backgroundArgb: Int): Any? = runCatching {
+        val activity = activityProvider() ?: return@runCatching null
+        val brushCompanionClass = XposedHelpers.findClass(BRUSH_COMPANION_CLASS, classLoader)
+            .getDeclaredField("Companion").apply { isAccessible = true }.get(null)
+        val companionClass = XposedHelpers.findClass("$BRUSH_COMPANION_CLASS\$Companion", classLoader)
+        val gradientMethod = companionClass.declaredMethods.firstOrNull { m ->
+            m.name == VERTICAL_GRADIENT_DEFAULT_METHOD && m.parameterTypes.size == 7
+        }?.apply { isAccessible = true } ?: run {
+            XposedBridge.log("$LOG_PREFIX $VERTICAL_GRADIENT_DEFAULT_METHOD not found")
+            return@runCatching null
+        }
+        val colorClass = XposedHelpers.findClass(COLOR_CLASS, classLoader)
+        val boxMethod = colorClass.getDeclaredMethod(COLOR_BOX_METHOD, java.lang.Long.TYPE).apply { isAccessible = true }
+        // Top = fully transparent host background colour (lets the user image
+        // show 1:1 in the avatar-top region). Bottom = opaque host background
+        // colour (covers any clear-image leakage below the natural image
+        // height and blends into the host page background colour naturally).
+        // Because both ends share the host's `getBackgroundAuto` RGB, the
+        // alpha ramp never bleeds into a different hue family -- the wash
+        // stays tonally consistent with the host's own page background.
+        val transparent = boxMethod.invoke(null, colorLongFromArgb(backgroundArgb and 0x00FFFFFF.toInt()))
+        val opaque = boxMethod.invoke(null, colorLongFromArgb(backgroundArgb or 0xFF000000.toInt()))
+        val colors = java.util.ArrayList<Any>(2).apply {
+            add(transparent)
+            add(opaque)
+        }
+        val screenHeight = activity.resources.displayMetrics.heightPixels.toFloat()
+        gradientMethod.invoke(
+            null,
+            brushCompanionClass,
+            colors,
+            0f,
+            screenHeight,
+            0,
+            0,
+            null,
+        )
+    }.getOrElse {
+        XposedBridge.log("$LOG_PREFIX verticalGradientHostFadeBrush failed: ${it.stackTraceToString()}")
+        null
+    }
+
+    private fun blurredBitmapShaderBrush(bitmap: Bitmap): Any? = runCatching {
+        blurredBitmapShaderBrushOffset(bitmap, 0f)
+    }.getOrNull()
+
+    private fun blurredBitmapShaderBrushOffset(bitmap: Bitmap, offsetY: Float): Any? = runCatching {
+        val activity = activityProvider() ?: return@runCatching null
+        // Real Gaussian-ish blur via iterative box blur. We downscale first so
+        // the per-pass cost stays low, then run 3 box-blur passes that converge
+        // to a Gaussian approximation. Final blur radius on the original scale
+        // is roughly radius * downscale reciprocal.
+        val downscale = 0.25f
+        val smallW = (bitmap.width * downscale).toInt().coerceAtLeast(1)
+        val smallH = (bitmap.height * downscale).toInt().coerceAtLeast(1)
+        var small = Bitmap.createScaledBitmap(bitmap, smallW, smallH, true)
+        small = boxBlur(small, radius = 8)
+        val screenW = activity.resources.displayMetrics.widthPixels
+        val matrix = android.graphics.Matrix()
+        // Fit-to-width: keep the same horizontal scale as the clear layer so
+        // both layers' pixels line up horizontally. Vertical direction uses
+        // the same scale, so the blurred image's natural height matches the
+        // clear image's natural height. postTranslate(0, offsetY) shifts the
+        // shader's origin so the blurred copy starts drawing at y=offsetY in
+        // root-Box coordinates -- i.e. immediately below where the clear
+        // image ends.
+        val scale = screenW.toFloat() / smallW.toFloat().coerceAtLeast(1f)
+        matrix.setScale(scale, scale)
+        matrix.postTranslate(0f, offsetY)
+        // DECAL on API 31+ so pixels beyond the (translated) image rectangle
+        // render as fully transparent -- no CLAMP edge-stretch band, no
+        // repetition. The blurred image appears once at its natural size below
+        // the clear image and is surrounded by transparent pixels that let
+        // the host page background show through.
+        val tileMode = if (android.os.Build.VERSION.SDK_INT >= 31) {
+            Shader.TileMode.DECAL
+        } else {
+            Shader.TileMode.CLAMP
+        }
+        val shader = BitmapShader(small, tileMode, tileMode).apply {
+            setLocalMatrix(matrix)
+        }
+        val brushKtClass = XposedHelpers.findClass(BRUSH_KT_CLASS, classLoader)
+        val factory = brushKtClass.declaredMethods.firstOrNull { m ->
+            m.name == SHADER_BRUSH_METHOD && m.parameterTypes.size == 1 &&
+                m.parameterTypes[0] == Shader::class.java
+        }?.apply { isAccessible = true } ?: return@runCatching null
+        factory.invoke(null, shader)
+    }.getOrNull()
+
+    private fun boxBlur(src: Bitmap, radius: Int): Bitmap {
+        if (radius < 1) return src.copy(src.config ?: Bitmap.Config.ARGB_8888, true)
+        val w = src.width
+        val h = src.height
+        val pixels = IntArray(w * h)
+        src.getPixels(pixels, 0, w, 0, 0, w, h)
+        val temp = IntArray(w * h)
+        repeat(3) { // 3 passes ≈ Gaussian
+            boxBlurHorizontal(pixels, temp, w, h, radius)
+            boxBlurVertical(temp, pixels, w, h, radius)
+        }
+        val out = Bitmap.createBitmap(w, h, src.config ?: Bitmap.Config.ARGB_8888)
+        out.setPixels(pixels, 0, w, 0, 0, w, h)
+        return out
+    }
+
+    private fun boxBlurHorizontal(src: IntArray, dst: IntArray, w: Int, h: Int, r: Int) {
+        val window = 2 * r + 1
+        for (y in 0 until h) {
+            val row = y * w
+            var a = 0; var rr = 0; var g = 0; var b = 0
+            for (i in -r..r) {
+                val x = i.coerceIn(0, w - 1)
+                val p = src[row + x]
+                a += (p ushr 24) and 0xff
+                rr += (p ushr 16) and 0xff
+                g += (p ushr 8) and 0xff
+                b += p and 0xff
+            }
+            for (x in 0 until w) {
+                dst[row + x] = ((a / window) shl 24) or ((rr / window) shl 16) or ((g / window) shl 8) or (b / window)
+                val outX = (x + r + 1).coerceIn(0, w - 1)
+                val inX = (x - r).coerceIn(0, w - 1)
+                val pOut = src[row + outX]
+                val pIn = src[row + inX]
+                a += (pOut ushr 24) and 0xff
+                rr += (pOut ushr 16) and 0xff
+                g += (pOut ushr 8) and 0xff
+                b += pOut and 0xff
+                a -= (pIn ushr 24) and 0xff
+                rr -= (pIn ushr 16) and 0xff
+                g -= (pIn ushr 8) and 0xff
+                b -= pIn and 0xff
+            }
+        }
+    }
+
+    private fun boxBlurVertical(src: IntArray, dst: IntArray, w: Int, h: Int, r: Int) {
+        val window = 2 * r + 1
+        for (x in 0 until w) {
+            var a = 0; var rr = 0; var g = 0; var b = 0
+            for (i in -r..r) {
+                val y = i.coerceIn(0, h - 1)
+                val p = src[y * w + x]
+                a += (p ushr 24) and 0xff
+                rr += (p ushr 16) and 0xff
+                g += (p ushr 8) and 0xff
+                b += p and 0xff
+            }
+            for (y in 0 until h) {
+                dst[y * w + x] = ((a / window) shl 24) or ((rr / window) shl 16) or ((g / window) shl 8) or (b / window)
+                val outY = (y + r + 1).coerceIn(0, h - 1)
+                val inY = (y - r).coerceIn(0, h - 1)
+                val pOut = src[outY * w + x]
+                val pIn = src[inY * w + x]
+                a += (pOut ushr 24) and 0xff
+                rr += (pOut ushr 16) and 0xff
+                g += (pOut ushr 8) and 0xff
+                b += pOut and 0xff
+                a -= (pIn ushr 24) and 0xff
+                rr -= (pIn ushr 16) and 0xff
+                g -= (pIn ushr 8) and 0xff
+                b -= pIn and 0xff
+            }
+        }
+    }
+
+    private fun invokeBrushBackground(modifier: Any, brush: Any, shape: Any?): Any? = runCatching {
+        val backgroundKtClass = XposedHelpers.findClass(BACKGROUND_KT_CLASS, classLoader)
+        val method = backgroundKtClass.declaredMethods.firstOrNull { m ->
+            m.name == BRUSH_BACKGROUND_DEFAULT_METHOD && m.parameterTypes.size == 6
+        }?.apply { isAccessible = true } ?: return@runCatching null
+        val resolvedShape = shape ?: rectangleShape()
+        method.invoke(
+            null,
+            modifier,
+            brush,
+            resolvedShape,
+            1f,
+            4, // default mask: skip alpha (idx 3)
+            null,
+        )
+    }.getOrNull()
+
+    private fun rectangleShape(): Any? = runCatching {
+        val cls = XposedHelpers.findClass(RECTANGLE_SHAPE_KT_CLASS, classLoader)
+        val field = cls.getDeclaredField("RectangleShape").apply { isAccessible = true }
+        field.get(null)
+    }.getOrNull()
+
+    private fun staticObject(clazz: Class<*>, fieldName: String): Any {
+        listOf(fieldName, "Companion").forEach { candidate ->
+            val field = runCatching { clazz.getDeclaredField(candidate) }
+                .recoverCatching { clazz.getField(candidate) }
+                .getOrNull()
+            if (field != null) {
+                field.isAccessible = true
+                field.get(null)?.let { return it }
+            }
+        }
+        clazz.declaredClasses.forEach { inner ->
+            val field = inner.declaredFields.firstOrNull { it.name == "\$\$INSTANCE" } ?: return@forEach
+            field.isAccessible = true
+            field.get(null)?.let { return it }
+        }
+        error("${clazz.name}.$fieldName static object not found")
+    }
+
+    private fun colorLongFromArgb(argb: Int): Long {
+        val cacheKey = "$COLOR_KT_CLASS#$COLOR_METHOD"
+        val factory = synchronized(methodCache) {
+            methodCache.getOrPut(cacheKey) {
+                val colorKtClass = XposedHelpers.findClass(COLOR_KT_CLASS, classLoader)
+                colorKtClass.declaredMethods.firstOrNull { method ->
+                    method.name == COLOR_METHOD &&
+                        method.parameterTypes.size == 1 &&
+                        method.parameterTypes[0] == Int::class.javaPrimitiveType
+                }?.apply { isAccessible = true }
+                    ?: error("Color factory not found")
+            }
+        }
+        return factory.invoke(null, argb) as Long
+    }
+
+    private fun parseArgb(hex: String): Int {
+        val normalized = hex.trim().removePrefix("#")
+        return when (normalized.length) {
+            8 -> normalized.toLong(16).toInt()
+            6 -> (0xFF shl 24) or normalized.toInt(16)
+            else -> BACKGROUND_ARGB_FALLBACK
+        }
+    }
+
+    private fun argbWithAlpha(argb: Int, alpha: Int): Int =
+        (alpha.coerceIn(0, 255) shl 24) or (argb and 0x00FFFFFF)
 
     private companion object {
         const val LOG_PREFIX = "ReaMicro LSP profile background"
 
-        const val TOOLBAR_HEIGHT_DP = 48
-        const val BACKGROUND_ARGB = 0x80000000.toInt()
+        const val BACKGROUND_ARGB_FALLBACK = 0x80000000.toInt()
+        const val PROFILE_BACKGROUND_DARK_PAGE_ARGB_FALLBACK = 0xFF000000.toInt()
+        const val PROFILE_BACKGROUND_LIGHT_PAGE_ARGB_FALLBACK = -1
+        const val PROFILE_BACKGROUND_HEADER_HEIGHT_DP = 330f
+        const val PROFILE_BACKGROUND_BANNER_FADE_WIDTH_RATIO = 0.78f
+        const val PROFILE_BACKGROUND_BANNER_FADE_MIN_DP = 220f
+        const val PROFILE_BACKGROUND_BANNER_FADE_MAX_DP = 360f
 
-        const val PROFILE_BG_CONTENT_KEY = 0x52_4D_42_47
-        const val PROFILE_BG_AREA_KEY = 0x52_4D_42_41
+        const val PROFILE_SCREEN_CLASS = "app.zhendong.reamicro.ui.profile.ProfileScreenKt"
 
-        const val PROFILE_TOOLBAR_CLASS = "app.zhendong.reamicro.ui.profile.components.ProfileToolbarKt"
-        const val PROFILE_TOOLBAR_METHOD = "ProfileToolbar"
+        const val THEME_KT_CLASS = "app.zhendong.reamicro.arch.theme.ThemeKt"
+        const val THEME_GET_BACKGROUND_AUTO_METHOD = "getBackgroundAuto"
+        const val MATERIAL_THEME_CLASS = "androidx.compose.material3.MaterialTheme"
+        const val COMPOSER_CLASS = "androidx.compose.runtime.Composer"
 
-        const val UNIT_EXT_KT_CLASS = "app.zhendong.reamicro.arch.extensions.UnitExtKt"
-        const val UDP_METHOD = "getUdp"
+        const val DIVIDER_KT_CLASS = "app.zhendong.reamicro.arch.components.DividerKt"
+        const val SIMPLE_DIVIDER_METHOD = "SimpleDivider-iJQMabo"
 
-        const val COMPOSABLE_LAMBDA_KT_CLASS = "androidx.compose.runtime.internal.ComposableLambdaKt"
-        const val COMPOSABLE_LAMBDA_METHOD = "composableLambdaInstance"
+        const val COLOR_SCHEME_CLASS = "androidx.compose.material3.ColorScheme"
+        const val SURFACE_CONTAINER_HIGH_METHOD = "getSurfaceContainerHigh-0d7_KjU"
 
-        const val COLUMN_KT_CLASS = "androidx.compose.foundation.layout.ColumnKt"
-        const val COLUMN_METHOD = "Column"
-        const val SIZE_KT_CLASS = "androidx.compose.foundation.layout.SizeKt"
-        const val FILL_MAX_WIDTH_DEFAULT_METHOD = "fillMaxWidth\$default"
-        const val HEIGHT_METHOD = "height-3ABfNKs"
         const val BACKGROUND_KT_CLASS = "androidx.compose.foundation.BackgroundKt"
-        const val BACKGROUND_DEFAULT_METHOD = "background-bw27NRU\$default"
-        const val CLICKABLE_KT_CLASS = "androidx.compose.foundation.ClickableKt"
-        const val CLICKABLE_DEFAULT_METHOD = "clickable-O2vRcR0\$default"
+        const val COLOR_BACKGROUND_DEFAULT_METHOD = "background-bw27NRU\$default"
+        const val BRUSH_BACKGROUND_DEFAULT_METHOD = "background\$default"
+
+        const val SIZE_KT_CLASS = "androidx.compose.foundation.layout.SizeKt"
+        const val FILL_MAX_SIZE_DEFAULT_METHOD = "fillMaxSize\$default"
+
+        const val BRUSH_KT_CLASS = "androidx.compose.ui.graphics.BrushKt"
+        const val SHADER_BRUSH_METHOD = "ShaderBrush"
+
+        const val BRUSH_COMPANION_CLASS = "androidx.compose.ui.graphics.Brush"
+        const val VERTICAL_GRADIENT_DEFAULT_METHOD = "verticalGradient-8A-3gB4\$default"
+
+        const val RECTANGLE_SHAPE_KT_CLASS = "androidx.compose.ui.graphics.RectangleShapeKt"
+
         const val COLOR_KT_CLASS = "androidx.compose.ui.graphics.ColorKt"
         const val COLOR_METHOD = "Color"
 
-        const val MODIFIER_CLASS = "androidx.compose.ui.Modifier"
-        const val ARRANGEMENT_CLASS = "androidx.compose.foundation.layout.Arrangement"
-        const val ALIGNMENT_CLASS = "androidx.compose.ui.Alignment"
-
-        const val FUNCTION0_CLASS = "kotlin.jvm.functions.Function0"
-        const val FUNCTION3_CLASS = "kotlin.jvm.functions.Function3"
+        const val COLOR_CLASS = "androidx.compose.ui.graphics.Color"
+        const val COLOR_BOX_METHOD = "box-impl"
     }
 }
