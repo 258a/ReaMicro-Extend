@@ -44,6 +44,11 @@ object ModuleSettings {
     const val KEY_PROFILE_BACKGROUND_USE_IMAGE = "profile_background_use_image"
     const val KEY_PROFILE_BACKGROUND_IMAGE = "profile_background_image"
     const val KEY_PROFILE_BACKGROUND_CROP_POSITION = "profile_background_crop_position"
+    const val KEY_PROFILE_BACKGROUND_DISPLAY_MODE = "profile_background_display_mode"
+    const val KEY_PROFILE_BACKGROUND_BLUR = "profile_background_blur"
+    const val KEY_PROFILE_BACKGROUND_TRANSPARENCY = "profile_background_transparency"
+    const val KEY_PROFILE_BACKGROUND_CARD_BLUR = "profile_background_card_blur"
+    const val KEY_PROFILE_BACKGROUND_CARD_TRANSPARENCY = "profile_background_card_transparency"
 
     private const val KEY_ASSOCIATION_SOURCE_PREFIX = "association_source_"
     private const val KEY_ONLINE_SOURCE_PREFIX = "online_source_"
@@ -91,6 +96,14 @@ object ModuleSettings {
     const val PROFILE_BACKGROUND_CROP_CENTER = "center"
     const val PROFILE_BACKGROUND_CROP_BOTTOM = "bottom"
     const val DEFAULT_PROFILE_BACKGROUND_CROP_POSITION = PROFILE_BACKGROUND_CROP_TOP
+    const val PROFILE_BACKGROUND_DISPLAY_COVER = "cover"
+    const val PROFILE_BACKGROUND_DISPLAY_FIT_WIDTH = "fit_width"
+    const val PROFILE_BACKGROUND_DISPLAY_FIT_HEIGHT = "fit_height"
+    const val DEFAULT_PROFILE_BACKGROUND_DISPLAY_MODE = PROFILE_BACKGROUND_DISPLAY_COVER
+    const val DEFAULT_PROFILE_BACKGROUND_BLUR = 50
+    const val DEFAULT_PROFILE_BACKGROUND_TRANSPARENCY = 0
+    const val DEFAULT_PROFILE_BACKGROUND_CARD_BLUR = 50
+    const val DEFAULT_PROFILE_BACKGROUND_CARD_TRANSPARENCY = 4
     val ROTATION_BASE_KEYS = setOf(
         KEY_ROTATION_AUTO_ENABLED,
         KEY_ROTATION_PORTRAIT_LOCK_ENABLED,
@@ -193,6 +206,11 @@ data class ModuleSettingsSnapshot(
     val profileBackgroundUseImage: Boolean = ModuleSettings.DEFAULT_PROFILE_BACKGROUND_USE_IMAGE,
     val profileBackgroundImage: String = ModuleSettings.DEFAULT_PROFILE_BACKGROUND_IMAGE,
     val profileBackgroundCropPosition: String = ModuleSettings.DEFAULT_PROFILE_BACKGROUND_CROP_POSITION,
+    val profileBackgroundDisplayMode: String = ModuleSettings.DEFAULT_PROFILE_BACKGROUND_DISPLAY_MODE,
+    val profileBackgroundBlur: Int = ModuleSettings.DEFAULT_PROFILE_BACKGROUND_BLUR,
+    val profileBackgroundTransparency: Int = ModuleSettings.DEFAULT_PROFILE_BACKGROUND_TRANSPARENCY,
+    val profileBackgroundCardBlur: Int = ModuleSettings.DEFAULT_PROFILE_BACKGROUND_CARD_BLUR,
+    val profileBackgroundCardTransparency: Int = ModuleSettings.DEFAULT_PROFILE_BACKGROUND_CARD_TRANSPARENCY,
     val associationSearchSources: Map<String, Boolean> = ModuleSettings.defaultAssociationSearchSources(),
 ) {
     val canRunAssociation: Boolean

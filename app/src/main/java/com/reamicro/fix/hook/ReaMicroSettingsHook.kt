@@ -34,7 +34,6 @@ import android.text.Editable
 import android.text.InputType
 import android.text.TextWatcher
 import android.util.Base64
-import android.util.TypedValue
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
@@ -765,11 +764,18 @@ class ReaMicroSettingsHook(
     }
 
     private fun profileBackgroundColorSummary(value: String): String =
-        PROFILE_BACKGROUND_COLOR_OPTIONS.firstOrNull { it.value.equals(value, ignoreCase = true) }?.title ?: value
+        profileBackgroundArgbHex(profileBackgroundColorValue(value))
 
     private fun profileBackgroundCropPositionSummary(value: String): String =
         PROFILE_BACKGROUND_CROP_POSITION_OPTIONS.firstOrNull { it.value == value }?.title
             ?: PROFILE_BACKGROUND_CROP_POSITION_OPTIONS.first().title
+
+    private fun profileBackgroundDisplayModeSummary(value: String): String =
+        PROFILE_BACKGROUND_DISPLAY_MODE_OPTIONS.firstOrNull { it.value == value }?.title
+            ?: PROFILE_BACKGROUND_DISPLAY_MODE_OPTIONS.first().title
+
+    private fun profileBackgroundPercentSummary(value: Int): String =
+        "${value.coerceIn(0, 100)}%"
 
     private fun completionEntryRow(key: String, title: String, enabled: Boolean, route: InjectedRoute): ActionRow =
         ActionRow(
@@ -1597,11 +1603,70 @@ class ReaMicroSettingsHook(
                     onClick = { openProfileBackgroundImagePicker() },
                 ),
                 ActionRow(
+                    key = "profile_background_display_mode_entry",
+                    title = "\u663e\u793a\u65b9\u5f0f",
+                    subtitle = profileBackgroundDisplayModeSummary(snapshot.profileBackgroundDisplayMode),
+                    singleLineSubtitle = true,
+                    onClick = { openProfileBackgroundDisplayModeDialog() },
+                ),
+                ActionRow(
                     key = "profile_background_crop_position_entry",
                     title = "\u88c1\u526a\u4f4d\u7f6e",
                     subtitle = profileBackgroundCropPositionSummary(snapshot.profileBackgroundCropPosition),
                     singleLineSubtitle = true,
                     onClick = { openProfileBackgroundCropPositionDialog() },
+                ),
+                ActionRow(
+                    key = "profile_background_blur_entry",
+                    title = "\u6a21\u7cca\u5f3a\u5ea6",
+                    subtitle = profileBackgroundPercentSummary(snapshot.profileBackgroundBlur),
+                    singleLineSubtitle = true,
+                    onClick = {
+                        openProfileBackgroundPercentDialog(
+                            title = "\u6a21\u7cca\u5f3a\u5ea6",
+                            initialValue = settings.snapshot().profileBackgroundBlur,
+                            onApply = settings::setProfileBackgroundBlur,
+                        )
+                    },
+                ),
+                ActionRow(
+                    key = "profile_background_transparency_entry",
+                    title = "\u56fe\u7247\u900f\u660e\u5ea6",
+                    subtitle = profileBackgroundPercentSummary(snapshot.profileBackgroundTransparency),
+                    singleLineSubtitle = true,
+                    onClick = {
+                        openProfileBackgroundPercentDialog(
+                            title = "\u56fe\u7247\u900f\u660e\u5ea6",
+                            initialValue = settings.snapshot().profileBackgroundTransparency,
+                            onApply = settings::setProfileBackgroundTransparency,
+                        )
+                    },
+                ),
+                ActionRow(
+                    key = "profile_background_card_transparency_entry",
+                    title = "\u5bb9\u5668\u900f\u660e\u5ea6",
+                    subtitle = profileBackgroundPercentSummary(snapshot.profileBackgroundCardTransparency),
+                    singleLineSubtitle = true,
+                    onClick = {
+                        openProfileBackgroundPercentDialog(
+                            title = "\u5bb9\u5668\u900f\u660e\u5ea6",
+                            initialValue = settings.snapshot().profileBackgroundCardTransparency,
+                            onApply = settings::setProfileBackgroundCardTransparency,
+                        )
+                    },
+                ),
+                ActionRow(
+                    key = "profile_background_card_blur_entry",
+                    title = "\u5bb9\u5668\u6a21\u7cca\u611f",
+                    subtitle = profileBackgroundPercentSummary(snapshot.profileBackgroundCardBlur),
+                    singleLineSubtitle = true,
+                    onClick = {
+                        openProfileBackgroundPercentDialog(
+                            title = "\u5bb9\u5668\u6a21\u7cca\u611f",
+                            initialValue = settings.snapshot().profileBackgroundCardBlur,
+                            onApply = settings::setProfileBackgroundCardBlur,
+                        )
+                    },
                 ),
             )
             addLazyItem(lazyListScope, PROFILE_BACKGROUND_COLOR_PICKER_ITEM_KEY + 1) { itemComposer ->
@@ -1613,6 +1678,11 @@ class ReaMicroSettingsHook(
     }
 
     private fun openProfileBackgroundColorDialog() {
+        val current = profileBackgroundArgbHex(profileBackgroundColorValue(settings.snapshot().profileBackgroundColor))
+        openProfileBackgroundCustomColorDialog(current)
+    }
+
+    private fun openProfileBackgroundCustomColorDialog(initialHex: String) {
         val activity = activityProvider() ?: return
         activity.runOnUiThread {
             runCatching {
@@ -1620,118 +1690,231 @@ class ReaMicroSettingsHook(
                 val dialog = Dialog(activity)
                 val card = settingsDialogCard(activity, colors)
                 card.addView(settingsDialogTitle(activity, "\u80cc\u666f\u989c\u8272", colors))
-                val current = settings.snapshot().profileBackgroundColor
-                PROFILE_BACKGROUND_COLOR_OPTIONS.forEach { option ->
-                    card.addView(profileBackgroundColorOptionRow(activity, option, current, colors) {
-                        settings.setProfileBackgroundColor(option.value)
-                        dialog.dismiss()
-                        bumpProfileBackgroundVersion()
-                    })
+                var pendingHex = profileBackgroundNormalizeArgbHexOrNull(initialHex)
+                    ?: ModuleSettings.DEFAULT_PROFILE_BACKGROUND_COLOR
+                val previewRow = profileBackgroundColorPreviewRow(activity, pendingHex, colors)
+                val input = settingsDialogInput(activity, "#AARRGGBB", singleLine = true, colors = colors).apply {
+                    inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS
+                    setText(pendingHex)
+                    selectAll()
+                }
+                val status = settingsDialogStatus(activity, pendingHex, colors)
+
+                fun updatePreview(raw: String) {
+                    val normalized = profileBackgroundNormalizeArgbHexOrNull(raw)
+                    if (normalized == null) {
+                        status.text = "\u989c\u8272\u503c\u683c\u5f0f\u4e0d\u6b63\u786e"
+                        status.setTextColor(colors.destructiveText)
+                        return
+                    }
+                    pendingHex = normalized
+                    status.text = normalized
+                    status.setTextColor(colors.body)
+                    previewRow.background = settingsRoundedRect(
+                        profileBackgroundColorValue(normalized),
+                        settingsDp(activity, 14),
+                        colors.border,
+                    )
+                }
+
+                input.addTextChangedListener(
+                    object : TextWatcher {
+                        override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+
+                        override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                            updatePreview(s?.toString().orEmpty())
+                        }
+
+                        override fun afterTextChanged(s: Editable?) = Unit
+                    },
+                )
+                card.addView(previewRow)
+                card.addView(input)
+                card.addView(status)
+
+                val actions = settingsDialogActions(activity)
+                actions.addView(
+                    settingsDialogButton(activity, "\u53d6\u6d88", colors, SettingsDialogButtonRole.Neutral).apply {
+                        setOnClickListener { dialog.dismiss() }
+                    },
+                    settingsDialogButtonParams(activity),
+                )
+                actions.addView(
+                    settingsDialogButton(activity, "\u5b8c\u6210", colors).apply {
+                        setOnClickListener {
+                            val normalized = profileBackgroundNormalizeArgbHexOrNull(input.text?.toString().orEmpty())
+                            if (normalized == null) {
+                                Toast.makeText(activity, "\u989c\u8272\u503c\u683c\u5f0f\u4e0d\u6b63\u786e", Toast.LENGTH_SHORT).show()
+                                return@setOnClickListener
+                            }
+                            settings.setProfileBackgroundColor(normalized)
+                            dialog.dismiss()
+                            bumpProfileBackgroundVersion()
+                        }
+                    },
+                    settingsDialogButtonParams(activity),
+                )
+                card.addView(actions)
+                showSettingsDialog(dialog, card, activity)
+            }.onFailure {
+                XposedBridge.log("ReaMicro LSP profile custom color dialog failed: ${it.stackTraceToString()}")
+            }
+        }
+    }
+
+    private fun openProfileBackgroundDisplayModeDialog() {
+        openProfileBackgroundOptionDialog(
+            title = "\u663e\u793a\u65b9\u5f0f",
+            current = settings.snapshot().profileBackgroundDisplayMode,
+            options = PROFILE_BACKGROUND_DISPLAY_MODE_OPTIONS,
+            onSelected = settings::setProfileBackgroundDisplayMode,
+            logName = "display mode",
+        )
+    }
+
+    private fun openProfileBackgroundPercentDialog(
+        title: String,
+        initialValue: Int,
+        onApply: (Int) -> Unit,
+    ) {
+        val activity = activityProvider() ?: return
+        activity.runOnUiThread {
+            runCatching {
+                val colors = SettingsDialogColors(activity)
+                val dialog = Dialog(activity)
+                val card = settingsDialogCard(activity, colors)
+                card.addView(settingsDialogTitle(activity, title, colors))
+                val input = settingsDialogInput(activity, "\u8f93\u5165 0-100", singleLine = true, colors = colors).apply {
+                    inputType = InputType.TYPE_CLASS_NUMBER
+                    setText(initialValue.coerceIn(0, 100).toString())
+                    selectAll()
+                }
+                card.addView(input)
+                card.addView(settingsDialogStatus(activity, "\u8303\u56f4 0-100\uff0c\u4fdd\u5b58\u540e\u7acb\u5373\u751f\u6548\u3002", colors))
+                val actions = settingsDialogActions(activity)
+                actions.addView(
+                    settingsDialogButton(activity, "\u53d6\u6d88", colors, SettingsDialogButtonRole.Neutral).apply {
+                        setOnClickListener { dialog.dismiss() }
+                    },
+                    settingsDialogButtonParams(activity),
+                )
+                actions.addView(
+                    settingsDialogButton(activity, "\u5b8c\u6210", colors).apply {
+                        setOnClickListener {
+                            val value = input.text?.toString()?.trim()?.toIntOrNull()
+                            if (value == null || value !in 0..100) {
+                                Toast.makeText(activity, "\u8bf7\u8f93\u5165 0-100", Toast.LENGTH_SHORT).show()
+                                return@setOnClickListener
+                            }
+                            onApply(value)
+                            dialog.dismiss()
+                            bumpProfileBackgroundVersion()
+                        }
+                    },
+                    settingsDialogButtonParams(activity),
+                )
+                card.addView(actions)
+                showSettingsDialog(dialog, card, activity)
+            }.onFailure {
+                XposedBridge.log("$LOG_PREFIX profile background percent dialog failed: ${it.stackTraceToString()}")
+            }
+        }
+    }
+
+    private fun openProfileBackgroundCropPositionDialog() {
+        openProfileBackgroundOptionDialog(
+            title = "\u88c1\u526a\u4f4d\u7f6e",
+            current = settings.snapshot().profileBackgroundCropPosition,
+            options = PROFILE_BACKGROUND_CROP_POSITION_OPTIONS,
+            onSelected = settings::setProfileBackgroundCropPosition,
+            logName = "crop position",
+        )
+    }
+
+    private fun openProfileBackgroundOptionDialog(
+        title: String,
+        current: String,
+        options: List<HighlightColorOption>,
+        onSelected: (String) -> Unit,
+        logName: String,
+    ) {
+        val activity = activityProvider() ?: return
+        activity.runOnUiThread {
+            runCatching {
+                val colors = SettingsDialogColors(activity)
+                val dialog = Dialog(activity)
+                val card = settingsDialogCard(activity, colors)
+                card.addView(settingsDialogTitle(activity, title, colors))
+                options.forEach { option ->
+                    val selected = option.value == current
+                    card.addView(
+                        settingsDialogChoiceRow(
+                            activity,
+                            if (selected) "${option.title}  \u5f53\u524d" else option.title,
+                            colors,
+                        ) {
+                            onSelected(option.value)
+                            dialog.dismiss()
+                            bumpProfileBackgroundVersion()
+                        },
+                    )
                 }
                 val actions = settingsDialogActions(activity)
                 actions.addView(
                     settingsDialogButton(activity, "\u5173\u95ed", colors, SettingsDialogButtonRole.Neutral).apply {
                         setOnClickListener { dialog.dismiss() }
                     },
+                    settingsDialogButtonParams(activity),
                 )
                 card.addView(actions)
-                dialog.setContentView(card)
-                dialog.show()
+                showSettingsDialog(dialog, settingsDialogScroll(activity, card), activity)
             }.onFailure {
-                XposedBridge.log("ReaMicro LSP profile background dialog failed: ${it.stackTraceToString()}")
+                XposedBridge.log("$LOG_PREFIX profile background $logName dialog failed: ${it.stackTraceToString()}")
             }
         }
     }
 
-    private fun openProfileBackgroundCropPositionDialog() {
-        val activity = activityProvider() ?: return
-        activity.runOnUiThread {
-            runCatching {
-                val current = settings.snapshot().profileBackgroundCropPosition
-                val titles = PROFILE_BACKGROUND_CROP_POSITION_OPTIONS.map { it.title }.toTypedArray()
-                val checked = PROFILE_BACKGROUND_CROP_POSITION_OPTIONS
-                    .indexOfFirst { it.value == current }
-                    .coerceAtLeast(0)
-                AlertDialog.Builder(activity)
-                    .setTitle("\u88c1\u526a\u4f4d\u7f6e")
-                    .setSingleChoiceItems(titles, checked) { dialog, which ->
-                        val option = PROFILE_BACKGROUND_CROP_POSITION_OPTIONS.getOrNull(which) ?: return@setSingleChoiceItems
-                        settings.setProfileBackgroundCropPosition(option.value)
-                        dialog.dismiss()
-                        bumpProfileBackgroundVersion()
-                    }
-                    .setNegativeButton("\u5173\u95ed", null)
-                    .show()
-            }.onFailure {
-                XposedBridge.log("$LOG_PREFIX profile background crop position dialog failed: ${it.stackTraceToString()}")
-            }
-        }
-    }
-
-    private fun profileBackgroundColorOptionRow(
-        activity: Activity,
-        option: HighlightColorOption,
-        current: String,
+    private fun profileBackgroundColorPreviewRow(
+        context: Context,
+        hex: String,
         colors: SettingsDialogColors,
-        onClick: () -> Unit,
-    ): LinearLayout =
-        LinearLayout(activity).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(
-                settingsDp(activity, 4),
-                settingsDp(activity, 8),
-                settingsDp(activity, 4),
-                settingsDp(activity, 8),
-            )
-            background = settingsRoundedRect(colors.field, settingsDp(activity, 12), colors.border)
+    ): View =
+        View(context).apply {
+            background = settingsRoundedRect(profileBackgroundColorValue(hex), settingsDp(context, 14), colors.border)
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-            ).apply { bottomMargin = settingsDp(activity, 8) }
-
-            val swatch = View(activity).apply {
-                background = settingsRoundedRect(parseRgb(option.value), settingsDp(activity, 8), 0)
-                layoutParams = LinearLayout.LayoutParams(settingsDp(activity, 28), settingsDp(activity, 28)).apply {
-                    rightMargin = settingsDp(activity, 12)
-                }
-            }
-            addView(swatch)
-
-            val title = TextView(activity).apply {
-                text = option.title
-                textSize = 14f
-                setTextColor(colors.title)
-                includeFontPadding = false
-                layoutParams = LinearLayout.LayoutParams(
-                    0,
-                    ViewGroup.LayoutParams.WRAP_CONTENT,
-                    1f,
-                )
-            }
-            addView(title)
-
-            val selected = option.value.equals(current, ignoreCase = true)
-            val trailing = TextView(activity).apply {
-                text = if (selected) "\u5f53\u524d" else "\u9009\u62e9"
-                textSize = 13f
-                setTextColor(if (selected) colors.primaryText else colors.body)
-                includeFontPadding = false
-                setPadding(settingsDp(activity, 6), 0, settingsDp(activity, 6), 0)
-            }
-            addView(trailing)
-
-            setOnClickListener { onClick() }
+                settingsDp(context, 52),
+            ).apply { bottomMargin = settingsDp(context, 10) }
         }
 
-    private fun parseRgb(hex: String): Int {
-        val normalized = hex.trim().removePrefix("#")
-        return when (normalized.length) {
-            8 -> normalized.toLong(16).toInt()
-            6 -> (0xFF shl 24) or normalized.toInt(16)
-            else -> Color.GRAY
+    private fun profileBackgroundNormalizeArgbHexOrNull(value: String): String? {
+        val normalized = value.trim().removePrefix("#")
+        if (!normalized.matches(Regex("^[0-9a-fA-F]{6}$")) &&
+            !normalized.matches(Regex("^[0-9a-fA-F]{8}$"))
+        ) {
+            return null
         }
+        val argb = when (normalized.length) {
+            6 -> "FF$normalized"
+            8 -> normalized
+            else -> return null
+        }
+        return "#${argb.uppercase(Locale.US)}"
     }
+
+    private fun profileBackgroundColorValue(hex: String): Int {
+        val normalized = hex.trim().removePrefix("#")
+        return runCatching {
+            when (normalized.length) {
+                8 -> normalized.toLong(16).toInt()
+                6 -> (0xFF shl 24) or normalized.toInt(16)
+                else -> 0x80000000.toInt()
+            }
+        }.getOrDefault(0x80000000.toInt())
+    }
+
+    private fun profileBackgroundArgbHex(argb: Int): String =
+        String.format(Locale.US, "#%08X", argb)
 
     private fun openReaderHighlightStyleDialog(style: ReaderHighlightStyle) {
         val activity = activityProvider() ?: return
@@ -4435,20 +4618,18 @@ class ReaMicroSettingsHook(
     }
 
     private inner class SettingsDialogColors(context: Context) {
-        private val dark = (context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
-            Configuration.UI_MODE_NIGHT_YES
-        val card: Int = if (dark) Color.rgb(30, 34, 40) else Color.WHITE
-        val border: Int = if (dark) Color.rgb(62, 69, 78) else Color.rgb(226, 230, 236)
-        val title: Int = if (dark) Color.WHITE else Color.rgb(29, 33, 39)
-        val body: Int = if (dark) Color.rgb(190, 198, 208) else Color.rgb(86, 94, 106)
-        val field: Int = if (dark) Color.rgb(39, 44, 51) else Color.rgb(246, 248, 251)
-        val primary: Int = settingsThemeColor(context, android.R.attr.colorAccent, Color.rgb(45, 135, 120))
-        val primarySoft: Int = if (dark) Color.rgb(36, 70, 64) else Color.rgb(230, 244, 241)
-        val primaryText: Int = if (dark) Color.rgb(166, 224, 212) else primary
-        val neutralSoft: Int = if (dark) Color.rgb(43, 48, 55) else Color.rgb(242, 244, 247)
-        val neutralText: Int = if (dark) Color.rgb(218, 223, 230) else Color.rgb(74, 82, 94)
-        val destructiveSoft: Int = if (dark) Color.rgb(82, 39, 42) else Color.rgb(253, 236, 236)
-        val destructiveText: Int = if (dark) Color.rgb(255, 172, 172) else Color.rgb(214, 69, 69)
+        val card: Int = Color.rgb(246, 245, 241)
+        val border: Int = Color.rgb(224, 221, 214)
+        val title: Int = Color.rgb(28, 25, 22)
+        val body: Int = Color.rgb(86, 80, 73)
+        val field: Int = Color.rgb(238, 236, 231)
+        val primary: Int = Color.rgb(163, 72, 18)
+        val primarySoft: Int = Color.rgb(246, 226, 211)
+        val primaryText: Int = Color.rgb(145, 62, 14)
+        val neutralSoft: Int = Color.rgb(235, 233, 228)
+        val neutralText: Int = Color.rgb(70, 64, 58)
+        val destructiveSoft: Int = Color.rgb(253, 236, 236)
+        val destructiveText: Int = Color.rgb(190, 54, 54)
     }
 
     private fun settingsDialogCard(context: Context, colors: SettingsDialogColors): LinearLayout =
@@ -4802,11 +4983,6 @@ class ReaMicroSettingsHook(
 
     private fun settingsDp(context: Context, value: Int): Int =
         (value * context.resources.displayMetrics.density).toInt()
-
-    private fun settingsThemeColor(context: Context, attr: Int, fallback: Int): Int {
-        val value = TypedValue()
-        return if (context.theme.resolveAttribute(attr, value, true)) value.data else fallback
-    }
 
     private fun openDictionaryPresetDialog() {
         openDictionaryPresetDialog(existing = null)
@@ -8084,19 +8260,15 @@ class ReaMicroSettingsHook(
             HighlightColorOption("#9333EA", "\u7d2b\u8272"),
             HighlightColorOption("#DC2626", "\u7ea2\u8272"),
         )
-        val PROFILE_BACKGROUND_COLOR_OPTIONS = listOf(
-            HighlightColorOption("#80000000", "\u534a\u900f\u660e\u9ed1"),
-            HighlightColorOption("#FF000000", "\u7eaf\u9ed1"),
-            HighlightColorOption("#FFFFFFFF", "\u7eaf\u767d"),
-            HighlightColorOption("#808B8B8B", "\u7070\u7070"),
-            HighlightColorOption("#FF1F2937", "\u6df1\u773c\u773c"),
-            HighlightColorOption("#FF0F172A", "\u591c\u7a7a\u84dd"),
-            HighlightColorOption("#FF6B7280", "\u77f3\u677f\u7070"),
-        )
-        val PROFILE_BACKGROUND_CROP_POSITION_OPTIONS = listOf(
+        private val PROFILE_BACKGROUND_CROP_POSITION_OPTIONS = listOf(
             HighlightColorOption(ModuleSettings.PROFILE_BACKGROUND_CROP_TOP, "\u9760\u4e0a"),
             HighlightColorOption(ModuleSettings.PROFILE_BACKGROUND_CROP_CENTER, "\u5c45\u4e2d"),
             HighlightColorOption(ModuleSettings.PROFILE_BACKGROUND_CROP_BOTTOM, "\u9760\u4e0b"),
+        )
+        private val PROFILE_BACKGROUND_DISPLAY_MODE_OPTIONS = listOf(
+            HighlightColorOption(ModuleSettings.PROFILE_BACKGROUND_DISPLAY_COVER, "\u586b\u5145\u5168\u5c4f"),
+            HighlightColorOption(ModuleSettings.PROFILE_BACKGROUND_DISPLAY_FIT_WIDTH, "\u9002\u5408\u5bbd\u5ea6"),
+            HighlightColorOption(ModuleSettings.PROFILE_BACKGROUND_DISPLAY_FIT_HEIGHT, "\u9002\u5408\u9ad8\u5ea6"),
         )
         const val YOUSHU_LOGIN_URL = "https://m.youshu.me/login.php"
         const val YOUSHU_FAST_LOGIN_VERIFY_ATTEMPTS = 1
